@@ -389,6 +389,14 @@ class NativeAgentGraph:
                         tool_calls=tool_calls[index:],
                         prompt=exc.prompt,
                     )
+                    # Notify listeners (webui WS/TUI) that a human approval is pending.
+                    # Without this emit the graph suspends silently and interactive
+                    # clients can never learn to send {"type": "approve", ...}.
+                    if self.event_bus:
+                        self.event_bus.emit(
+                            EventType.APPROVAL_NEEDED,
+                            {"prompt": exc.prompt, "tool": tool_name},
+                        )
                     return events, True
                 except Exception as exc:
                     content = json.dumps({"error": str(exc)})
