@@ -60,7 +60,10 @@ class AgentTool:
 
     async def ainvoke(self, arguments: dict[str, Any] | None = None, /, **kwargs: Any) -> Any:
         params = _normalize_arguments(arguments, kwargs)
-        with tool_execution_context():
+        # Inherit the enclosing resume decision: a nested tool invoked by an
+        # already-approved parent must not raise a fresh InterruptRequest
+        # (which would reset the approval and loop forever on resume).
+        with tool_execution_context(resume_decision=_TOOL_RESUME_DECISION.get()):
             if inspect.iscoroutinefunction(self.func):
                 return await self.func(**params)
             return await asyncio.to_thread(self.func, **params)
