@@ -198,7 +198,11 @@ function startSession() {
   const apiKey = document.getElementById('api-key').value;
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/agent`);
+  // WebUI access key: browsers cannot set WebSocket headers, so the server's
+  // browser-friendly auth path is the ?api_key= query param. Pass through the
+  // key from the page URL (open http://host:8899/?api_key=<CLEARWING_WEB_API_KEY>).
+  const webuiKey = new URLSearchParams(location.search).get('api_key') || '';
+  ws = new WebSocket(`${proto}://${location.host}/ws/agent${webuiKey ? `?api_key=${encodeURIComponent(webuiKey)}` : ''}`);
 
   ws.onopen = () => {
     document.getElementById('conn-status').textContent = 'Connected';
