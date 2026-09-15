@@ -102,3 +102,16 @@ class TestSaveReportTolerant:
         assert "saved" in message.lower()
         content = out.read_text(encoding="utf-8")
         assert "CVE-2020-1472" in content
+
+
+class TestSingletonListWrapper:
+    def test_singleton_list_wrapper_unwrapped(self):
+        normalized = _normalize_scan_data({"item": [dict(GOOD_SCAN_DATA)]})
+        assert normalized["target"] == "10.0.0.1"
+        assert normalized["open_ports"][0]["port"] == 80
+
+    def test_generate_report_singleton_list(self):
+        report = generate_report.func(
+            format="markdown", scan_data={"item": [dict(GOOD_SCAN_DATA)]}
+        )
+        assert "10.0.0.1" in report

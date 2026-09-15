@@ -417,10 +417,14 @@ def create_app():
 
         message_queue: asyncio.Queue = asyncio.Queue()
         transcript: SessionTranscript | None = None
+        # EventBus is a process-wide singleton whose payloads carry no session
+        # id, so bus events can only be attributed while THIS session's turn
+        # is running; record nothing outside the window.
+        turn_state = {"active": False}
 
         def _record_in_transcript(event_name: str, data: Any) -> None:
             """Mirror bus events into the session report transcript."""
-            if transcript is None or not isinstance(data, dict):
+            if transcript is None or not turn_state["active"] or not isinstance(data, dict):
                 return
             if event_name == "tool_start":
                 transcript.add_tool(
@@ -430,7 +434,13 @@ def create_app():
                 if transcript.tool_calls and transcript.tool_calls[-1].get("content_length") is None:
                     transcript.tool_calls[-1]["content_length"] = data.get("content_length")
             elif event_name == "cost_update":
-                transcript.set_cost(data.get("cost_usd"), data.get("tokens"))
+                # CostTracker emits total_cost_usd / input_tokens / output_tokens.
+                tokens = data.get("tokens")
+                if tokens is None:
+                    tokens = (data.get("input_tokens") or 0) + (data.get("output_tokens") or 0)
+                transcript.set_cost(
+                    data.get("total_cost_usd", data.get("cost_usd")), tokens
+                )
             elif event_name == "error":
                 transcript.add_error(data.get("message") or str(data))
 
@@ -588,6 +598,7 @@ def create_app():
                     input_msg = {"messages": [{"role": "user", "content": content}]}
 
                     try:
+                        turn_state["active"] = True
                         last_content = ""
                         async for event in graph.astream(input_msg, config, stream_mode="values"):
                             msgs = event.get("messages", [])
@@ -624,6 +635,8 @@ def create_app():
                             }
                         ):
                             break
+                    finally:
+                        turn_state["active"] = False
                     # Complete follows both success and failure, so the
                     # client never waits on a turn that died mid-stream.
                     await _drain_events()
@@ -636,6 +649,7 @@ def create_app():
                         transcript.add_user(
                             f"[approval {'approved' if approved else 'denied'} by operator]"
                         )
+                    resume_ok = True
                     try:
                         # Detect no-op resumes (stale approve with nothing
                         # pending): the graph reports the same message count.
@@ -645,8 +659,10 @@ def create_app():
                             )
                         except Exception:
                             before = None
+                        turn_state["active"] = True
                         snapshot = await graph.ainvoke(Command(resume=approved), config)
                     except Exception as e:
+                        resume_ok = False
                         logger.exception("Agent resume failed")
                         if transcript:
                             transcript.add_error(str(e))
@@ -657,7 +673,9 @@ def create_app():
                             }
                         ):
                             break
-                    else:
+                    finally:
+                        turn_state["active"] = False
+                    if resume_ok:
                         values = getattr(snapshot, "values", None)
                         messages_after = (values or {}).get("messages", [])
                         produced_new = before is None or len(messages_after) > before

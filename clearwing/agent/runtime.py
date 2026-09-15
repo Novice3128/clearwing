@@ -66,10 +66,17 @@ def _tool_result_failed(content: str) -> bool:
     except Exception:
         parsed = None
     if isinstance(parsed, dict):
-        # JSON-shaped results: only a non-empty error *string* is a failure.
-        # `{"error": null, "status": "ok"}` and friends are successes.
         error = parsed.get("error")
-        return isinstance(error, str) and bool(error.strip())
+        if isinstance(error, str):
+            return bool(error.strip())
+        if error is not None:
+            # Structured failure payloads: {"error": {"code": ..., ...}}.
+            return True
+        if parsed.get("status") == "error" or parsed.get("ok") is False:
+            # Repo conventions: callback_listener {"status": "error", ...},
+            # potentials {"ok": False, "error": {...}}.
+            return True
+        return False
     head = content[:2000].lower()
     return any(marker in head for marker in _FAILURE_MARKERS)
 
@@ -315,29 +322,43 @@ class NativeAgentGraph:
             tool_calls = getattr(last, "tool_calls", []) or []
             if not tool_calls:
                 break
-            if max_tool_calls is not None and tool_calls_total >= max_tool_calls:
-                logger.info("agent loop stopped: reached max_tool_calls=%d", max_tool_calls)
-                # The last AIMessage requested tools that will never run;
-                # answer them so the next turn doesn't send orphaned tool_use.
-                state.setdefault("messages", []).extend(
-                    _synthesize_skipped_tool_results(
-                        tool_calls, "tool-call budget (max_tool_calls) reached"
+            if max_tool_calls is not None:
+                budget_left = max_tool_calls - tool_calls_total
+                if budget_left <= 0:
+                    logger.info(
+                        "agent loop stopped: reached max_tool_calls=%d", max_tool_calls
                     )
-                )
-                state["messages"].append(
-                    HumanMessage(
-                        content=(
-                            "Automatic stop: the tool-call budget (max_tool_calls) has "
-                            "been reached. Summarize the progress and results collected "
-                            "so far."
+                    # The last AIMessage requested tools that will never run;
+                    # answer them so the next turn doesn't send orphaned tool_use.
+                    state.setdefault("messages", []).extend(
+                        _synthesize_skipped_tool_results(
+                            tool_calls, "tool-call budget (max_tool_calls) reached"
                         )
                     )
-                )
-                if self.event_bus:
-                    self.event_bus.emit_message(
-                        "agent loop stopped: max_tool_calls reached", "warning"
+                    state["messages"].append(
+                        HumanMessage(
+                            content=(
+                                "Automatic stop: the tool-call budget (max_tool_calls) has "
+                                "been reached. Summarize the progress and results collected "
+                                "so far."
+                            )
+                        )
                     )
-                break
+                    if self.event_bus:
+                        self.event_bus.emit_message(
+                            "agent loop stopped: max_tool_calls reached", "warning"
+                        )
+                    break
+                if budget_left < len(tool_calls):
+                    # A parallel batch can exceed the remaining budget; run the
+                    # head of the batch and answer the tail as skipped.
+                    state.setdefault("messages", []).extend(
+                        _synthesize_skipped_tool_results(
+                            tool_calls[budget_left:],
+                            "tool-call budget (max_tool_calls) reached mid-batch",
+                        )
+                    )
+                    tool_calls = tool_calls[:budget_left]
             tool_calls_total += len(tool_calls)
             tool_events, paused, halted = await self._arun_tool_calls(
                 state, tool_calls, resume_decision=Ellipsis

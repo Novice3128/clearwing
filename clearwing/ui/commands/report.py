@@ -40,6 +40,12 @@ def _find_session_report(session_id: str) -> Path | None:
 def handle(cli, args):
     """Show a session report, or the legacy per-target DB summary."""
     if args.session:
+        if args.format not in ("markdown", "text"):
+            cli.console.print(
+                f"[red]Session reports are stored as markdown; -f {args.format} "
+                "is not supported for --session[/red]"
+            )
+            return
         path = _find_session_report(args.session)
         if path is None:
             cli.console.print(f"[red]No report found for session {args.session}[/red]")

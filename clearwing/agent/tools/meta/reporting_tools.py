@@ -71,8 +71,18 @@ def _normalize_scan_data(scan_data: Any) -> dict:
         scan_data = {}
     if len(scan_data) == 1:
         only_key = next(iter(scan_data))
-        if only_key not in _SCAN_DATA_KEYS and isinstance(scan_data[only_key], dict):
-            scan_data = scan_data[only_key]
+        inner = scan_data[only_key]
+        if only_key not in _SCAN_DATA_KEYS:
+            if isinstance(inner, dict):
+                scan_data = inner
+            elif (
+                isinstance(inner, list)
+                and len(inner) == 1
+                and isinstance(inner[0], dict)
+            ):
+                # {"item": [{...scan data...}]} — same wrapper as the dict
+                # form, observed from the same session.
+                scan_data = inner[0]
 
     normalized = dict(scan_data)
     for field in ("open_ports", "services", "vulnerabilities", "exploits"):

@@ -256,3 +256,69 @@ class TestStreakValidator:
         assert validate_agent_limits("r", {"identical_failure_streak": "6"})
         assert validate_agent_limits("r", {"identical_failure_streak": -1})
         assert validate_agent_limits("r", {"identical_failure_streak": True})
+
+
+class TestStructuredFailureShapes:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"error": {"code": "E", "message": "boom"}},  # potentials-style
+            {"status": "error", "message": "boom"},  # callback_listener-style
+            {"ok": False, "error": {"code": "E"}},
+        ],
+    )
+    async def test_structured_failures_feed_the_guard(self, payload):
+        graph = _graph(AgentLimits(identical_failure_streak=2))
+        state = graph._get_or_create_state("t1")
+
+        @tool(name="structured_fail")
+        def structured_fail(target: str) -> dict:
+            """Returns repo-typical structured failure shapes."""
+            return dict(payload)
+
+        graph.tools["structured_fail"] = structured_fail
+        calls = [
+            _call("structured_fail", {"target": "x"}, f"c{i}") for i in range(4)
+        ]
+        _events, _paused, halted = await graph._arun_tool_calls(
+            state, calls, resume_decision=...
+        )
+        assert halted is True
+
+    @pytest.mark.asyncio
+    async def test_batch_trimmed_to_remaining_budget(self):
+        """A parallel batch larger than the remaining budget is trimmed,
+        and the tail still gets answered (no orphaned tool_use)."""
+        limits = AgentLimits(max_tool_calls=2)
+        graph = _graph(limits)
+        thread_id = "t1"
+        state = graph._get_or_create_state(thread_id)
+
+        class _Msg:
+            def __init__(self):
+                self.content = ""
+                self.tool_calls = [
+                    _call("always_fails", {"target": "x"}, f"c{i}") for i in range(4)
+                ]
+
+        async def fake_step(st):
+            st["messages"].append(_Msg())
+            return {}
+
+        graph._aassistant_step = fake_step
+
+        async for _ in graph._arun_loop(thread_id):
+            pass
+
+        tool_call_ids, answered_ids = set(), set()
+        executed = 0
+        for m in state["messages"]:
+            if getattr(m, "tool_calls", None):
+                tool_call_ids.update(tc.call_id for tc in m.tool_calls)
+            if getattr(m, "role", "") == "tool":
+                answered_ids.add(m.tool_call_id)
+                if "skipped" not in (m.content or ""):
+                    executed += 1
+        assert tool_call_ids == answered_ids
+        assert executed == 2  # budget cap honored inside the batch

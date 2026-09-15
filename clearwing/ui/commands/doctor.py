@@ -195,14 +195,13 @@ def _check_web_and_sandbox() -> DoctorSection:
             )
         )
 
-    docker_host = (os.environ.get("CLEARWING_DOCKER_HOST") or "").strip()
-    section.add(
-        DoctorCheck(
-            "CLEARWING_DOCKER_HOST",
-            STATUS_OK,
-            docker_host or "unset — sandbox uses the local Docker daemon socket",
-        )
-    )
+    try:
+        from clearwing.sandbox.dind import get_docker_host
+
+        docker_desc = f"sandbox docker host: {get_docker_host()}"
+    except Exception as exc:  # pragma: no cover - resolver is env-dependent
+        docker_desc = f"docker host resolver failed ({exc}); default socket assumed"
+    section.add(DoctorCheck("Docker host", STATUS_OK, docker_desc))
 
     sandbox_endpoint = (os.environ.get("CLEARWING_SANDBOX_ENDPOINT") or "").strip()
     if sandbox_endpoint:
@@ -213,22 +212,38 @@ def _check_web_and_sandbox() -> DoctorSection:
         )
     section.add(DoctorCheck("Sandbox backend", STATUS_OK, sandbox_desc))
 
-    def _env_raw(name: str, default: str) -> str:
-        return (os.environ.get(name) or "").strip() or default
+    def _parsed_env_int(name: str, default: int) -> tuple[int | str, bool]:
+        """(effective value, raw value was invalid).
 
+        Mirrors the runtime parsers: non-integers fall back to the default,
+        non-positive limits mean unbounded/disabled.
+        """
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            return default, False
+        try:
+            value = int(raw)
+        except ValueError:
+            return default, True
+        if value <= 0:
+            return "unbounded" if name != "CLEARWING_IDENTICAL_FAILURE_STREAK" else "disabled", True
+        return value, False
+
+    steps, steps_bad = _parsed_env_int("CLEARWING_MAX_STEPS", 100)
+    calls, calls_bad = _parsed_env_int("CLEARWING_MAX_TOOL_CALLS", 400)
+    streak, streak_bad = _parsed_env_int("CLEARWING_IDENTICAL_FAILURE_STREAK", 6)
+    bounds_msg = f"max_steps={steps} max_tool_calls={calls} identical_failure_streak={streak}"
     section.add(
         DoctorCheck(
             "Agent loop bounds",
-            STATUS_OK,
-            "max_steps={steps} max_tool_calls={calls} identical_failure_streak={streak} "
-            "(0 = unbounded/disabled)".format(
-                steps=_env_raw("CLEARWING_MAX_STEPS", "100"),
-                calls=_env_raw("CLEARWING_MAX_TOOL_CALLS", "400"),
-                streak=_env_raw("CLEARWING_IDENTICAL_FAILURE_STREAK", "6"),
-            ),
+            STATUS_WARN if (steps_bad or calls_bad or streak_bad) else STATUS_OK,
+            bounds_msg,
             hint=(
                 "Override with CLEARWING_MAX_STEPS / CLEARWING_MAX_TOOL_CALLS / "
-                "CLEARWING_IDENTICAL_FAILURE_STREAK."
+                "CLEARWING_IDENTICAL_FAILURE_STREAK (values <= 0 mean unbounded; "
+                "invalid values fall back to the default)."
+                if (steps_bad or calls_bad or streak_bad)
+                else ""
             ),
         )
     )
