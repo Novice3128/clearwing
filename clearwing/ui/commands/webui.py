@@ -1,5 +1,33 @@
 """Web UI subcommand."""
 
+import logging
+import re
+
+
+class _ApiKeyRedactionFilter(logging.Filter):
+    """Scrub ``api_key=<secret>`` from uvicorn access-log records.
+
+    The browser-compatible auth path is ``?api_key=`` (query param), and
+    uvicorn logs the full path+query verbatim — without this filter every
+    authenticated request writes the operator key to the log file.
+    """
+
+    _QUERY_RE = re.compile(r"(api_key=)[^&\s]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if "api_key=" not in record.getMessage():
+            return True
+        if record.args:
+            record.args = tuple(
+                self._QUERY_RE.sub(r"\1[REDACTED]", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        # Re-render in case the secret sits in msg itself rather than args.
+        if "api_key=" in record.getMessage():
+            record.msg = self._QUERY_RE.sub(r"\1[REDACTED]", record.getMessage())
+            record.args = None
+        return True
+
 
 def add_parser(subparsers):
     parser = subparsers.add_parser("webui", help="Start the web UI server")
@@ -21,6 +49,8 @@ def handle(cli, args):
         return
 
     from ..web import create_app
+
+    logging.getLogger("uvicorn.access").addFilter(_ApiKeyRedactionFilter())
 
     app = create_app()
 

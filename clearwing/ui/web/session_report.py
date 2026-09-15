@@ -9,6 +9,7 @@ exists — even when the client disconnects mid-run.
 
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,25 @@ from clearwing.reporting.safety import redact_text
 
 logger = logging.getLogger(__name__)
 
+# The shared redact_text misses secret shapes that chat transcripts commonly
+# carry (operator-pasted LLM keys, the webui key itself, `password: ...`
+# prose). Applied on top of redact_text for THIS artifact only — the shared
+# patterns must stay conservative because sourcehunt reports legitimately
+# contain 32-hex hashes as findings.
+_EXTRA_SECRET_PATTERNS = [
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+    re.compile(
+        r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key)\s*[:=]\s*\S+"
+    ),
+]
+
+
+def _redact(text: str) -> str:
+    for pattern in _EXTRA_SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return redact_text(text)
+
 
 def session_report_path(session_id: str) -> Path:
     """Path of the markdown report for a WebUI chat session."""
@@ -25,7 +45,7 @@ def session_report_path(session_id: str) -> Path:
 
 
 def _md_cell(value: Any) -> str:
-    text = redact_text(str(value if value is not None else ""))
+    text = _redact(str(value if value is not None else ""))
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
@@ -92,7 +112,7 @@ class SessionTranscript:
             for i, msg in enumerate(self.user_messages, 1):
                 lines.append(f"### Request {i}")
                 lines.append("")
-                lines.append(redact_text(msg).strip() or "(empty)")
+                lines.append(_redact(msg).strip() or "(empty)")
                 lines.append("")
 
         if self.agent_messages:
@@ -101,7 +121,7 @@ class SessionTranscript:
             for i, msg in enumerate(self.agent_messages, 1):
                 lines.append(f"### Response {i}")
                 lines.append("")
-                lines.append(redact_text(msg).strip() or "(empty)")
+                lines.append(_redact(msg).strip() or "(empty)")
                 lines.append("")
 
         if self.tool_calls:
@@ -124,7 +144,7 @@ class SessionTranscript:
             lines.append("## Errors")
             lines.append("")
             for err in self.errors:
-                lines.append(f"- {redact_text(err).strip()}")
+                lines.append(f"- {_redact(err).strip()}")
             lines.append("")
 
         lines.append(
@@ -141,6 +161,10 @@ class SessionTranscript:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".md.tmp")
         tmp.write_text(self.render(), encoding="utf-8")
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        # The transcript can carry target credentials; keep the artifact
+        # owner-readable only regardless of umask.
+        os.chmod(path, 0o600)
         logger.info("Session report updated: %s", path)
         return path

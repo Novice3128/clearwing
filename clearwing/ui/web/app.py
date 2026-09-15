@@ -27,6 +27,24 @@ from clearwing.ui.web.session_report import SessionTranscript, session_report_pa
 logger = logging.getLogger(__name__)
 
 
+def _last_ai_content(values: dict[str, Any] | None) -> str:
+    """Last non-empty AI message text from a graph state snapshot."""
+    messages = (values or {}).get("messages", [])
+    for message in reversed(messages):
+        if getattr(message, "type", "") != "ai":
+            continue
+        content = message.content
+        if isinstance(content, list):
+            content = "\n".join(
+                part["text"]
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        if content:
+            return content
+    return ""
+
+
 def _make_session_store():
     return memory_data.SessionStore()
 
@@ -81,14 +99,21 @@ def create_app():
             # Should be unreachable because routes are not mounted without a key,
             # but keep a defensive fallback.
             raise HTTPException(status_code=503, detail="API key not configured")
-        if provided is None or not hmac.compare_digest(provided, _api_key):
+        if not _key_matches(provided, _api_key):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    def _key_matches(provided: str | None, expected: str) -> bool:
+        if provided is None:
+            return False
+        try:
+            return hmac.compare_digest(provided.encode(), expected.encode())
+        except (TypeError, AttributeError, UnicodeEncodeError):
+            # Non-ASCII junk must be a 401, not a 500.
+            return False
 
     def _ws_authorized(websocket: WebSocket) -> bool:
         provided = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
-        return bool(
-            _api_key and provided is not None and hmac.compare_digest(provided, _api_key)
-        )
+        return bool(_api_key and _key_matches(provided, _api_key))
 
     # Serve the single-page frontend
     _static_dir = Path(__file__).parent / "static"
@@ -607,8 +632,20 @@ def create_app():
 
                 elif msg_type == "approve" and graph and config:
                     approved = data.get("approved", False)
+                    if transcript:
+                        transcript.add_user(
+                            f"[approval {'approved' if approved else 'denied'} by operator]"
+                        )
                     try:
-                        await graph.ainvoke(Command(resume=approved), config)
+                        # Detect no-op resumes (stale approve with nothing
+                        # pending): the graph reports the same message count.
+                        try:
+                            before = len(
+                                (graph.get_state(config).values or {}).get("messages", [])
+                            )
+                        except Exception:
+                            before = None
+                        snapshot = await graph.ainvoke(Command(resume=approved), config)
                     except Exception as e:
                         logger.exception("Agent resume failed")
                         if transcript:
@@ -620,8 +657,39 @@ def create_app():
                             }
                         ):
                             break
+                    else:
+                        values = getattr(snapshot, "values", None)
+                        messages_after = (values or {}).get("messages", [])
+                        produced_new = before is None or len(messages_after) > before
+                        if produced_new:
+                            content = _last_ai_content(values)
+                            if content:
+                                if transcript:
+                                    transcript.add_agent(content)
+                                if not await _safe_send(
+                                    {
+                                        "type": "agent_message",
+                                        "data": {"content": content},
+                                    }
+                                ):
+                                    break
+                    # Complete follows both success and failure, so the
+                    # client never waits on a resume that died mid-stream.
                     await _drain_events()
                     if not await _safe_send(_complete_payload()):
+                        break
+
+                elif msg_type in ("message", "approve"):
+                    # The frame needs an agent, but no start succeeded yet —
+                    # never leave the client waiting in silence.
+                    if not await _safe_send(
+                        {
+                            "type": "error",
+                            "data": {
+                                "message": "No active agent — send a start frame first"
+                            },
+                        }
+                    ):
                         break
 
         except WebSocketDisconnect:

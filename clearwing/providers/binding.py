@@ -157,6 +157,12 @@ def validate_agent_limits(route: str, d: Mapping | None) -> list[str]:
             continue
         if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
             problems.append(f"route {route!r} {name}={v!r} must be a positive integer")
+    v = d.get("identical_failure_streak")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
+        problems.append(
+            f"route {route!r} identical_failure_streak={v!r} must be a "
+            "non-negative integer (0 disables the guard)"
+        )
     return problems
 
 

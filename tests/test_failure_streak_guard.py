@@ -88,13 +88,96 @@ class TestIdenticalFailureStreak:
         events, paused, halted = await graph._arun_tool_calls(
             state, calls, resume_decision=...
         )
-        # Fourth call (2 * bound) halts the batch: only 3 tool results recorded,
-        # the halt notice is appended, and the loop is told to stop.
+        # Fourth call (2 * bound) halts the batch, but every tool_call in the
+        # batch must end up answered — unanswered tool_use 400s the next turn.
         assert halted is True
         assert paused is False
-        assert sum(1 for m in state["messages"] if getattr(m, "name", None) == "always_fails") == 3
+        tool_messages = [
+            m for m in state["messages"] if getattr(m, "name", None) == "always_fails"
+        ]
+        assert len(tool_messages) == len(calls)
+        answered_ids = {m.tool_call_id for m in tool_messages}
+        assert answered_ids == {c.call_id for c in calls}
         assert isinstance(state["messages"][-1], HumanMessage)
         assert "Automatic stop" in state["messages"][-1].content
+
+    @pytest.mark.asyncio
+    async def test_halt_mid_batch_answers_remaining_calls(self):
+        graph = _graph(AgentLimits(identical_failure_streak=1))
+        state = graph._get_or_create_state("t1")
+        # 5 calls, halt triggers on the 2nd (2 * bound with bound=1);
+        # calls 3-5 must still receive placeholder results.
+        calls = [_call("always_fails", {"target": "x"}, f"c{i}") for i in range(5)]
+
+        _events, _paused, halted = await graph._arun_tool_calls(
+            state, calls, resume_decision=...
+        )
+        assert halted is True
+        tool_messages = [
+            m for m in state["messages"] if getattr(m, "name", None) == "always_fails"
+        ]
+        assert {m.tool_call_id for m in tool_messages} == {c.call_id for c in calls}
+        skipped = [m for m in tool_messages if "skipped" in m.content]
+        assert len(skipped) == 3
+
+    @pytest.mark.asyncio
+    async def test_json_error_null_is_not_a_failure(self):
+        graph = _graph(AgentLimits(identical_failure_streak=1))
+        state = graph._get_or_create_state("t1")
+
+        @tool(name="returns_null_error")
+        def returns_null_error(target: str) -> dict:
+            """Shape that used to be misclassified as a failure."""
+            return {"error": None, "status": "ok", "target": target}
+
+        graph.tools["returns_null_error"] = returns_null_error
+        for i in range(5):
+            _, _paused, halted = await graph._arun_tool_calls(
+                state,
+                [_call("returns_null_error", {"target": "x"}, f"c{i}")],
+                resume_decision=...,
+            )
+            assert halted is False
+        assert not any(isinstance(m, HumanMessage) for m in state["messages"])
+
+    @pytest.mark.asyncio
+    async def test_user_denial_is_not_a_failure(self):
+        from clearwing.agent.runtime import _tool_result_failed
+
+        assert not _tool_result_failed('{"success": false, "error": "Exploit denied by user"}')
+
+    @pytest.mark.asyncio
+    async def test_max_tool_calls_stop_answers_tool_calls(self):
+        """Reaching max_tool_calls must not orphan the pending tool_use."""
+        limits = AgentLimits(max_tool_calls=1)
+        graph = _graph(limits)
+        thread_id = "t1"
+        state = graph._get_or_create_state(thread_id)
+
+        class _Msg:
+            def __init__(self, call_id):
+                self.content = ""
+                self.tool_calls = [_call("always_fails", {"target": "x"}, call_id)]
+
+        step = {"n": 0}
+
+        async def fake_step(st):
+            step["n"] += 1
+            st["messages"].append(_Msg(f"step-{step['n']}"))
+            return {}
+
+        graph._aassistant_step = fake_step
+
+        async for _ in graph._arun_loop(thread_id):
+            pass
+
+        tool_call_ids, answered_ids = set(), set()
+        for m in state["messages"]:
+            if getattr(m, "tool_calls", None):
+                tool_call_ids.update(tc.call_id for tc in m.tool_calls)
+            if getattr(m, "role", "") == "tool":
+                answered_ids.add(m.tool_call_id)
+        assert tool_call_ids == answered_ids, "orphaned tool_use would 400 the next turn"
 
     @pytest.mark.asyncio
     async def test_varying_args_breaks_streak(self):
@@ -158,3 +241,18 @@ class TestIdenticalFailureStreak:
             )
             assert halted is False
         assert not any(isinstance(m, HumanMessage) for m in state["messages"])
+
+
+class TestStreakValidator:
+    def test_zero_and_positive_accepted(self):
+        from clearwing.providers.binding import validate_agent_limits
+
+        assert validate_agent_limits("r", {"identical_failure_streak": 0}) == []
+        assert validate_agent_limits("r", {"identical_failure_streak": 6}) == []
+
+    def test_bad_types_rejected(self):
+        from clearwing.providers.binding import validate_agent_limits
+
+        assert validate_agent_limits("r", {"identical_failure_streak": "6"})
+        assert validate_agent_limits("r", {"identical_failure_streak": -1})
+        assert validate_agent_limits("r", {"identical_failure_streak": True})

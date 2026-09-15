@@ -292,15 +292,21 @@ class TestQueryKeyAuth:
     def test_reports_requires_key(self, client):
         assert client.get("/api/reports/whatever").status_code == 401
 
+    def test_non_ascii_key_is_401_not_500(self, client):
+        resp = client.get("/api/reports/abc?api_key=%C3%A9llo")
+        assert resp.status_code == 401
+
 
 class _FakeAI:
-    type = "ai"
-    content = "Task done: report attached"
+    def __init__(self, content="Task done: report attached"):
+        self.type = "ai"
+        self.content = content
 
 
 class _FakeGraph:
-    def __init__(self, events=None):
+    def __init__(self, events=None, resume_messages=None):
         self.events = events or []
+        self.resume_messages = resume_messages or []
 
     async def astream(self, input_msg, config, stream_mode="values"):
         for ev in self.events:
@@ -309,7 +315,7 @@ class _FakeGraph:
     async def ainvoke(self, input_data, config):
         from clearwing.agent.runtime import GraphStateSnapshot
 
-        return GraphStateSnapshot(values={})
+        return GraphStateSnapshot(values={"messages": list(self.resume_messages)})
 
 
 @pytest.fixture
@@ -376,6 +382,58 @@ class TestAgentSessionFlow:
                 break
             time.sleep(0.02)
         assert report.is_file(), "session report must be written even without any turn"
+
+    def test_message_before_start_gets_error_reply(self, client):
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "message", "content": "hello?"})
+            frame = ws.receive_json()
+            assert frame["type"] == "error"
+            assert "start" in frame["data"]["message"]
+
+    def test_approve_records_decision_and_response(self, client, monkeypatch, results_dir):
+        fake = _FakeGraph(resume_messages=[_FakeAI("post approval answer")])
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            started = ws.receive_json()
+            sid = started["session_id"]
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+            types = [f["type"] for f in frames]
+            assert "agent_message" in types
+
+        report = results_dir / "sessions" / sid / "report.md"
+        content = report.read_text(encoding="utf-8")
+        assert "[approval approved by operator]" in content
+        assert "post approval answer" in content
+
+
+class TestSessionReportHardening:
+    def test_report_redacts_key_shapes_and_is_owner_only(self, monkeypatch, tmp_path):
+        import stat as stat_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00001", model="m")
+        transcript.add_user("my key is sk-abcdefghijklmnopqrst")
+        transcript.add_user("token: supersecret123")
+        transcript.add_user("audit hash aabbccdd00112233aabbccdd00112233")
+        path = transcript.write()
+
+        assert stat_module.S_IMODE(path.stat().st_mode) == 0o600
+        content = path.read_text(encoding="utf-8")
+        assert "sk-abcdefghijklmnopqrst" not in content
+        assert "supersecret123" not in content
+        assert "aabbccdd00112233aabbccdd00112233" not in content
 
 
 class TestReportDownloadEndpoint:

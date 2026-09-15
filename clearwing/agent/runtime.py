@@ -59,8 +59,38 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _tool_result_failed(content: str) -> bool:
+    if "denied by user" in content[:500].lower():
+        return False  # a human decision, not a malfunction
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        # JSON-shaped results: only a non-empty error *string* is a failure.
+        # `{"error": null, "status": "ok"}` and friends are successes.
+        error = parsed.get("error")
+        return isinstance(error, str) and bool(error.strip())
     head = content[:2000].lower()
     return any(marker in head for marker in _FAILURE_MARKERS)
+
+
+def _synthesize_skipped_tool_results(
+    tool_calls: list[Any], reason: str
+) -> list[ToolMessage]:
+    """Placeholder ToolMessages for tool calls that will never run.
+
+    Providers reject a history where an assistant ``tool_use`` has no
+    matching ``tool_result`` (Anthropic/OpenAI both 400), so any path that
+    abandons a tool batch must answer every call before the turn ends.
+    """
+    return [
+        ToolMessage(
+            content=json.dumps({"error": f"skipped: {reason}"}),
+            name=str(getattr(tool_call, "fn_name", "") or ""),
+            tool_call_id=getattr(tool_call, "call_id", None),
+        )
+        for tool_call in tool_calls
+    ]
 
 
 def _streak_key(tool_name: str, tool_args: dict[str, Any]) -> str:
@@ -287,6 +317,26 @@ class NativeAgentGraph:
                 break
             if max_tool_calls is not None and tool_calls_total >= max_tool_calls:
                 logger.info("agent loop stopped: reached max_tool_calls=%d", max_tool_calls)
+                # The last AIMessage requested tools that will never run;
+                # answer them so the next turn doesn't send orphaned tool_use.
+                state.setdefault("messages", []).extend(
+                    _synthesize_skipped_tool_results(
+                        tool_calls, "tool-call budget (max_tool_calls) reached"
+                    )
+                )
+                state["messages"].append(
+                    HumanMessage(
+                        content=(
+                            "Automatic stop: the tool-call budget (max_tool_calls) has "
+                            "been reached. Summarize the progress and results collected "
+                            "so far."
+                        )
+                    )
+                )
+                if self.event_bus:
+                    self.event_bus.emit_message(
+                        "agent loop stopped: max_tool_calls reached", "warning"
+                    )
                 break
             tool_calls_total += len(tool_calls)
             tool_events, paused, halted = await self._arun_tool_calls(
@@ -465,6 +515,8 @@ class NativeAgentGraph:
                 if _tool_result_failed(content):
                     last_key, count = self._failure_runs.get(thread_id, ("", 0))
                     count = count + 1 if last_key == key else 1
+                    if len(self._failure_runs) > 256:
+                        self._failure_runs.pop(next(iter(self._failure_runs)))
                     self._failure_runs[thread_id] = (key, count)
                     if count == streak_bound:
                         nudge_count = count
@@ -478,6 +530,21 @@ class NativeAgentGraph:
                         logger.warning("agent turn halted: %s", halt_reason)
                         if self.event_bus:
                             self.event_bus.emit(EventType.ERROR, {"message": halt_reason})
+                        # Answer the halting call and every remaining call in
+                        # the batch, or the next turn 400s on orphaned tool_use.
+                        result_messages.append(
+                            ToolMessage(
+                                content=content,
+                                name=tool_name,
+                                tool_call_id=tool_call_id,
+                            )
+                        )
+                        result_messages.extend(
+                            _synthesize_skipped_tool_results(
+                                tool_calls[index + 1 :],
+                                "turn halted by identical-failure guard",
+                            )
+                        )
                         break
                 else:
                     self._failure_runs.pop(thread_id, None)
