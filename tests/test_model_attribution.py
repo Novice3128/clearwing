@@ -166,3 +166,83 @@ class TestEpisodeAttribution:
         assert episodes[0].session_id == "sess19"
         assert episodes[0].event_type == "tool:echo_tool"
         assert graph.episodic_memory.recall("other-target") == []
+
+
+class TestPricingKeyNormalization:
+    """Codex r2 P1: a versioned served name must not silently fall back to
+    Sonnet rates when the configured model has a real pricing entry."""
+
+    @pytest.mark.asyncio
+    async def test_versioned_served_name_prices_with_configured(self):
+        graph = _graph(
+            llm=_FakeLLM("claude-opus-4-7", "claude-opus-4-7-20260901")
+        )
+        cost, audit = _wire_recorders(graph)
+
+        state = graph._get_or_create_state("pricing-1")
+        await graph._aassistant_step(state)
+
+        # Pricing uses the priced configured name; metadata and audit keep
+        # the truthful served name.
+        assert cost.record_llm_call.call_args.args[2] == "claude-opus-4-7"
+        assert state["messages"][-1].response_metadata["model"] == (
+            "claude-opus-4-7-20260901"
+        )
+        assert audit.log_llm_call.call_args.kwargs["model"] == "claude-opus-4-7-20260901"
+
+    @pytest.mark.asyncio
+    async def test_unpriced_pair_keeps_served_name(self):
+        # Neither name is priced (glm-5.3 vs a versioned echo): keep the
+        # served name — the silent-fallback gap itself is issue #10.
+        graph = _graph(llm=_FakeLLM("glm-5.3", "glm-5.3-20260901"))
+        cost, _audit = _wire_recorders(graph)
+
+        state = graph._get_or_create_state("pricing-2")
+        await graph._aassistant_step(state)
+
+        assert cost.record_llm_call.call_args.args[2] == "glm-5.3-20260901"
+
+    @pytest.mark.asyncio
+    async def test_priced_served_name_wins(self):
+        graph = _graph(llm=_FakeLLM("claude-opus-4-7", "claude-opus-4-7"))
+        cost, _audit = _wire_recorders(graph)
+
+        state = graph._get_or_create_state("pricing-3")
+        await graph._aassistant_step(state)
+
+        assert cost.record_llm_call.call_args.args[2] == "claude-opus-4-7"
+
+
+class TestSessionModelExplicitRoundtrip:
+    """Codex r2 P2: persist the explicit/defer intent so `--resume` keeps an
+    intentionally chosen default model instead of deferring to config."""
+
+    def test_roundtrip_preserves_flag(self, tmp_path):
+        from clearwing.data.memory.session_store import SessionStore
+
+        store = SessionStore()
+        store.BASE_DIR = tmp_path
+        created = store.create(
+            target="10.0.0.1", model="claude-sonnet-4-6", model_explicit=True
+        )
+        loaded = store.load(created.session_id)
+        assert loaded.model_explicit is True
+
+    def test_legacy_row_without_field_reads_as_defer(self, tmp_path):
+        import json
+
+        from clearwing.data.memory.session_store import SessionStore
+
+        store = SessionStore()
+        store.BASE_DIR = tmp_path
+        legacy = {
+            "session_id": "deadbeef",
+            "target": "10.0.0.1",
+            "model": "claude-sonnet-4-6",
+            "status": "completed",
+            "start_time": "2026-09-01T00:00:00+00:00",
+        }
+        (tmp_path / "deadbeef.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+        loaded = store.load("deadbeef")
+        assert loaded.model_explicit is False

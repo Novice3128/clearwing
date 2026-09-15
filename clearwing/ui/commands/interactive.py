@@ -77,19 +77,26 @@ def handle(cli, args):
             cli.console.print(f"[green]Resuming session {session.session_id}[/green]")
             args.target = session.target
             # A stored value equal to the legacy argparse default is
-            # ambiguous: sessions saved before that default was removed
-            # stored the placeholder even when the user never chose a
-            # model, and promoting it would override config.yaml on
-            # resume. Treat it as "defer"; an explicit --model on this
-            # invocation still wins over the stored value.
+            # ambiguous on its own: sessions saved before that default was
+            # removed stored the placeholder even when the user never chose
+            # a model. New sessions persist the choice intent alongside
+            # (model_explicit); legacy rows default to "defer". An explicit
+            # --model on this invocation still wins over the stored value.
             if session.model and args.model is None:
                 args.model = session.model
-                args.model_explicit = session.model != DEFAULT_ANTHROPIC_MODEL
+                if session.model != DEFAULT_ANTHROPIC_MODEL:
+                    args.model_explicit = True
+                else:
+                    args.model_explicit = bool(getattr(session, "model_explicit", False))
         else:
             cli.console.print(f"[red]Session {resume_id} not found.[/red]")
             return
     else:
-        session = store.create(target=args.target or "", model=args.model or "")
+        session = store.create(
+            target=args.target or "",
+            model=args.model or "",
+            model_explicit=getattr(args, "model_explicit", args.model is not None),
+        )
 
     # Launch TUI or legacy mode
     use_tui = not getattr(args, "no_tui", False)

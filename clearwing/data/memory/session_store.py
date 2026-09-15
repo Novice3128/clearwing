@@ -6,7 +6,6 @@ import json
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 
 
 @dataclass
@@ -31,6 +30,11 @@ class SessionInfo:
     custom_tool_names: list[str] = field(default_factory=list)
     thread_id: str = ""
     langgraph_thread_id: str = ""
+    # Whether `model` was an explicit operator choice (vs deferred to
+    # config/env). Persisted so `--resume` can distinguish an intentional
+    # claude-sonnet-4-6 from the legacy argparse default; absent in rows
+    # saved before the field existed, which read as "defer".
+    model_explicit: bool = False
 
     def __post_init__(self) -> None:
         if not self.thread_id and self.langgraph_thread_id:
@@ -72,12 +76,13 @@ class SessionStore:
     # Public API
     # ------------------------------------------------------------------
 
-    def create(self, target: str, model: str) -> SessionInfo:
+    def create(self, target: str, model: str, model_explicit: bool = False) -> SessionInfo:
         """Create a new session and persist it to disk."""
         session = SessionInfo(
             session_id=uuid.uuid4().hex[:8],
             target=target,
             model=model,
+            model_explicit=model_explicit,
             status="running",
             start_time=datetime.now(tz=timezone.utc),
             thread_id=uuid.uuid4().hex,

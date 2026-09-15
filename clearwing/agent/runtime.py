@@ -496,11 +496,23 @@ class NativeAgentGraph:
         # actually served it. `model_name` is the caller-supplied label
         # (often the webui placeholder); the resolved endpoint model lives
         # on the client and is echoed back on every response.
-        effective_model = (
-            response.provider_model_name
-            or getattr(self.llm, "model_name", None)
-            or self.model_name
-        )
+        served_model = response.provider_model_name
+        configured_model = getattr(self.llm, "model_name", None)
+        effective_model = served_model or configured_model or self.model_name
+        # Pricing key: providers echo canonical/versioned names (e.g.
+        # claude-opus-4-7-20260901) that miss the pricing table — charging
+        # those at the Sonnet fallback would understate spend whenever the
+        # configured name is priced. Metadata and audit keep the served
+        # name; only the pricing lookup normalizes.
+        pricing_model = effective_model
+        if (
+            served_model
+            and configured_model
+            and served_model != configured_model
+            and not CostTracker.has_pricing(served_model)
+            and CostTracker.has_pricing(configured_model)
+        ):
+            pricing_model = configured_model
         ai_message = AIMessage(
             content=assistant_text,
             tool_calls=tool_calls,
@@ -519,7 +531,7 @@ class NativeAgentGraph:
             self.cost_tracker.record_llm_call(
                 input_tokens,
                 output_tokens,
-                effective_model,
+                pricing_model,
                 provider=provider_name,
             )
             state["total_cost_usd"] = self.cost_tracker.total_cost_usd
