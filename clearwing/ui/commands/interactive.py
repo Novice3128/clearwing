@@ -80,8 +80,9 @@ def handle(cli, args):
             # ambiguous: sessions saved before that default was removed
             # stored the placeholder even when the user never chose a
             # model, and promoting it would override config.yaml on
-            # resume. Treat it as "defer"; pass --model to pin a model.
-            if session.model:
+            # resume. Treat it as "defer"; an explicit --model on this
+            # invocation still wins over the stored value.
+            if session.model and args.model is None:
                 args.model = session.model
                 args.model_explicit = session.model != DEFAULT_ANTHROPIC_MODEL
         else:
