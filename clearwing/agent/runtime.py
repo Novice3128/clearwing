@@ -4,6 +4,7 @@ import ast
 import asyncio
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from clearwing.data.memory import ContextSummarizer, EpisodicMemory
 from clearwing.llm.messages import (
     AIMessage,
     BaseMessage,
+    HumanMessage,
     ToolMessage,
     _coerce_chat_messages,
 )
@@ -33,6 +35,40 @@ from .tooling import AgentTool, InterruptRequest, tool_execution_context
 
 logger = logging.getLogger(__name__)
 tracer = get_oi_tracer(__name__)
+
+# Consecutive-identical-failure guard: without it a model can loop on the
+# same failing tool call forever (session 932ff8ec repeated one failing
+# call 293 times, ~$249). Nudge at N, halt the turn at 2N. 0 disables.
+_DEFAULT_FAILURE_STREAK_NUDGE = 6
+
+_FAILURE_MARKERS = (
+    '"error"',
+    "error:",
+    "traceback (most recent call last)",
+    "unauthorized",
+    "permission denied",
+    "operation not permitted",
+)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _tool_result_failed(content: str) -> bool:
+    head = content[:2000].lower()
+    return any(marker in head for marker in _FAILURE_MARKERS)
+
+
+def _streak_key(tool_name: str, tool_args: dict[str, Any]) -> str:
+    try:
+        args_json = json.dumps(tool_args, sort_keys=True, default=str)
+    except Exception:
+        args_json = str(tool_args)
+    return f"{tool_name}:{args_json}"
 
 
 FLAG_PATTERNS = [
@@ -140,6 +176,8 @@ class NativeAgentGraph:
         self.on_text_delta: Callable[[str], None] | None = None
         self._state: dict[str, dict[str, Any]] = {}
         self._pending: dict[str, _PendingToolResume | None] = {}
+        # thread_id -> (streak_key, consecutive identical failure count)
+        self._failure_runs: dict[str, tuple[str, int]] = {}
 
         self.cost_tracker = (
             CostTracker() if enable_cost_tracker and capabilities.has("telemetry") else None
@@ -219,12 +257,12 @@ class NativeAgentGraph:
             return
         self._pending[thread_id] = None
         state = self._get_or_create_state(thread_id)
-        tool_events, paused = await self._arun_tool_calls(
+        tool_events, paused, halted = await self._arun_tool_calls(
             state, pending.tool_calls, resume_decision=approved
         )
         for event in tool_events:
             yield event
-        if paused:
+        if paused or halted:
             return
         async for event in self._arun_loop(thread_id):
             yield event
@@ -251,12 +289,12 @@ class NativeAgentGraph:
                 logger.info("agent loop stopped: reached max_tool_calls=%d", max_tool_calls)
                 break
             tool_calls_total += len(tool_calls)
-            tool_events, paused = await self._arun_tool_calls(
+            tool_events, paused, halted = await self._arun_tool_calls(
                 state, tool_calls, resume_decision=Ellipsis
             )
             for event in tool_events:
                 yield event
-            if paused:
+            if paused or halted:
                 break
 
     @tracer.chain(name="agent.assistant_step")
@@ -348,16 +386,32 @@ class NativeAgentGraph:
 
         return dict(state)
 
+    def _failure_streak_bound(self) -> int | None:
+        raw = None
+        if self.agent_limits is not None:
+            raw = getattr(self.agent_limits, "identical_failure_streak", None)
+        if raw is None:
+            raw = _env_int("CLEARWING_IDENTICAL_FAILURE_STREAK", _DEFAULT_FAILURE_STREAK_NUDGE)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return None
+        return raw
+
     async def _arun_tool_calls(
         self,
         state: dict[str, Any],
         tool_calls: list[Any],
         *,
         resume_decision: object,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
         events: list[dict[str, Any]] = []
         result_messages: list[BaseMessage] = []
         new_flags: list[dict[str, str]] = []
+        thread_id = self._find_thread_id_for_state(state)
+        streak_bound = self._failure_streak_bound()
+        nudge_count = 0
+        nudge_tool = ""
+        halted = False
+        halt_reason = ""
 
         for index, tool_call in enumerate(tool_calls):
             # tool_call is a genai ToolCall: .call_id / .fn_name / .fn_arguments
@@ -397,12 +451,36 @@ class NativeAgentGraph:
                             EventType.APPROVAL_NEEDED,
                             {"prompt": exc.prompt, "tool": tool_name},
                         )
-                    return events, True
+                    return events, True, False
                 except Exception as exc:
                     content = json.dumps({"error": str(exc)})
 
             if not isinstance(content, str):
                 content = json.dumps(content)
+
+            # Identical-failure streak guard: nudge at N consecutive identical
+            # failing calls, halt the turn at 2N (default N=6, env-overridable).
+            if streak_bound:
+                key = _streak_key(tool_name, tool_args)
+                if _tool_result_failed(content):
+                    last_key, count = self._failure_runs.get(thread_id, ("", 0))
+                    count = count + 1 if last_key == key else 1
+                    self._failure_runs[thread_id] = (key, count)
+                    if count == streak_bound:
+                        nudge_count = count
+                        nudge_tool = tool_name
+                    elif count >= 2 * streak_bound:
+                        halted = True
+                        halt_reason = (
+                            f"Tool '{tool_name}' failed with identical arguments "
+                            f"{count} times in a row (last result: {content[:200]})"
+                        )
+                        logger.warning("agent turn halted: %s", halt_reason)
+                        if self.event_bus:
+                            self.event_bus.emit(EventType.ERROR, {"message": halt_reason})
+                        break
+                else:
+                    self._failure_runs.pop(thread_id, None)
 
             message = ToolMessage(
                 content=content,
@@ -462,6 +540,30 @@ class NativeAgentGraph:
                 )
 
         state.setdefault("messages", []).extend(result_messages)
+        if nudge_count and not halted:
+            nudge = HumanMessage(
+                content=(
+                    f"Automatic guard: tool '{nudge_tool}' has now failed with identical "
+                    f"arguments {nudge_count} times in a row. Do not repeat the same call "
+                    "unchanged — adjust the approach or give your final answer."
+                )
+            )
+            state["messages"].append(nudge)
+            if self.event_bus:
+                self.event_bus.emit_message(nudge.content, "warning")
+        if halted:
+            state["messages"].append(
+                HumanMessage(
+                    content=(
+                        f"Automatic stop: {halt_reason} The turn has been halted to protect "
+                        "the budget. Summarize the progress and results collected so far."
+                    )
+                )
+            )
+            if self.audit_logger:
+                self.audit_logger.log_tool_call(
+                    tool_name=tool_name, args=tool_args, result=halt_reason
+                )
         if new_flags:
             existing_flags = list(state.get("flags_found", []))
             state["flags_found"] = existing_flags + new_flags
@@ -469,7 +571,7 @@ class NativeAgentGraph:
                 self.event_bus.emit(EventType.FLAG_FOUND, {"flags": new_flags})
 
         events.append(dict(state))
-        return events, False
+        return events, False, halted
 
     async def _ainvoke_tool(
         self, tool: AgentTool, arguments: dict[str, Any], resume_decision: object

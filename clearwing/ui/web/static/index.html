@@ -260,9 +260,19 @@ function startSession() {
       case 'error':
         addMessage(`Error: ${data.message || JSON.stringify(data)}`, 'error');
         break;
-      case 'complete':
+      case 'complete': {
         addMessage('Agent completed.', 'tool');
+        if (data.report_url) {
+          // The reports endpoint accepts the same ?api_key= auth as the WS.
+          const sep = data.report_url.includes('?') ? '&' : '?';
+          const wrap = addMessage('', 'tool');
+          const link = document.createElement('a');
+          link.href = `${data.report_url}${sep}api_key=${encodeURIComponent(webuiKey)}`;
+          link.textContent = 'Download session report';
+          wrap.appendChild(link);
+        }
         break;
+      }
       case 'campaign_progress':
         opsState.campaign = data;
         updateOpsPanel();

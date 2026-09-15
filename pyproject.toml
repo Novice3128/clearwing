@@ -125,6 +125,10 @@ clearwing = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
+markers = [
+    "integration: tests that require a Docker daemon; skipped in CI without Docker",
+    "timeout(seconds): per-test time limit (enforced when pytest-timeout is installed)",
+]
 
 [tool.black]
 line-length = 100

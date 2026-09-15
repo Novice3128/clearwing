@@ -83,7 +83,7 @@ class TestApprovalNeededEvent:
         bus = EventBus()
         bus.subscribe(EventType.APPROVAL_NEEDED, handler)
         try:
-            events, paused = await graph._arun_tool_calls(
+            events, paused, _halted = await graph._arun_tool_calls(
                 state, [_tool_call()], resume_decision=...
             )
         finally:
@@ -114,7 +114,7 @@ class TestApprovalNeededEvent:
         bus = EventBus()
         bus.subscribe(EventType.APPROVAL_NEEDED, handler)
         try:
-            _, paused = await graph._arun_tool_calls(state, [_tool_call()], resume_decision=...)
+            _, paused, _halted = await graph._arun_tool_calls(state, [_tool_call()], resume_decision=...)
             assert paused is True
             assert len(emitted) == 1
 
@@ -139,7 +139,7 @@ class TestApprovalNeededEvent:
         config = {"configurable": {"thread_id": "t3"}}
         state = graph._get_or_create_state("t3")
 
-        _, paused = await graph._arun_tool_calls(state, [_tool_call()], resume_decision=...)
+        _, paused, _halted = await graph._arun_tool_calls(state, [_tool_call()], resume_decision=...)
         assert paused is True
 
         _stub_assistant_step(graph)

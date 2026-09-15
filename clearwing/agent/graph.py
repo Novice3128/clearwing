@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from clearwing.agent.runtime import NativeAgentGraph, populate_knowledge_graph
@@ -8,9 +9,35 @@ from clearwing.agent.tooling import ensure_agent_tool
 from clearwing.capabilities import capabilities
 from clearwing.llm.native import AsyncLLMClient
 from clearwing.providers import ProviderManager, resolve_llm_endpoint
+from clearwing.providers.binding import AgentLimits
 
 from .prompts import build_system_prompt
 from .tools import get_all_tools, get_custom_tools
+
+
+def _default_agent_limits() -> AgentLimits:
+    """Env-overridable loop bounds for entry points without a provider profile.
+
+    Without these a WebUI/CLI session can loop unbounded (session 932ff8ec
+    repeated one failing tool call 293 times, ~$249). The defaults are
+    generous for legitimate tasks; set CLEARWING_MAX_STEPS /
+    CLEARWING_MAX_TOOL_CALLS to override (values <= 0 mean unbounded).
+    """
+
+    def _env_int(name: str, default: int) -> int | None:
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return value if value > 0 else None
+
+    return AgentLimits(
+        max_steps=_env_int("CLEARWING_MAX_STEPS", 100),
+        max_tool_calls=_env_int("CLEARWING_MAX_TOOL_CALLS", 400),
+    )
 
 
 def _default_pentest_state_updater(tool_name: str, data: Any, state: dict) -> dict:
@@ -141,6 +168,7 @@ def create_agent(
     agent_limits = None
     if provider_manager is None:
         llm = _create_llm(model_name, base_url=base_url, api_key=api_key)
+        agent_limits = _default_agent_limits()
     else:
         llm = _create_llm(
             model_name,

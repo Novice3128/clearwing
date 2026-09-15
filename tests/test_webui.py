@@ -270,3 +270,131 @@ class TestCorsOrigins:
             "CLEARWING_WEB_CORS_ORIGINS", "https://a.example, https://b.example "
         )
         assert _cors_origins() == ["https://a.example", "https://b.example"]
+
+
+class TestQueryKeyAuth:
+    """Browsers cannot set headers; every key-gated route must accept ?api_key=."""
+
+    def test_operate_accepts_query_key(self, client):
+        resp = client.post(
+            f"/api/operate?api_key={API_KEY}",
+            json={"target": "10.0.0.1", "goals": ["g"]},
+        )
+        assert resp.status_code == 200
+
+    def test_operate_rejects_wrong_query_key(self, client):
+        resp = client.post(
+            "/api/operate?api_key=wrong",
+            json={"target": "10.0.0.1", "goals": ["g"]},
+        )
+        assert resp.status_code == 401
+
+    def test_reports_requires_key(self, client):
+        assert client.get("/api/reports/whatever").status_code == 401
+
+
+class _FakeAI:
+    type = "ai"
+    content = "Task done: report attached"
+
+
+class _FakeGraph:
+    def __init__(self, events=None):
+        self.events = events or []
+
+    async def astream(self, input_msg, config, stream_mode="values"):
+        for ev in self.events:
+            yield ev
+
+    async def ainvoke(self, input_data, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values={})
+
+
+@pytest.fixture
+def results_dir(tmp_path, monkeypatch):
+    import clearwing.ui.web.session_report as session_report
+
+    root = tmp_path / "results"
+    monkeypatch.setattr(session_report, "default_results_dir", lambda sub: root / sub)
+    return root
+
+
+class TestAgentSessionFlow:
+    """config → prompt → (tools) → complete → deterministic report artifact."""
+
+    def test_message_turn_completes_with_report(self, client, monkeypatch, results_dir):
+        fake = _FakeGraph(events=[{"messages": [_FakeAI()]}])
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "10.0.0.1", "model": "m"})
+            started = ws.receive_json()
+            assert started["type"] == "started"
+
+            ws.send_json({"type": "message", "content": "scan it and report"})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+            types = [f["type"] for f in frames]
+            assert "agent_message" in types
+            complete = frames[-1]
+            assert complete["data"]["report_url"].startswith("/api/reports/")
+
+        sid = complete["data"]["session_id"]
+        report = results_dir / "sessions" / sid / "report.md"
+        assert report.is_file()
+        content = report.read_text(encoding="utf-8")
+        assert "scan it and report" in content
+        assert "Task done" in content
+
+    def test_start_failure_sends_error_frame(self, client, monkeypatch):
+        def boom(**kwargs):
+            raise RuntimeError("no llm configured")
+
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", boom)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "x", "model": "m"})
+            frame = ws.receive_json()
+            assert frame["type"] == "error"
+            assert "Failed to start agent" in frame["data"]["message"]
+
+    def test_report_written_on_disconnect_after_start(self, client, monkeypatch, results_dir):
+        import time
+
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: _FakeGraph())
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            started = ws.receive_json()
+            sid = started["session_id"]
+        report = results_dir / "sessions" / sid / "report.md"
+        for _ in range(100):
+            if report.is_file():
+                break
+            time.sleep(0.02)
+        assert report.is_file(), "session report must be written even without any turn"
+
+
+class TestReportDownloadEndpoint:
+    def test_serves_report_with_query_key(self, client, monkeypatch, results_dir):
+        import clearwing.ui.web.session_report as session_report
+
+        transcript = session_report.SessionTranscript("abc12345", target="t", model="m")
+        transcript.add_user("hello")
+        path = transcript.write()
+        assert path.is_file()
+
+        resp = client.get(f"/api/reports/abc12345?api_key={API_KEY}")
+        assert resp.status_code == 200
+        assert b"hello" in resp.content
+
+    def test_404_for_unknown_session(self, client):
+        resp = client.get(f"/api/reports/zzzzzzzz?api_key={API_KEY}")
+        assert resp.status_code == 404
+
+    def test_400_for_malformed_session_id(self, client):
+        resp = client.get("/api/reports/..%2Fetc%2Fpasswd?api_key=" + API_KEY)
+        assert resp.status_code in (400, 404)
