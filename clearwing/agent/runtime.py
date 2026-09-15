@@ -220,7 +220,12 @@ class NativeAgentGraph:
             CostTracker() if enable_cost_tracker and capabilities.has("telemetry") else None
         )
         self.episodic_memory = (
-            EpisodicMemory() if enable_episodic_memory and capabilities.has("memory") else None
+            # session_id flows into every recorded episode; without it all
+            # rows landed with session_id='' and could not be attributed
+            # (issue #19).
+            EpisodicMemory(session_id=session_id or "")
+            if enable_episodic_memory and capabilities.has("memory")
+            else None
         )
         self.context_summarizer = (
             ContextSummarizer()
@@ -487,6 +492,15 @@ class NativeAgentGraph:
         # ChatMessage assistant round-trips them, and so the tool loop can
         # pair each result by call_id.
         tool_calls = list(response.tool_calls)
+        # Cost pricing and audit must attribute the call to the model that
+        # actually served it. `model_name` is the caller-supplied label
+        # (often the webui placeholder); the resolved endpoint model lives
+        # on the client and is echoed back on every response.
+        effective_model = (
+            response.provider_model_name
+            or getattr(self.llm, "model_name", None)
+            or self.model_name
+        )
         ai_message = AIMessage(
             content=assistant_text,
             tool_calls=tool_calls,
@@ -496,7 +510,7 @@ class NativeAgentGraph:
                     "output_tokens": (usage.completion_tokens or 0) if usage else 0,
                     "total_tokens": (usage.total_tokens or 0) if usage else 0,
                 },
-                "model": response.provider_model_name or self.model_name,
+                "model": effective_model,
             },
         )
         state.setdefault("messages", []).append(ai_message)
@@ -505,14 +519,14 @@ class NativeAgentGraph:
             self.cost_tracker.record_llm_call(
                 input_tokens,
                 output_tokens,
-                self.model_name,
+                effective_model,
                 provider=provider_name,
             )
             state["total_cost_usd"] = self.cost_tracker.total_cost_usd
             state["total_tokens"] = self.cost_tracker.input_tokens + self.cost_tracker.output_tokens
             if self.audit_logger:
                 self.audit_logger.log_llm_call(
-                    model=self.model_name,
+                    model=effective_model,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cost_usd=self.cost_tracker.total_cost_usd,

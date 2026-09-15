@@ -58,11 +58,18 @@ class ClearwingApp(App):
     ]
 
     def __init__(
-        self, target=None, model="claude-sonnet-4-6", session_id=None, base_url=None, api_key=None
+        self,
+        target=None,
+        model="claude-sonnet-4-6",
+        session_id=None,
+        base_url=None,
+        api_key=None,
+        model_explicit: bool = False,
     ):
         super().__init__()
         self.target = target
         self.model = model
+        self.model_explicit = model_explicit
         self.session_id = session_id
         self.base_url = base_url
         self.api_key = api_key
@@ -92,13 +99,17 @@ class ClearwingApp(App):
             session_id=self.session_id,
             base_url=self.base_url,
             api_key=self.api_key,
+            model_explicit=self.model_explicit,
         )
         self._agent_config = {"configurable": {"thread_id": self.session_id or "tui-session"}}
 
         feed = self.query_one(ActivityFeed)
         if self.target:
             feed.add_message(f"Target: {self.target}", "info")
-        feed.add_message(f"Model: {self.model}", "info")
+        resolved_model = getattr(
+            getattr(self._agent_graph, "llm", None), "model_name", None
+        )
+        feed.add_message(f"Model: {resolved_model or self.model or 'config'}", "info")
         feed.add_message("Agent ready. Type a message to begin.", "success")
 
         self.run_worker(self._agent_loop(), exclusive=True)

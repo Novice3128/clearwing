@@ -720,8 +720,10 @@ def create_app():
                         if not await _reject_busy_frame():
                             break
                         continue
-                    # Initialize agent
-                    model = data.get("model", "claude-sonnet-4-6")
+                    # Initialize agent. An empty model field means "defer to
+                    # config.yaml/env"; a non-empty one is an explicit choice
+                    # that must win over the configured model (issue #22).
+                    model = (data.get("model") or "").strip() or None
                     target = data.get("target", "")
                     handler_target = target
                     session_id = uuid.uuid4().hex[:8]
@@ -732,6 +734,7 @@ def create_app():
                             session_id=session_id,
                             base_url=data.get("base_url"),
                             api_key=data.get("api_key"),
+                            model_explicit=model is not None,
                         )
                     except Exception as e:
                         logger.exception("Failed to create agent for ws session")
@@ -746,14 +749,23 @@ def create_app():
                             break
                         continue
                     config = {"configurable": {"thread_id": f"ws-{session_id}"}}
-                    transcript = SessionTranscript(session_id, target=target, model=model)
+                    # Report the model that actually got configured (config
+                    # fallback may resolve a different one than the frame).
+                    resolved_model = (
+                        getattr(getattr(graph, "llm", None), "model_name", None)
+                        or model
+                        or ""
+                    )
+                    transcript = SessionTranscript(
+                        session_id, target=target, model=resolved_model
+                    )
 
                     if not await _safe_send(
                         {
                             "type": "started",
                             "session_id": session_id,
                             "target": target,
-                            "model": model,
+                            "model": resolved_model,
                         }
                     ):
                         break
