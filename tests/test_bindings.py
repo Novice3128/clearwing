@@ -457,7 +457,7 @@ class TestAgentLoopEnforcement:
 
         async def fake_tools(st, tcs, resume_decision=None):
             steps["tools"] += 1
-            return ([], False)
+            return ([], False, False)
 
         graph._aassistant_step = fake_step
         graph._arun_tool_calls = fake_tools

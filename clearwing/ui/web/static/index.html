@@ -260,9 +260,34 @@ function startSession() {
       case 'error':
         addMessage(`Error: ${data.message || JSON.stringify(data)}`, 'error');
         break;
-      case 'complete':
+      case 'complete': {
         addMessage('Agent completed.', 'tool');
+        if (data.report_url && webuiKey) {
+          // Download via fetch + header so the key never lands in an href
+          // (browser history) or the server's access log query string.
+          const wrap = addMessage('', 'tool');
+          const link = document.createElement('a');
+          link.href = '#';
+          link.textContent = 'Download session report';
+          link.onclick = async (ev) => {
+            ev.preventDefault();
+            try {
+              const resp = await fetch(data.report_url, {headers: {'X-API-Key': webuiKey}});
+              if (!resp.ok) throw new Error('HTTP ' + resp.status);
+              const blob = await resp.blob();
+              const a = document.createElement('a');
+              a.href = URL.createObjectURL(blob);
+              a.download = `clearwing-report-${data.session_id || 'session'}.md`;
+              a.click();
+              URL.revokeObjectURL(a.href);
+            } catch (err) {
+              addMessage('Report download failed: ' + err.message, 'error');
+            }
+          };
+          wrap.appendChild(link);
+        }
         break;
+      }
       case 'campaign_progress':
         opsState.campaign = data;
         updateOpsPanel();

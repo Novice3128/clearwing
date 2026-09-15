@@ -125,7 +125,7 @@ class TestNestedApprovalAtGraphLevel:
         bus = EventBus()
         bus.subscribe(EventType.APPROVAL_NEEDED, handler)
         try:
-            _, paused = await graph._arun_tool_calls(
+            _, paused, _halted = await graph._arun_tool_calls(
                 state, [_outer_tool_call()], resume_decision=...
             )
             assert paused is True
@@ -155,7 +155,7 @@ class TestNestedApprovalAtGraphLevel:
         config = {"configurable": {"thread_id": "nested-2"}}
         state = graph._get_or_create_state("nested-2")
 
-        _, paused = await graph._arun_tool_calls(state, [_outer_tool_call()], resume_decision=...)
+        _, paused, _halted = await graph._arun_tool_calls(state, [_outer_tool_call()], resume_decision=...)
         assert paused is True
 
         _stub_assistant_step(graph)

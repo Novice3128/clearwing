@@ -119,6 +119,7 @@ def handle(cli, args) -> None:
     sections: list[DoctorSection] = [
         _check_python_and_clearwing(),
         _check_llm_provider(cli, skip_invoke=args.skip_llm_invoke),
+        _check_web_and_sandbox(),
         _check_filesystem(cli),
         _check_docker(),
         _check_external_tools(),
@@ -160,6 +161,92 @@ def _check_python_and_clearwing() -> DoctorSection:
         )
 
     section.add(DoctorCheck("clearwing", STATUS_OK, cw_version))
+    return section
+
+
+# --- Section: Web UI / sandbox runtime -----------------------------------
+
+
+def _check_web_and_sandbox() -> DoctorSection:
+    """Surface the env vars that silently gate the prompt→report loop.
+
+    CLEARWING_WEB_API_KEY is the big one: when it is unset the webui mounts
+    stub endpoints and closes /ws/agent (1008), which looks like a mysterious
+    "can't connect" from the browser. WARN (not ERR) because CLI-only
+    operators legitimately run without it.
+    """
+    section = DoctorSection("Web UI / sandbox")
+
+    if os.environ.get("CLEARWING_WEB_API_KEY"):
+        section.add(
+            DoctorCheck(
+                "CLEARWING_WEB_API_KEY",
+                STATUS_OK,
+                "set — webui chat (/ws/agent) and /api/operate enabled",
+            )
+        )
+    else:
+        section.add(
+            DoctorCheck(
+                "CLEARWING_WEB_API_KEY",
+                STATUS_WARN,
+                "not set — webui chat and operator API are disabled",
+                hint="Set CLEARWING_WEB_API_KEY and restart the webui to enable it.",
+            )
+        )
+
+    try:
+        from clearwing.sandbox.dind import get_docker_host
+
+        docker_desc = f"sandbox docker host: {get_docker_host()}"
+    except Exception as exc:  # pragma: no cover - resolver is env-dependent
+        docker_desc = f"docker host resolver failed ({exc}); default socket assumed"
+    section.add(DoctorCheck("Docker host", STATUS_OK, docker_desc))
+
+    sandbox_endpoint = (os.environ.get("CLEARWING_SANDBOX_ENDPOINT") or "").strip()
+    if sandbox_endpoint:
+        sandbox_desc = f"JSON-RPC sandbox supervisor at {sandbox_endpoint}"
+    else:
+        sandbox_desc = (
+            "DockerSandboxBackend (set CLEARWING_SANDBOX_ENDPOINT for a remote supervisor)"
+        )
+    section.add(DoctorCheck("Sandbox backend", STATUS_OK, sandbox_desc))
+
+    def _parsed_env_int(name: str, default: int) -> tuple[int | str, bool]:
+        """(effective value, raw value was invalid).
+
+        Mirrors the runtime parsers: non-integers fall back to the default,
+        non-positive limits mean unbounded/disabled.
+        """
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            return default, False
+        try:
+            value = int(raw)
+        except ValueError:
+            return default, True
+        if value <= 0:
+            return "unbounded" if name != "CLEARWING_IDENTICAL_FAILURE_STREAK" else "disabled", True
+        return value, False
+
+    steps, steps_bad = _parsed_env_int("CLEARWING_MAX_STEPS", 100)
+    calls, calls_bad = _parsed_env_int("CLEARWING_MAX_TOOL_CALLS", 400)
+    streak, streak_bad = _parsed_env_int("CLEARWING_IDENTICAL_FAILURE_STREAK", 6)
+    bounds_msg = f"max_steps={steps} max_tool_calls={calls} identical_failure_streak={streak}"
+    section.add(
+        DoctorCheck(
+            "Agent loop bounds",
+            STATUS_WARN if (steps_bad or calls_bad or streak_bad) else STATUS_OK,
+            bounds_msg,
+            hint=(
+                "Override with CLEARWING_MAX_STEPS / CLEARWING_MAX_TOOL_CALLS / "
+                "CLEARWING_IDENTICAL_FAILURE_STREAK (values <= 0 mean unbounded; "
+                "invalid values fall back to the default)."
+                if (steps_bad or calls_bad or streak_bad)
+                else ""
+            ),
+        )
+    )
     return section
 
 

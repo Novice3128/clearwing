@@ -88,7 +88,8 @@ class ReportGenerator:
         if scan_result.open_ports:
             for port in scan_result.open_ports:
                 lines.append(
-                    f"  Port {port['port']}/{port['protocol']}: {port['service']} ({port['state']})"
+                    f"  Port {port.get('port', '?')}/{port.get('protocol', 'tcp')}: "
+                    f"{port.get('service', '')} ({port.get('state', 'open')})"
                 )
         else:
             lines.append("  No open ports found")
@@ -100,8 +101,8 @@ class ReportGenerator:
         if scan_result.services:
             for service in scan_result.services:
                 lines.append(
-                    f"  Port {service['port']}: "
-                    f"{_format_service_label(service['service'], service.get('version'))}"
+                    f"  Port {service.get('port', '?')}: "
+                    f"{_format_service_label(service.get('service', '?'), service.get('version'))}"
                 )
                 if service.get("banner"):
                     lines.append(f"    Banner: {service['banner'][:100]}...")
@@ -202,10 +203,10 @@ class ReportGenerator:
         for port in scan_result.open_ports:
             html += (
                 "        <tr>"
-                f"<td>{html_escape(str(port['port']))}</td>"
-                f"<td>{html_escape(str(port['protocol']))}</td>"
-                f"<td>{html_escape(str(port['service']))}</td>"
-                f"<td>{html_escape(str(port['state']))}</td>"
+                f"<td>{html_escape(str(port.get('port', '?')))}</td>"
+                f"<td>{html_escape(str(port.get('protocol', 'tcp')))}</td>"
+                f"<td>{html_escape(str(port.get('service', '')))}</td>"
+                f"<td>{html_escape(str(port.get('state', 'open')))}</td>"
                 "</tr>\n"
             )
 
@@ -266,10 +267,10 @@ class ReportGenerator:
 """
         for port in scan_result.open_ports:
             md += (
-                f"| {markdown_table_cell(port['port'])} "
-                f"| {markdown_table_cell(port['protocol'])} "
-                f"| {markdown_table_cell(port['service'])} "
-                f"| {markdown_table_cell(port['state'])} |\n"
+                f"| {markdown_table_cell(port.get('port', '?'))} "
+                f"| {markdown_table_cell(port.get('protocol', 'tcp'))} "
+                f"| {markdown_table_cell(port.get('service', ''))} "
+                f"| {markdown_table_cell(port.get('state', 'open'))} |\n"
             )
 
         md += "\n## Vulnerabilities\n\n"

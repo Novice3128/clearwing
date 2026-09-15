@@ -509,3 +509,26 @@ class TestDoctorSubcommand:
             with pytest.raises(SystemExit) as exc:
                 doctor.handle(tmp_cli, args)
             assert exc.value.code == 0
+
+
+class TestWebAndSandboxSection:
+    """The Web UI / sandbox section surfaces the env vars that silently
+    gate the prompt→report loop (notably CLEARWING_WEB_API_KEY)."""
+
+    def test_warn_when_web_key_unset(self, monkeypatch):
+        monkeypatch.delenv("CLEARWING_WEB_API_KEY", raising=False)
+        section = doctor._check_web_and_sandbox()
+        key_check = next(c for c in section.checks if c.name == "CLEARWING_WEB_API_KEY")
+        assert key_check.status == STATUS_WARN
+
+    def test_ok_when_web_key_set(self, monkeypatch):
+        monkeypatch.setenv("CLEARWING_WEB_API_KEY", "k")
+        section = doctor._check_web_and_sandbox()
+        key_check = next(c for c in section.checks if c.name == "CLEARWING_WEB_API_KEY")
+        assert key_check.status == STATUS_OK
+
+    def test_loop_bounds_check_present(self):
+        section = doctor._check_web_and_sandbox()
+        bounds = next(c for c in section.checks if c.name == "Agent loop bounds")
+        assert bounds.status == STATUS_OK
+        assert "max_steps" in bounds.message

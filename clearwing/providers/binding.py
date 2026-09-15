@@ -120,6 +120,10 @@ class AgentLimits:
     max_steps: int | None = None
     max_tool_calls: int | None = None
     max_retries: int | None = None
+    # Abort guard: after this many *consecutive identical* failing tool calls
+    # (same tool + same args + error-looking result) the runtime injects a
+    # correction message, and at 2x it halts the turn. None → runtime default.
+    identical_failure_streak: int | None = None
 
     @classmethod
     def from_dict(cls, d: Mapping | None) -> AgentLimits | None:
@@ -129,6 +133,7 @@ class AgentLimits:
             max_steps=d.get("max_steps"),
             max_tool_calls=d.get("max_tool_calls"),
             max_retries=d.get("max_retries"),
+            identical_failure_streak=d.get("identical_failure_streak"),
         )
 
     @property
@@ -137,6 +142,7 @@ class AgentLimits:
             self.max_steps is None
             and self.max_tool_calls is None
             and self.max_retries is None
+            and self.identical_failure_streak is None
         )
 
 
@@ -151,6 +157,12 @@ def validate_agent_limits(route: str, d: Mapping | None) -> list[str]:
             continue
         if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
             problems.append(f"route {route!r} {name}={v!r} must be a positive integer")
+    v = d.get("identical_failure_streak")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
+        problems.append(
+            f"route {route!r} identical_failure_streak={v!r} must be a "
+            "non-negative integer (0 disables the guard)"
+        )
     return problems
 
 

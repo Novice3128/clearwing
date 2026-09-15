@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,8 +22,27 @@ from clearwing.agent.runtime import Command
 from clearwing.core.events import EventBus, EventType
 from clearwing.observability import MetricsCollector
 from clearwing.observability.integration import ObservabilityIntegration
+from clearwing.ui.web.session_report import SessionTranscript, session_report_path
 
 logger = logging.getLogger(__name__)
+
+
+def _last_ai_content(values: dict[str, Any] | None) -> str:
+    """Last non-empty AI message text from a graph state snapshot."""
+    messages = (values or {}).get("messages", [])
+    for message in reversed(messages):
+        if getattr(message, "type", "") != "ai":
+            continue
+        content = message.content
+        if isinstance(content, list):
+            content = "\n".join(
+                part["text"]
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        if content:
+            return content
+    return ""
 
 
 def _make_session_store():
@@ -69,19 +88,32 @@ def create_app():
 
     _api_key = os.environ.get("CLEARWING_WEB_API_KEY")
 
-    def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    def require_api_key(
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        api_key: str | None = Query(default=None),
+    ) -> None:
+        # Browsers cannot set headers on WebSocket/REST calls, so the query
+        # param is accepted everywhere the header is (same as _ws_authorized).
+        provided = x_api_key or api_key
         if not _api_key:
             # Should be unreachable because routes are not mounted without a key,
             # but keep a defensive fallback.
             raise HTTPException(status_code=503, detail="API key not configured")
-        if x_api_key is None or not hmac.compare_digest(x_api_key, _api_key):
+        if not _key_matches(provided, _api_key):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    def _key_matches(provided: str | None, expected: str) -> bool:
+        if provided is None:
+            return False
+        try:
+            return hmac.compare_digest(provided.encode(), expected.encode())
+        except (TypeError, AttributeError, UnicodeEncodeError):
+            # Non-ASCII junk must be a 401, not a 500.
+            return False
 
     def _ws_authorized(websocket: WebSocket) -> bool:
         provided = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
-        return bool(
-            _api_key and provided is not None and hmac.compare_digest(provided, _api_key)
-        )
+        return bool(_api_key and _key_matches(provided, _api_key))
 
     # Serve the single-page frontend
     _static_dir = Path(__file__).parent / "static"
@@ -342,6 +374,18 @@ def create_app():
             raise HTTPException(status_code=404, detail="Session not found")
         return _sessions[session_id]
 
+    @app.get("/api/reports/{session_id}", dependencies=[Depends(require_api_key)])
+    async def get_session_report(session_id: str):
+        """Download the deterministic markdown report for an agent session."""
+        import re
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+            raise HTTPException(status_code=400, detail="Invalid session id")
+        path = session_report_path(session_id)
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(path, media_type="text/markdown", filename=path.name)
+
     # ---------------------------------------------------------------
     # WebSocket endpoint for real-time streaming
     # ---------------------------------------------------------------
@@ -361,7 +405,10 @@ def create_app():
         - Server sends: {"type": "cost_update", "cost_usd": 0.05, "tokens": 1000}
         - Server sends: {"type": "approval_needed", "prompt": "..."}
         - Server sends: {"type": "error", "message": "..."}
-        - Server sends: {"type": "complete"}
+        - Server sends: {"type": "complete", "data": {"session_id": "...",
+                       "report_path": "...", "report_url": "/api/reports/<id>"}}
+          (emitted after each message/approve turn; report_path/report_url
+          appear once the agent session has been started)
         """
         if not _ws_authorized(websocket):
             await websocket.close(code=1008)
@@ -369,6 +416,33 @@ def create_app():
         await websocket.accept()
 
         message_queue: asyncio.Queue = asyncio.Queue()
+        transcript: SessionTranscript | None = None
+        # EventBus is a process-wide singleton whose payloads carry no session
+        # id, so bus events can only be attributed while THIS session's turn
+        # is running; record nothing outside the window.
+        turn_state = {"active": False}
+
+        def _record_in_transcript(event_name: str, data: Any) -> None:
+            """Mirror bus events into the session report transcript."""
+            if transcript is None or not turn_state["active"] or not isinstance(data, dict):
+                return
+            if event_name == "tool_start":
+                transcript.add_tool(
+                    data.get("tool") or data.get("name") or "tool", args=data.get("args")
+                )
+            elif event_name == "tool_result":
+                if transcript.tool_calls and transcript.tool_calls[-1].get("content_length") is None:
+                    transcript.tool_calls[-1]["content_length"] = data.get("content_length")
+            elif event_name == "cost_update":
+                # CostTracker emits total_cost_usd / input_tokens / output_tokens.
+                tokens = data.get("tokens")
+                if tokens is None:
+                    tokens = (data.get("input_tokens") or 0) + (data.get("output_tokens") or 0)
+                transcript.set_cost(
+                    data.get("total_cost_usd", data.get("cost_usd")), tokens
+                )
+            elif event_name == "error":
+                transcript.add_error(data.get("message") or str(data))
 
         # Subscribe to EventBus and forward events to the WebSocket
         try:
@@ -387,6 +461,7 @@ def create_app():
                         message_queue.put_nowait(
                             {"type": event_type_name, "data": serializable}
                         )
+                        _record_in_transcript(event_type_name, serializable)
                     except Exception:
                         logger.debug("Failed to enqueue event", exc_info=True)
 
@@ -421,16 +496,52 @@ def create_app():
         graph = None
         config = None
 
+        async def _safe_send(payload: dict) -> bool:
+            try:
+                await websocket.send_json(payload)
+                return True
+            except Exception:
+                # Client went away mid-send; the receive loop will observe the
+                # disconnect. Never let a send failure kill the handler.
+                return False
+
+        async def _pump_events() -> None:
+            # Forward queued bus events while the agent loop is running —
+            # the receive loop below cannot drain the queue mid-turn, so
+            # without this pump, tool progress and approvals arrive late.
+            while True:
+                msg = await message_queue.get()
+                if not await _safe_send(msg):
+                    return
+
+        async def _drain_events() -> None:
+            while True:
+                try:
+                    msg = message_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not await _safe_send(msg):
+                    return
+
+        def _complete_payload() -> dict:
+            data: dict[str, Any] = {}
+            if transcript is not None:
+                try:
+                    report_path = transcript.write()
+                except Exception:
+                    logger.debug("Failed to write session report", exc_info=True)
+                else:
+                    data = {
+                        "session_id": transcript.session_id,
+                        "report_path": str(report_path),
+                        "report_url": f"/api/reports/{transcript.session_id}",
+                    }
+            return {"type": "complete", "data": data}
+
+        pump = asyncio.create_task(_pump_events())
+
         try:
             while True:
-                # Check for queued events to send
-                try:
-                    while not message_queue.empty():
-                        msg = message_queue.get_nowait()
-                        await websocket.send_json(msg)
-                except asyncio.QueueEmpty:
-                    pass
-
                 # Receive client message with timeout
                 try:
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
@@ -448,28 +559,46 @@ def create_app():
                     target = data.get("target", "")
                     session_id = uuid.uuid4().hex[:8]
 
-                    graph = create_agent(
-                        model_name=model,
-                        session_id=session_id,
-                        base_url=data.get("base_url"),
-                        api_key=data.get("api_key"),
-                    )
+                    try:
+                        graph = create_agent(
+                            model_name=model,
+                            session_id=session_id,
+                            base_url=data.get("base_url"),
+                            api_key=data.get("api_key"),
+                        )
+                    except Exception as e:
+                        logger.exception("Failed to create agent for ws session")
+                        graph = None
+                        config = None
+                        if not await _safe_send(
+                            {
+                                "type": "error",
+                                "data": {"message": f"Failed to start agent: {e}"},
+                            }
+                        ):
+                            break
+                        continue
                     config = {"configurable": {"thread_id": f"ws-{session_id}"}}
+                    transcript = SessionTranscript(session_id, target=target, model=model)
 
-                    await websocket.send_json(
+                    if not await _safe_send(
                         {
                             "type": "started",
                             "session_id": session_id,
                             "target": target,
                             "model": model,
                         }
-                    )
+                    ):
+                        break
 
                 elif msg_type == "message" and graph and config:
                     content = data.get("content", "")
+                    if transcript:
+                        transcript.add_user(content)
                     input_msg = {"messages": [{"role": "user", "content": content}]}
 
                     try:
+                        turn_state["active"] = True
                         last_content = ""
                         async for event in graph.astream(input_msg, config, stream_mode="values"):
                             msgs = event.get("messages", [])
@@ -486,35 +615,118 @@ def create_app():
                                     if c:
                                         last_content = c
                         if last_content:
-                            await websocket.send_json(
+                            if transcript:
+                                transcript.add_agent(last_content)
+                            if not await _safe_send(
                                 {
                                     "type": "agent_message",
                                     "data": {"content": last_content},
                                 }
-                            )
+                            ):
+                                break
                     except Exception as e:
-                        await websocket.send_json(
+                        logger.exception("Agent turn failed")
+                        if transcript:
+                            transcript.add_error(str(e))
+                        if not await _safe_send(
                             {
                                 "type": "error",
                                 "data": {"message": str(e)},
                             }
-                        )
+                        ):
+                            break
+                    finally:
+                        turn_state["active"] = False
+                    # Complete follows both success and failure, so the
+                    # client never waits on a turn that died mid-stream.
+                    await _drain_events()
+                    if not await _safe_send(_complete_payload()):
+                        break
 
                 elif msg_type == "approve" and graph and config:
                     approved = data.get("approved", False)
+                    if transcript:
+                        transcript.add_user(
+                            f"[approval {'approved' if approved else 'denied'} by operator]"
+                        )
+                    resume_ok = True
                     try:
-                        await graph.ainvoke(Command(resume=approved), config)
+                        # Detect no-op resumes (stale approve with nothing
+                        # pending): the graph reports the same message count.
+                        try:
+                            before = len(
+                                (graph.get_state(config).values or {}).get("messages", [])
+                            )
+                        except Exception:
+                            before = None
+                        turn_state["active"] = True
+                        snapshot = await graph.ainvoke(Command(resume=approved), config)
                     except Exception as e:
-                        await websocket.send_json(
+                        resume_ok = False
+                        logger.exception("Agent resume failed")
+                        if transcript:
+                            transcript.add_error(str(e))
+                        if not await _safe_send(
                             {
                                 "type": "error",
                                 "data": {"message": str(e)},
                             }
-                        )
+                        ):
+                            break
+                    finally:
+                        turn_state["active"] = False
+                    if resume_ok:
+                        values = getattr(snapshot, "values", None)
+                        messages_after = (values or {}).get("messages", [])
+                        produced_new = before is None or len(messages_after) > before
+                        if produced_new:
+                            content = _last_ai_content(values)
+                            if content:
+                                if transcript:
+                                    transcript.add_agent(content)
+                                if not await _safe_send(
+                                    {
+                                        "type": "agent_message",
+                                        "data": {"content": content},
+                                    }
+                                ):
+                                    break
+                    # Complete follows both success and failure, so the
+                    # client never waits on a resume that died mid-stream.
+                    await _drain_events()
+                    if not await _safe_send(_complete_payload()):
+                        break
+
+                elif msg_type in ("message", "approve"):
+                    # The frame needs an agent, but no start succeeded yet —
+                    # never leave the client waiting in silence.
+                    if not await _safe_send(
+                        {
+                            "type": "error",
+                            "data": {
+                                "message": "No active agent — send a start frame first"
+                            },
+                        }
+                    ):
+                        break
 
         except WebSocketDisconnect:
             pass
+        except Exception:
+            logger.exception("Agent websocket handler crashed")
         finally:
+            pump.cancel()
+            try:
+                await pump
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Event pump shutdown error", exc_info=True)
+            if transcript is not None:
+                try:
+                    transcript.write()
+                except Exception:
+                    logger.debug("Failed to write final session report", exc_info=True)
             # Cleanup subscriptions
             if bus and handlers:
                 for et, h in handlers.items():
