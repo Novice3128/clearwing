@@ -333,8 +333,56 @@ class TestCveDbUpdate:
     def test_download_declined(self):
         with patch("clearwing.agent.tools.data.cve_tools.interrupt", return_value=False):
             result = cve_db_update.invoke({})
-        assert "error" in result
-        assert "declined" in result["error"]
+        assert result["status"] == "declined"
+        # "denied by user" keeps the decline outside the identical-failure
+        # guard — a declined download is a decision, not a malfunction.
+        assert "denied by user" in result["message"]
+
+    def test_download_zip_retries_then_succeeds(self, tmp_path):
+        import io
+        import urllib.error
+
+        from clearwing.agent.tools.data.cve_tools import _download_zip
+
+        calls = []
+
+        def fake_urlopen(url, timeout):
+            calls.append((url, timeout))
+            if len(calls) == 1:
+                raise urllib.error.URLError("connection reset")
+            return io.BytesIO(b"zip-bytes")
+
+        dest = tmp_path / "cve.zip"
+        with (
+            patch(
+                "clearwing.agent.tools.data.cve_tools.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch("clearwing.agent.tools.data.cve_tools.time.sleep"),
+        ):
+            _download_zip("https://example/cve.zip", dest)
+
+        assert dest.read_bytes() == b"zip-bytes"
+        assert len(calls) == 2
+        assert not dest.with_suffix(".zip.part").exists()
+
+    def test_download_zip_fails_after_retries(self, tmp_path):
+        import urllib.error
+
+        from clearwing.agent.tools.data.cve_tools import _download_zip
+
+        dest = tmp_path / "cve.zip"
+        with (
+            patch(
+                "clearwing.agent.tools.data.cve_tools.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("down forever"),
+            ),
+            patch("clearwing.agent.tools.data.cve_tools.time.sleep"),
+            pytest.raises(urllib.error.URLError),
+        ):
+            _download_zip("https://example/cve.zip", dest)
+
+        assert not dest.exists()
 
 
 class TestBuildDb:

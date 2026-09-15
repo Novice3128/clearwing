@@ -259,15 +259,35 @@ class NativeAgentGraph:
     ):
         del stream_mode
         thread_id = self._thread_id(config)
-        if isinstance(input_data, Command):
-            async for event in self._aresume(thread_id, input_data.resume):
-                yield event
-            return
+        try:
+            if isinstance(input_data, Command):
+                async for event in self._aresume(thread_id, input_data.resume):
+                    yield event
+                return
 
-        state = self._get_or_create_state(thread_id)
-        self._merge_input(state, input_data)
-        async for event in self._arun_loop(thread_id):
-            yield event
+            state = self._get_or_create_state(thread_id)
+            if self._pending.get(thread_id) is not None:
+                # A new user turn on top of a suspended approval batch would
+                # orphan its tool_use (provider 400). Interactive clients gate
+                # this earlier; this is the last-line defense for direct
+                # astream callers.
+                logger.warning(
+                    "Discarding pending approval batch before new input on %s",
+                    thread_id,
+                )
+                self._stop_cleanup(thread_id)
+            self._merge_input(state, input_data)
+            async for event in self._arun_loop(thread_id):
+                yield event
+        except asyncio.CancelledError:
+            # Operator stop: an abandoned tool batch must still be answered
+            # (providers 400 a history with orphaned tool_use) before the
+            # cancellation propagates to the consumer. NB: this covers
+            # cancellations landing on an await INSIDE the generator; if a
+            # consumer adds awaits to its for-body, the stop branch in the
+            # webui still answers via discard_interrupt.
+            self._stop_cleanup(thread_id)
+            raise
 
     async def ainvoke(
         self, input_data: dict[str, Any] | Command, config: dict
@@ -287,6 +307,61 @@ class NativeAgentGraph:
             next=("tools",),
             tasks=[GraphTask(interrupts=[GraphInterrupt(value=pending.prompt)])],
         )
+
+    def discard_interrupt(self, config: dict) -> bool:
+        """Answer a pending approval interrupt (and any dangling tool batch)
+        as skipped.
+
+        Used when an operator stops a session that is suspended waiting for
+        an ``approve`` frame: without this, the pending batch's tool_calls
+        stay unanswered and the next turn 400s on orphaned tool_use. Returns
+        True when anything was actually cleaned up.
+        """
+        return self._stop_cleanup(self._thread_id(config))
+
+    def _stop_cleanup(self, thread_id: str) -> bool:
+        """Answer every unanswered tool call on *thread_id* as skipped."""
+        cleaned = False
+        pending = self._pending.get(thread_id)
+        if pending is not None:
+            self._pending[thread_id] = None
+            state = self._get_or_create_state(thread_id)
+            state.setdefault("messages", []).extend(
+                _synthesize_skipped_tool_results(
+                    pending.tool_calls, "session stopped by operator"
+                )
+            )
+            cleaned = True
+
+        # Mid-batch abandonment: the assistant requested tools but the batch
+        # never finished. Scan back past the batch's trailing ToolMessages —
+        # a pause/cancel at index > 0 leaves completed results between the
+        # request and the unanswered tail, so messages[-1] is not the request.
+        state = self._get_or_create_state(thread_id)
+        messages = state.get("messages", [])
+        idx = len(messages) - 1
+        while idx >= 0 and getattr(messages[idx], "type", "") == "tool":
+            idx -= 1
+        if idx >= 0:
+            last = messages[idx]
+            calls = getattr(last, "tool_calls", None) or []
+            if getattr(last, "type", "") == "ai" and calls:
+                answered = {
+                    getattr(m, "tool_call_id", None)
+                    for m in messages
+                    if getattr(m, "type", "") == "tool"
+                }
+                unanswered = [
+                    c for c in calls if getattr(c, "call_id", None) not in answered
+                ]
+                if unanswered:
+                    messages.extend(
+                        _synthesize_skipped_tool_results(
+                            unanswered, "session stopped by operator"
+                        )
+                    )
+                    cleaned = True
+        return cleaned
 
     async def _aresume(self, thread_id: str, approved: bool):
         pending = self._pending.get(thread_id)
@@ -664,6 +739,11 @@ class NativeAgentGraph:
     async def _ainvoke_tool(
         self, tool: AgentTool, arguments: dict[str, Any], resume_decision: object
     ) -> Any:
+        # Reject calls missing required inputs up front, naming the fields
+        # so the model can retry with them (instead of an opaque TypeError).
+        missing = tool.missing_required_arguments(arguments)
+        if missing:
+            raise ValueError(f"missing required argument(s): {', '.join(missing)}")
         with tool_execution_context(resume_decision=resume_decision):
             if asyncio.iscoroutinefunction(tool.func):
                 return await tool.func(**arguments)

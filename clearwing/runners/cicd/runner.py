@@ -10,11 +10,56 @@ from dataclasses import dataclass
 from typing import Any
 
 from clearwing.agent.graph import create_agent
+from clearwing.agent.runtime import Command
 from clearwing.observability.telemetry import CostTracker
 
 from .sarif import SARIFGenerator
 
 logger = logging.getLogger(__name__)
+
+
+async def drive_with_auto_decline(
+    graph: Any,
+    initial_state: dict[str, Any],
+    config: dict,
+    *,
+    limits_exceeded: Any,
+    max_declines: int = 5,
+) -> None:
+    """Drive *graph* to completion, auto-declining every approval gate.
+
+    An unattended run has nobody to answer an approval prompt, and an
+    unanswered one used to abort the whole task on its first gated tool
+    (issue #20 — session 9526f073 died on cve_db_update's download
+    confirm). Declining is the conservative outcome and keeps the run
+    going. A model that keeps re-requesting gated tools is bounded by
+    *max_declines* before the run is abandoned.
+    """
+    first = True
+    declines = 0
+    while True:
+        payload = initial_state if first else Command(resume=False)
+        first = False
+        async for _event in graph.astream(payload, config, stream_mode="values"):
+            if limits_exceeded():
+                return
+        if limits_exceeded():
+            return
+        snapshot = graph.get_state(config)
+        if not getattr(snapshot, "next", ()):
+            return
+        declines += 1
+        if declines > max_declines:
+            logger.warning(
+                "CI/CD run abandoned after %d auto-declined approval gates",
+                max_declines,
+            )
+            return
+        logger.info(
+            "CI/CD run auto-declined a pending approval gate (%d/%d)",
+            declines,
+            max_declines,
+        )
 
 
 @dataclass
@@ -141,15 +186,17 @@ class CICDRunner:
         timeout_seconds = self.timeout_minutes * 60
         deadline = start_time + timeout_seconds
 
-        async def _drive() -> None:
-            async for _event in graph.astream(initial_state, config, stream_mode="values"):
-                if time.monotonic() > deadline:
-                    break
-                if cost_tracker and cost_tracker.is_over_limit():
-                    break
+        def _limits_exceeded() -> bool:
+            return time.monotonic() > deadline or (
+                cost_tracker is not None and cost_tracker.is_over_limit()
+            )
 
         try:
-            asyncio.run(_drive())
+            asyncio.run(
+                drive_with_auto_decline(
+                    graph, initial_state, config, limits_exceeded=_limits_exceeded
+                )
+            )
         except Exception:
             logger.warning("CI/CD agent loop failed", exc_info=True)
 

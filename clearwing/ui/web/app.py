@@ -22,7 +22,11 @@ from clearwing.agent.runtime import Command
 from clearwing.core.events import EventBus, EventType
 from clearwing.observability import MetricsCollector
 from clearwing.observability.integration import ObservabilityIntegration
-from clearwing.ui.web.session_report import SessionTranscript, session_report_path
+from clearwing.ui.web.session_report import (
+    SessionTranscript,
+    coerce_text,
+    session_report_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +402,7 @@ def create_app():
         - Client sends: {"type": "start", "target": "10.0.0.1", "model": "..."}
         - Client sends: {"type": "message", "content": "scan ports"}
         - Client sends: {"type": "approve", "approved": true}
+        - Client sends: {"type": "stop"} to cancel the running turn
         - Server sends: {"type": "agent_message", "content": "..."}
         - Server sends: {"type": "tool_start", "tool": "scan_ports", "args": {...}}
         - Server sends: {"type": "tool_result", "tool": "scan_ports", "content": "..."}
@@ -405,10 +410,17 @@ def create_app():
         - Server sends: {"type": "cost_update", "cost_usd": 0.05, "tokens": 1000}
         - Server sends: {"type": "approval_needed", "prompt": "..."}
         - Server sends: {"type": "error", "message": "..."}
+        - Server sends: {"type": "stopped", "data": {"cancelled_turn": bool,
+                       "discarded_approval": bool}} after a stop frame
         - Server sends: {"type": "complete", "data": {"session_id": "...",
                        "report_path": "...", "report_url": "/api/reports/<id>"}}
-          (emitted after each message/approve turn; report_path/report_url
+          (emitted after each message/approve/stop turn; report_path/report_url
           appear once the agent session has been started)
+
+        Turns run as background tasks so the receive loop stays responsive;
+        a `message`/`approve` sent while a turn is still running is rejected
+        with an error frame. On stop or client disconnect the running turn is
+        cancelled and any pending approval is discarded.
         """
         if not _ws_authorized(websocket):
             await websocket.close(code=1008)
@@ -495,6 +507,49 @@ def create_app():
 
         graph = None
         config = None
+        turn_task: asyncio.Task | None = None
+        # Target from the start frame; rides along with every message so the
+        # graph state (episodic memory, system prompt recall) can attribute
+        # turns to the target the operator declared.
+        handler_target = ""
+
+        def _turn_active() -> bool:
+            return turn_task is not None and not turn_task.done()
+
+        def _graph_has_pending(graph_ref: Any, config_ref: dict) -> bool:
+            # Fake graphs in tests may lack get_state; treat as no pending.
+            try:
+                return bool(getattr(graph_ref.get_state(config_ref), "next", ()))
+            except Exception:
+                return False
+
+        async def _reject_busy_frame() -> bool:
+            """True when the handler may keep serving; False when the client is gone."""
+            return await _safe_send(
+                {
+                    "type": "error",
+                    "data": {
+                        "message": (
+                            "A turn is already running — "
+                            'send {"type": "stop"} to cancel it first'
+                        )
+                    },
+                }
+            )
+
+        async def _reject_pending_approval_frame() -> bool:
+            return await _safe_send(
+                {
+                    "type": "error",
+                    "data": {
+                        "message": (
+                            "An approval is still pending — answer it with "
+                            '{"type": "approve", "approved": true|false} or '
+                            'discard it with {"type": "stop"} first'
+                        )
+                    },
+                }
+            )
 
         async def _safe_send(payload: dict) -> bool:
             try:
@@ -538,6 +593,113 @@ def create_app():
                     }
             return {"type": "complete", "data": data}
 
+        async def _run_message_turn(
+            graph_ref: Any,
+            config_ref: dict,
+            input_msg: dict[str, Any],
+            transcript_ref: SessionTranscript | None,
+        ) -> None:
+            # Parameters bind the session objects at task creation: a `start`
+            # frame arriving mid-turn rebinds the handler variables but must
+            # not swap the graph under a running turn.
+            try:
+                turn_state["active"] = True
+                last_content = ""
+                async for event in graph_ref.astream(
+                    input_msg, config_ref, stream_mode="values"
+                ):
+                    msgs = event.get("messages", [])
+                    if msgs:
+                        last = msgs[-1]
+                        if hasattr(last, "content") and last.type == "ai":
+                            c = last.content
+                            if isinstance(c, list):
+                                c = "\n".join(
+                                    p["text"]
+                                    for p in c
+                                    if isinstance(p, dict) and p.get("type") == "text"
+                                )
+                            if c:
+                                last_content = c
+                if last_content:
+                    if transcript_ref:
+                        transcript_ref.add_agent(last_content)
+                    if not await _safe_send(
+                        {
+                            "type": "agent_message",
+                            "data": {"content": last_content},
+                        }
+                    ):
+                        return
+            except Exception as e:
+                logger.exception("Agent turn failed")
+                if transcript_ref:
+                    transcript_ref.add_error(str(e))
+                if not await _safe_send(
+                    {
+                        "type": "error",
+                        "data": {"message": str(e)},
+                    }
+                ):
+                    return
+            finally:
+                turn_state["active"] = False
+            # Complete follows both success and failure, so the client never
+            # waits on a turn that died mid-stream.
+            await _drain_events()
+            await _safe_send(_complete_payload())
+
+        async def _run_approve_turn(
+            graph_ref: Any,
+            config_ref: dict,
+            approved: bool,
+            transcript_ref: SessionTranscript | None,
+        ) -> None:
+            try:
+                # Detect no-op resumes (stale approve with nothing pending):
+                # the graph reports the same message count.
+                try:
+                    before = len(
+                        (graph_ref.get_state(config_ref).values or {}).get("messages", [])
+                    )
+                except Exception:
+                    before = None
+                turn_state["active"] = True
+                snapshot = await graph_ref.ainvoke(Command(resume=approved), config_ref)
+            except Exception as e:
+                logger.exception("Agent resume failed")
+                if transcript_ref:
+                    transcript_ref.add_error(str(e))
+                if not await _safe_send(
+                    {
+                        "type": "error",
+                        "data": {"message": str(e)},
+                    }
+                ):
+                    return
+            else:
+                values = getattr(snapshot, "values", None)
+                messages_after = (values or {}).get("messages", [])
+                produced_new = before is None or len(messages_after) > before
+                if produced_new:
+                    content = _last_ai_content(values)
+                    if content:
+                        if transcript_ref:
+                            transcript_ref.add_agent(content)
+                        if not await _safe_send(
+                            {
+                                "type": "agent_message",
+                                "data": {"content": content},
+                            }
+                        ):
+                            return
+            finally:
+                turn_state["active"] = False
+            # Complete follows both success and failure, so the client never
+            # waits on a resume that died mid-stream.
+            await _drain_events()
+            await _safe_send(_complete_payload())
+
         pump = asyncio.create_task(_pump_events())
 
         try:
@@ -554,9 +716,14 @@ def create_app():
                 msg_type = data.get("type")
 
                 if msg_type == "start":
+                    if _turn_active():
+                        if not await _reject_busy_frame():
+                            break
+                        continue
                     # Initialize agent
                     model = data.get("model", "claude-sonnet-4-6")
                     target = data.get("target", "")
+                    handler_target = target
                     session_id = uuid.uuid4().hex[:8]
 
                     try:
@@ -592,108 +759,81 @@ def create_app():
                         break
 
                 elif msg_type == "message" and graph and config:
-                    content = data.get("content", "")
+                    if _turn_active():
+                        if not await _reject_busy_frame():
+                            break
+                        continue
+                    if _graph_has_pending(graph, config):
+                        # A user message on top of a suspended tool batch
+                        # would orphan its tool_use (provider 400 next turn).
+                        if not await _reject_pending_approval_frame():
+                            break
+                        continue
+
+                    # WS clients can send content: null / list / object; the
+                    # transcript and the LLM both need a plain string.
+                    content = coerce_text(data.get("content", ""))
                     if transcript:
                         transcript.add_user(content)
-                    input_msg = {"messages": [{"role": "user", "content": content}]}
+                    input_msg: dict[str, Any] = {
+                        "messages": [{"role": "user", "content": content}]
+                    }
+                    if handler_target:
+                        input_msg["target"] = handler_target
 
-                    try:
-                        turn_state["active"] = True
-                        last_content = ""
-                        async for event in graph.astream(input_msg, config, stream_mode="values"):
-                            msgs = event.get("messages", [])
-                            if msgs:
-                                last = msgs[-1]
-                                if hasattr(last, "content") and last.type == "ai":
-                                    c = last.content
-                                    if isinstance(c, list):
-                                        c = "\n".join(
-                                            p["text"]
-                                            for p in c
-                                            if isinstance(p, dict) and p.get("type") == "text"
-                                        )
-                                    if c:
-                                        last_content = c
-                        if last_content:
-                            if transcript:
-                                transcript.add_agent(last_content)
-                            if not await _safe_send(
-                                {
-                                    "type": "agent_message",
-                                    "data": {"content": last_content},
-                                }
-                            ):
-                                break
-                    except Exception as e:
-                        logger.exception("Agent turn failed")
-                        if transcript:
-                            transcript.add_error(str(e))
-                        if not await _safe_send(
-                            {
-                                "type": "error",
-                                "data": {"message": str(e)},
-                            }
-                        ):
-                            break
-                    finally:
-                        turn_state["active"] = False
-                    # Complete follows both success and failure, so the
-                    # client never waits on a turn that died mid-stream.
-                    await _drain_events()
-                    if not await _safe_send(_complete_payload()):
-                        break
+                    turn_task = asyncio.create_task(
+                        _run_message_turn(graph, config, input_msg, transcript)
+                    )
 
                 elif msg_type == "approve" and graph and config:
+                    if _turn_active():
+                        if not await _reject_busy_frame():
+                            break
+                        continue
+
                     approved = data.get("approved", False)
                     if transcript:
                         transcript.add_user(
                             f"[approval {'approved' if approved else 'denied'} by operator]"
                         )
-                    resume_ok = True
-                    try:
-                        # Detect no-op resumes (stale approve with nothing
-                        # pending): the graph reports the same message count.
+
+                    turn_task = asyncio.create_task(
+                        _run_approve_turn(graph, config, approved, transcript)
+                    )
+
+                elif msg_type == "stop":
+                    cancelled_turn = _turn_active()
+                    if cancelled_turn:
+                        turn_task.cancel()
                         try:
-                            before = len(
-                                (graph.get_state(config).values or {}).get("messages", [])
-                            )
+                            await turn_task
+                        except asyncio.CancelledError:
+                            pass
                         except Exception:
-                            before = None
-                        turn_state["active"] = True
-                        snapshot = await graph.ainvoke(Command(resume=approved), config)
-                    except Exception as e:
-                        resume_ok = False
-                        logger.exception("Agent resume failed")
-                        if transcript:
-                            transcript.add_error(str(e))
-                        if not await _safe_send(
-                            {
-                                "type": "error",
-                                "data": {"message": str(e)},
-                            }
-                        ):
-                            break
-                    finally:
-                        turn_state["active"] = False
-                    if resume_ok:
-                        values = getattr(snapshot, "values", None)
-                        messages_after = (values or {}).get("messages", [])
-                        produced_new = before is None or len(messages_after) > before
-                        if produced_new:
-                            content = _last_ai_content(values)
-                            if content:
-                                if transcript:
-                                    transcript.add_agent(content)
-                                if not await _safe_send(
-                                    {
-                                        "type": "agent_message",
-                                        "data": {"content": content},
-                                    }
-                                ):
-                                    break
-                    # Complete follows both success and failure, so the
-                    # client never waits on a resume that died mid-stream.
+                            logger.debug("Cancelled turn task raised", exc_info=True)
+                    turn_task = None
+                    discarded = False
+                    if graph is not None and config is not None:
+                        # Covers a turn paused awaiting approve (no running
+                        # task to cancel) and any dangling tool batch the
+                        # cancellation path could not reach.
+                        try:
+                            discarded = bool(graph.discard_interrupt(config))
+                        except Exception:
+                            logger.debug("Failed to discard pending interrupt", exc_info=True)
+                    if transcript and (cancelled_turn or discarded):
+                        transcript.add_error("[session stopped by operator]")
                     await _drain_events()
+                    if not await _safe_send(
+                        {
+                            "type": "stopped",
+                            "data": {
+                                "cancelled_turn": cancelled_turn,
+                                "discarded_approval": discarded,
+                            },
+                        }
+                    ):
+                        break
                     if not await _safe_send(_complete_payload()):
                         break
 
@@ -715,6 +855,22 @@ def create_app():
         except Exception:
             logger.exception("Agent websocket handler crashed")
         finally:
+            # A disconnect must not leave the agent burning tokens in the
+            # background: cancel the running turn and answer any pending
+            # approval/tool batch before tearing the session down.
+            if turn_task is not None and not turn_task.done():
+                turn_task.cancel()
+                try:
+                    await turn_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug("Turn task cancellation error", exc_info=True)
+            if graph is not None and config is not None:
+                try:
+                    graph.discard_interrupt(config)
+                except Exception:
+                    logger.debug("Failed to discard pending interrupt", exc_info=True)
             pump.cancel()
             try:
                 await pump

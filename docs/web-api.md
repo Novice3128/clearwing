@@ -69,6 +69,11 @@ Sends a user turn into the ReAct graph.
 {"type": "message", "content": "scan ports on the target"}
 ```
 
+`content` must be a string (or omitted). `null` / list / object values
+are coerced to text rather than rejected. Only one turn may run at a
+time: a `message` (or `approve`) sent while a turn is still running is
+rejected with an inline `error` frame.
+
 ### `approve`
 
 Resumes a graph that paused at an approval interrupt.
@@ -76,6 +81,25 @@ Resumes a graph that paused at an approval interrupt.
 ```json
 {"type": "approve", "approved": true}
 ```
+
+### `stop`
+
+Cancels the running turn (if any) and discards any approval still
+pending. The server answers the unanswered tool calls of the abandoned
+batch so the session stays usable — the next `message` starts a fresh
+turn instead of failing on an orphaned `tool_use`.
+
+```json
+{"type": "stop"}
+```
+
+Stopping is idempotent: a `stop` with nothing running still gets a
+`stopped` frame with both flags false.
+
+Limitation: `stop` cancels the agent loop promptly, but a synchronous
+tool already in flight (most scanning tools run in a worker thread)
+runs to completion on the server; its result is recorded as skipped.
+LLM calls stop immediately.
 
 ## Server → client envelope
 
@@ -497,6 +521,23 @@ exception while driving the graph.
   "data": {"message": "ProviderTimeout: no response in 30s"}
 }
 ```
+
+### `stopped`
+
+Sent in response to a client `stop` frame (see [`stop`](#stop)).
+
+```json
+{
+  "type": "stopped",
+  "data": {
+    "cancelled_turn": true,
+    "discarded_approval": false
+  }
+}
+```
+
+A `complete` frame follows every `stopped` frame, same as after
+`message` / `approve` turns.
 
 ## Events that are emitted but not forwarded
 

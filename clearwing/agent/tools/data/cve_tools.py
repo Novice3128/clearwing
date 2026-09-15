@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
+import time
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -12,6 +16,31 @@ from clearwing.agent.tooling import interrupt, tool
 
 _CVE_ZIP_URL = "https://github.com/CVEProject/cvelistV5/archive/refs/heads/main.zip"
 _DB_NAME = "cve.db"
+# urlretrieve has no timeout: a stalled GitHub connection used to hang the
+# agent turn indefinitely (issue #20).
+_DOWNLOAD_TIMEOUT_SECONDS = 120.0
+_DOWNLOAD_ATTEMPTS = 2
+
+
+def _download_zip(url: str, dest: Path) -> None:
+    """Blocking download with a socket timeout and a short retry."""
+    last_error: Exception | None = None
+    for attempt in range(_DOWNLOAD_ATTEMPTS):
+        tmp = dest.with_suffix(".zip.part")
+        try:
+            with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as resp, open(
+                tmp, "wb"
+            ) as out:
+                shutil.copyfileobj(resp, out)
+            tmp.replace(dest)
+            return
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            last_error = exc
+            tmp.unlink(missing_ok=True)
+            if attempt + 1 < _DOWNLOAD_ATTEMPTS:
+                time.sleep(2 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
 
 
 def _db_dir() -> Path:
@@ -219,12 +248,20 @@ def cve_db_update(zip_path: str = "") -> dict:
             if not interrupt(
                 f"Download CVE database (~550 MB) from GitHub to {db_dir}?"
             ):
-                return {"error": "User declined download."}
-
-            import urllib.request
+                # Unattended runners auto-decline this gate; the wording
+                # matters — "denied by user" is excluded from the runtime's
+                # identical-failure guard, so a declined download is a human
+                # decision, not a malfunction the model should retry.
+                return {
+                    "status": "declined",
+                    "message": (
+                        "Download denied by user; continuing with the existing "
+                        "CVE database. Pass zip_path to load an offline copy."
+                    ),
+                }
 
             src = db_dir / "cvelistV5-main.zip"
-            urllib.request.urlretrieve(_CVE_ZIP_URL, str(src))
+            _download_zip(_CVE_ZIP_URL, src)
 
         extract_dir = db_dir / "cvelistV5"
         if extract_dir.exists():

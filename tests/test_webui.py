@@ -318,6 +318,51 @@ class _FakeGraph:
         return GraphStateSnapshot(values={"messages": list(self.resume_messages)})
 
 
+class _SlowFakeGraph(_FakeGraph):
+    """Graph whose first turn sleeps far beyond a test's patience."""
+
+    def __init__(self):
+        super().__init__()
+        self.turn_started = False
+        self.turn_cancelled = False
+
+    async def astream(self, input_msg, config, stream_mode="values"):
+        import asyncio
+
+        self.turn_started = True
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            self.turn_cancelled = True
+            raise
+        yield {"messages": [_FakeAI()]}
+
+
+class _PendingFakeGraph(_FakeGraph):
+    """Graph suspended awaiting an approve frame (stop must discard it)."""
+
+    def __init__(self):
+        super().__init__()
+        self.discard_calls = 0
+
+    def discard_interrupt(self, config):
+        self.discard_calls += 1
+        # Real semantics: True only while something is actually pending.
+        return self.discard_calls == 1
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values={"messages": []}, next=("tools",), tasks=[])
+
+
+class _FailingResumeGraph(_FakeGraph):
+    """Graph whose approve-resume always raises."""
+
+    async def ainvoke(self, input_data, config):
+        raise RuntimeError("resume exploded")
+
+
 @pytest.fixture
 def results_dir(tmp_path, monkeypatch):
     import clearwing.ui.web.session_report as session_report
@@ -414,6 +459,125 @@ class TestAgentSessionFlow:
         assert "post approval answer" in content
 
 
+class TestStopFrame:
+    """#6: an operator must be able to cancel a running/pending agent turn."""
+
+    def test_stop_cancels_running_turn(self, client, monkeypatch, results_dir):
+        import time
+
+        fake = _SlowFakeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            t0 = time.monotonic()
+            ws.send_json({"type": "message", "content": "long task"})
+            ws.send_json({"type": "stop"})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+
+        assert time.monotonic() - t0 < 10, "stop must cancel the 30s turn promptly"
+        stopped = next(f for f in frames if f["type"] == "stopped")
+        assert stopped["data"]["cancelled_turn"] is True
+        assert fake.turn_started
+        assert fake.turn_cancelled
+
+    def test_message_during_running_turn_is_rejected(self, client, monkeypatch):
+        fake = _SlowFakeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "message", "content": "first"})
+            ws.send_json({"type": "message", "content": "second"})
+            busy = ws.receive_json()
+            assert busy["type"] == "error"
+            assert "already running" in busy["data"]["message"]
+
+            ws.send_json({"type": "stop"})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+            assert any(f["type"] == "stopped" for f in frames)
+
+    def test_stop_discards_pending_approval(self, client, monkeypatch, results_dir):
+        fake = _PendingFakeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "stop"})
+            stopped = ws.receive_json()
+            assert stopped["type"] == "stopped"
+            assert stopped["data"]["cancelled_turn"] is False
+            assert stopped["data"]["discarded_approval"] is True
+            assert ws.receive_json()["type"] == "complete"
+
+        # Once for the stop frame; the handler's disconnect cleanup may
+        # call it again (idempotent no-op on a real graph).
+        assert fake.discard_calls >= 1
+
+    def test_stop_before_start_is_harmless(self, client):
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "stop"})
+            stopped = ws.receive_json()
+            assert stopped["type"] == "stopped"
+            assert stopped["data"] == {
+                "cancelled_turn": False,
+                "discarded_approval": False,
+            }
+            complete = ws.receive_json()
+            assert complete["type"] == "complete"
+            assert complete["data"] == {}
+
+    def test_approve_failure_still_sends_complete(self, client, monkeypatch, results_dir):
+        """Review P1: a failed resume used to die on an unbound `snapshot`,
+        leaving the client waiting for a complete frame that never came."""
+        fake = _FailingResumeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+
+        types = [f["type"] for f in frames]
+        assert "error" in types
+        assert types[-1] == "complete"
+        assert "resume exploded" in next(f for f in frames if f["type"] == "error")["data"][
+            "message"
+        ]
+
+    def test_message_while_approval_pending_is_rejected(self, client, monkeypatch):
+        """A user message on a suspended batch would orphan its tool_use."""
+        fake = _PendingFakeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "message", "content": "hello?"})
+            frame = ws.receive_json()
+            assert frame["type"] == "error"
+            assert "approval is still pending" in frame["data"]["message"]
+
+
 class TestSessionReportHardening:
     def test_report_redacts_key_shapes_and_is_owner_only(self, monkeypatch, tmp_path):
         import stat as stat_module
@@ -434,6 +598,85 @@ class TestSessionReportHardening:
         assert "sk-abcdefghijklmnopqrst" not in content
         assert "supersecret123" not in content
         assert "aabbccdd00112233aabbccdd00112233" not in content
+
+    def test_non_string_content_renders(self, monkeypatch, tmp_path):
+        """#25: content null/list/object must not crash report rendering."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00002", model="m")
+        transcript.add_user(None)
+        transcript.add_user([{"type": "text", "text": "part one"}, {"type": "text", "text": "part two"}])
+        transcript.add_user({"tool_use": {"name": "x"}})
+        transcript.add_agent(None)
+        transcript.add_error({"message": "structured boom"})
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert "part one\npart two" in content
+        assert '"tool_use"' in content
+        assert "structured boom" in content
+        assert "(empty)" in content  # null content keeps its placeholder
+
+    def test_write_falls_back_when_render_is_poisoned(self, monkeypatch, tmp_path):
+        """#25: even an unrenderable transcript must still produce the artifact."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00003", model="m")
+        transcript.add_user("hello")
+        # Bypass add_user() with a legacy non-coerced value (int) — render()
+        # cannot process it and raises.
+        transcript.user_messages.append(12345)
+        path = transcript.write()  # must not raise
+
+        assert path.is_file()
+        content = path.read_text(encoding="utf-8")
+        assert "render failed" in content
+        assert "sec00003" in content
+
+    def test_json_shaped_content_is_redacted(self, monkeypatch, tmp_path):
+        """coerce_text JSON-fallen dict content must still hit the redaction
+        patterns (quote between key and colon used to bypass them)."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00004", model="m")
+        transcript.add_user({"token": "abcdef1234567890", "secret": "xyzvalue9876"})
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert "abcdef1234567890" not in content
+        assert "xyzvalue9876" not in content
+
+    def test_ws_message_with_null_content_still_writes_report(
+        self, client, monkeypatch, results_dir
+    ):
+        """#25 end-to-end: `content: null` must not permanently break the report."""
+        fake = _FakeGraph(events=[{"messages": [_FakeAI()]}])
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "message", "content": None})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+            assert any(f["type"] == "agent_message" for f in frames)
+
+        sid = frames[-1]["data"]["session_id"]
+        report = results_dir / "sessions" / sid / "report.md"
+        assert report.is_file()
 
 
 class TestReportDownloadEndpoint:

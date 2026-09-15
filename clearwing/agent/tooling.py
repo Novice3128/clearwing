@@ -76,6 +76,22 @@ class AgentTool:
             return asyncio.run(self.ainvoke(params))
         return self.ainvoke(params)
 
+    def missing_required_arguments(self, arguments: dict[str, Any] | None) -> list[str]:
+        """Names of required parameters absent from *arguments*.
+
+        Extra keys are not flagged: tools may tolerate superfluous LLM
+        arguments, but a call missing required inputs fails with an opaque
+        ``TypeError`` (issue #9: ``save_report() missing 3 required
+        positional arguments``) — naming the fields lets the model self-
+        correct on the next attempt.
+        """
+        params = dict(arguments or {})
+        return [
+            name
+            for name, field in self.input_model.model_fields.items()
+            if field.is_required() and name not in params
+        ]
+
     def with_resume_decision(self, decision: bool) -> Callable[[dict[str, Any]], Any]:
         async def runner(arguments: dict[str, Any]) -> Any:
             with tool_execution_context(resume_decision=decision):
