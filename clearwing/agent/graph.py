@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import Any
 
@@ -10,6 +11,7 @@ from clearwing.capabilities import capabilities
 from clearwing.llm.native import AsyncLLMClient
 from clearwing.providers import ProviderManager, resolve_llm_endpoint
 from clearwing.providers.binding import AgentLimits
+from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
 
 from .prompts import build_system_prompt
 from .tools import get_all_tools, get_custom_tools
@@ -138,11 +140,25 @@ def _create_llm(
 ) -> AsyncLLMClient:
     if provider_manager is not None:
         return provider_manager.get_native_client(task)
-    endpoint = resolve_llm_endpoint(
-        cli_model=model_name,
-        cli_base_url=base_url,
-        cli_api_key=api_key,
-    )
+    if base_url or api_key:
+        # Explicit per-request credentials win outright.
+        endpoint = resolve_llm_endpoint(
+            cli_model=model_name,
+            cli_base_url=base_url,
+            cli_api_key=api_key,
+            config_provider={},
+        )
+        return ProviderManager.for_endpoint(endpoint).get_native_client("default")
+    # No per-request credentials: resolve from env / config.yaml instead.
+    # The webui start frame always carries a model name; passing it as a
+    # bare cli_model used to take the "CLI flags win" branch, which never
+    # consulted config.yaml / env — every chat session then died with
+    # "no API key or base URL configured".
+    endpoint = resolve_llm_endpoint()
+    if model_name and (
+        endpoint.source == "default" or model_name != DEFAULT_ANTHROPIC_MODEL
+    ):
+        endpoint = dataclasses.replace(endpoint, model=model_name)
     return ProviderManager.for_endpoint(endpoint).get_native_client("default")
 
 

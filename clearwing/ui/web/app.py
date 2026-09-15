@@ -599,10 +599,11 @@ def create_app():
                             }
                         ):
                             break
-                    else:
-                        await _drain_events()
-                        if not await _safe_send(_complete_payload()):
-                            break
+                    # Complete follows both success and failure, so the
+                    # client never waits on a turn that died mid-stream.
+                    await _drain_events()
+                    if not await _safe_send(_complete_payload()):
+                        break
 
                 elif msg_type == "approve" and graph and config:
                     approved = data.get("approved", False)
@@ -619,10 +620,9 @@ def create_app():
                             }
                         ):
                             break
-                    else:
-                        await _drain_events()
-                        if not await _safe_send(_complete_payload()):
-                            break
+                    await _drain_events()
+                    if not await _safe_send(_complete_payload()):
+                        break
 
         except WebSocketDisconnect:
             pass
