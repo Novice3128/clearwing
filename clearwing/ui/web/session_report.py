@@ -55,8 +55,10 @@ def coerce_text(value: Any) -> str:
 _EXTRA_SECRET_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+    # Quote-tolerant so JSON-fallen dict/list content (see coerce_text) is
+    # covered too: `"token": "x"` has a quote between key and colon.
     re.compile(
-        r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key)\s*[:=]\s*\S+"
+        r"(?i)\b(?:password|passwd|pwd|token|secret|api[_-]?key)['\"]?\s*[:=]\s*\S+"
     ),
 ]
 
@@ -204,7 +206,7 @@ class SessionTranscript:
                 f"| Tool calls | {len(self.tool_calls)} |",
                 f"| Errors | {len(self.errors)} |",
                 "",
-                f"Note: full transcript render failed ({reason}); "
+                f"Note: full transcript render failed ({_md_cell(reason)}); "
                 "this report contains the session summary only.",
                 "",
             ]

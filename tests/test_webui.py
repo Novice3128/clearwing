@@ -350,6 +350,18 @@ class _PendingFakeGraph(_FakeGraph):
         # Real semantics: True only while something is actually pending.
         return self.discard_calls == 1
 
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values={"messages": []}, next=("tools",), tasks=[])
+
+
+class _FailingResumeGraph(_FakeGraph):
+    """Graph whose approve-resume always raises."""
+
+    async def ainvoke(self, input_data, config):
+        raise RuntimeError("resume exploded")
+
 
 @pytest.fixture
 def results_dir(tmp_path, monkeypatch):
@@ -528,6 +540,43 @@ class TestStopFrame:
             assert complete["type"] == "complete"
             assert complete["data"] == {}
 
+    def test_approve_failure_still_sends_complete(self, client, monkeypatch, results_dir):
+        """Review P1: a failed resume used to die on an unbound `snapshot`,
+        leaving the client waiting for a complete frame that never came."""
+        fake = _FailingResumeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+
+        types = [f["type"] for f in frames]
+        assert "error" in types
+        assert types[-1] == "complete"
+        assert "resume exploded" in next(f for f in frames if f["type"] == "error")["data"][
+            "message"
+        ]
+
+    def test_message_while_approval_pending_is_rejected(self, client, monkeypatch):
+        """A user message on a suspended batch would orphan its tool_use."""
+        fake = _PendingFakeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "message", "content": "hello?"})
+            frame = ws.receive_json()
+            assert frame["type"] == "error"
+            assert "approval is still pending" in frame["data"]["message"]
+
 
 class TestSessionReportHardening:
     def test_report_redacts_key_shapes_and_is_owner_only(self, monkeypatch, tmp_path):
@@ -589,6 +638,22 @@ class TestSessionReportHardening:
         content = path.read_text(encoding="utf-8")
         assert "render failed" in content
         assert "sec00003" in content
+
+    def test_json_shaped_content_is_redacted(self, monkeypatch, tmp_path):
+        """coerce_text JSON-fallen dict content must still hit the redaction
+        patterns (quote between key and colon used to bypass them)."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00004", model="m")
+        transcript.add_user({"token": "abcdef1234567890", "secret": "xyzvalue9876"})
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert "abcdef1234567890" not in content
+        assert "xyzvalue9876" not in content
 
     def test_ws_message_with_null_content_still_writes_report(
         self, client, monkeypatch, results_dir

@@ -24,6 +24,7 @@ async def drive_with_auto_decline(
     config: dict,
     *,
     limits_exceeded: Any,
+    max_declines: int = 5,
 ) -> None:
     """Drive *graph* to completion, auto-declining every approval gate.
 
@@ -31,9 +32,11 @@ async def drive_with_auto_decline(
     unanswered one used to abort the whole task on its first gated tool
     (issue #20 — session 9526f073 died on cve_db_update's download
     confirm). Declining is the conservative outcome and keeps the run
-    going.
+    going. A model that keeps re-requesting gated tools is bounded by
+    *max_declines* before the run is abandoned.
     """
     first = True
+    declines = 0
     while True:
         payload = initial_state if first else Command(resume=False)
         first = False
@@ -45,7 +48,18 @@ async def drive_with_auto_decline(
         snapshot = graph.get_state(config)
         if not getattr(snapshot, "next", ()):
             return
-        logger.info("CI/CD run auto-declined a pending approval gate")
+        declines += 1
+        if declines > max_declines:
+            logger.warning(
+                "CI/CD run abandoned after %d auto-declined approval gates",
+                max_declines,
+            )
+            return
+        logger.info(
+            "CI/CD run auto-declined a pending approval gate (%d/%d)",
+            declines,
+            max_declines,
+        )
 
 
 @dataclass

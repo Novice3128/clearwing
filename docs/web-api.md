@@ -96,6 +96,11 @@ turn instead of failing on an orphaned `tool_use`.
 Stopping is idempotent: a `stop` with nothing running still gets a
 `stopped` frame with both flags false.
 
+Limitation: `stop` cancels the agent loop promptly, but a synchronous
+tool already in flight (most scanning tools run in a worker thread)
+runs to completion on the server; its result is recorded as skipped.
+LLM calls stop immediately.
+
 ## Server → client envelope
 
 All bus-forwarded events share one envelope:

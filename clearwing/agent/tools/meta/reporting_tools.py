@@ -144,6 +144,10 @@ def save_report(filepath: str, format: str, scan_data: dict) -> dict:
     """
     if not isinstance(filepath, str) or not filepath.strip():
         return {"error": "filepath must be a non-empty string"}
+    # Normalize once so the write and the verification target the same file:
+    # a bare "~" used to write a literal ./~ directory while the check
+    # looked in $HOME, reporting failure for a write that succeeded.
+    written_path = Path(filepath).expanduser().resolve()
     scan_data = _normalize_scan_data(scan_data)
     result = ScanResult(target=scan_data.get("target", "unknown"))
     result.open_ports = scan_data.get("open_ports", [])
@@ -154,13 +158,16 @@ def save_report(filepath: str, format: str, scan_data: dict) -> dict:
 
     generator = ReportGenerator()
     try:
-        generator.save(result, filepath, format)
+        generator.save(result, str(written_path), format)
     except Exception as exc:
         return {"error": f"Failed to save report to {filepath}: {exc}"}
-    written = Path(filepath).expanduser().resolve()
-    if not written.is_file():
-        return {"error": f"Report write verification failed: {written} does not exist"}
-    return {"status": "saved", "path": str(written), "bytes": written.stat().st_size}
+    if not written_path.is_file():
+        return {"error": f"Report write verification failed: {written_path} does not exist"}
+    return {
+        "status": "saved",
+        "path": str(written_path),
+        "bytes": written_path.stat().st_size,
+    }
 
 
 @tool

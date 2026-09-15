@@ -34,6 +34,21 @@ def gated_tool() -> dict:
     return {"gated": "approved"}
 
 
+@tool(name="fast_ok")
+def fast_ok() -> dict:
+    """Tool that completes immediately."""
+    return {"ok": True}
+
+
+@tool(name="slow_gated")
+async def slow_gated() -> dict:
+    """Gate tool that runs long once approved (slow only on resume)."""
+    if not interrupt("Approve slow op?"):
+        return {"gated": "denied"}
+    await asyncio.sleep(30)
+    return {"gated": "approved"}
+
+
 def _call(name: str, call_id: str, args: dict | None = None) -> SimpleNamespace:
     return SimpleNamespace(fn_name=name, call_id=call_id, fn_arguments=args or {})
 
@@ -115,6 +130,41 @@ class TestCancelDuringToolBatch:
         ):
             pass
 
+    @pytest.mark.asyncio
+    async def test_cancel_of_resume_answers_batch_tail(self):
+        """Pause at index > 0 leaves completed results before the dangling
+        tail; cancelling the approved resume must still answer the tail."""
+        graph = _graph([fast_ok, slow_gated])
+        config = {"configurable": {"thread_id": "stop-cancel-2"}}
+        _stub_assistant_tool_calls(
+            graph, [_call("fast_ok", "c1"), _call("slow_gated", "c2")]
+        )
+
+        async for _ in graph.astream({"messages": []}, config):
+            pass  # c1 runs, c2 pauses: messages = [ai(c1,c2), tool(c1)]
+        assert graph.get_state(config).next == ("tools",)
+
+        _stub_assistant_done(graph)
+
+        async def consume():
+            async for _ in graph.astream(Command(resume=True), config):
+                pass
+
+        resumed = asyncio.create_task(consume())
+        await asyncio.sleep(0.1)  # resume is now awaiting slow_gated's sleep
+        resumed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await resumed
+
+        messages = graph.get_state(config).values["messages"]
+        answered = {
+            getattr(m, "tool_call_id", None)
+            for m in messages
+            if getattr(m, "type", "") == "tool"
+        }
+        assert {"c1", "c2"} <= answered
+        assert graph.get_state(config).next == ()
+
 
 class TestDiscardInterrupt:
     @pytest.mark.asyncio
@@ -161,3 +211,31 @@ class TestDiscardInterrupt:
             pass  # deny resolves the batch
 
         assert graph.discard_interrupt(config) is False
+
+
+class TestNewInputDiscardsPending:
+    @pytest.mark.asyncio
+    async def test_new_user_turn_answers_suspended_batch(self):
+        """A direct astream caller merging input while an approval is
+        pending must not orphan the batch's tool_use."""
+        graph = _graph([gated_tool])
+        config = {"configurable": {"thread_id": "stop-discard-4"}}
+        _stub_assistant_tool_calls(graph, [_call("gated_tool", "c1")])
+        async for _ in graph.astream({"messages": []}, config):
+            pass  # pauses
+        assert graph.get_state(config).next == ("tools",)
+
+        _stub_assistant_done(graph)
+        async for _ in graph.astream(
+            {"messages": [{"role": "user", "content": "moving on"}]}, config
+        ):
+            pass
+
+        messages = graph.get_state(config).values["messages"]
+        answered = {
+            getattr(m, "tool_call_id", None)
+            for m in messages
+            if getattr(m, "type", "") == "tool"
+        }
+        assert "c1" in answered
+        assert graph.get_state(config).next == ()

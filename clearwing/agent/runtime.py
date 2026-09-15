@@ -266,13 +266,26 @@ class NativeAgentGraph:
                 return
 
             state = self._get_or_create_state(thread_id)
+            if self._pending.get(thread_id) is not None:
+                # A new user turn on top of a suspended approval batch would
+                # orphan its tool_use (provider 400). Interactive clients gate
+                # this earlier; this is the last-line defense for direct
+                # astream callers.
+                logger.warning(
+                    "Discarding pending approval batch before new input on %s",
+                    thread_id,
+                )
+                self._stop_cleanup(thread_id)
             self._merge_input(state, input_data)
             async for event in self._arun_loop(thread_id):
                 yield event
         except asyncio.CancelledError:
             # Operator stop: an abandoned tool batch must still be answered
             # (providers 400 a history with orphaned tool_use) before the
-            # cancellation propagates to the consumer.
+            # cancellation propagates to the consumer. NB: this covers
+            # cancellations landing on an await INSIDE the generator; if a
+            # consumer adds awaits to its for-body, the stop branch in the
+            # webui still answers via discard_interrupt.
             self._stop_cleanup(thread_id)
             raise
 
@@ -320,15 +333,17 @@ class NativeAgentGraph:
             )
             cleaned = True
 
-        # Mid-batch cancellation: the assistant already requested tools but
-        # the batch never finished, so the AIMessage's calls are dangling.
-        # Results completed before the cancel are only extended into state
-        # at the end of the batch, so every call is answered here as skipped
-        # (a tool that actually ran just gets its result discarded).
+        # Mid-batch abandonment: the assistant requested tools but the batch
+        # never finished. Scan back past the batch's trailing ToolMessages —
+        # a pause/cancel at index > 0 leaves completed results between the
+        # request and the unanswered tail, so messages[-1] is not the request.
         state = self._get_or_create_state(thread_id)
         messages = state.get("messages", [])
-        if messages:
-            last = messages[-1]
+        idx = len(messages) - 1
+        while idx >= 0 and getattr(messages[idx], "type", "") == "tool":
+            idx -= 1
+        if idx >= 0:
+            last = messages[idx]
             calls = getattr(last, "tool_calls", None) or []
             if getattr(last, "type", "") == "ai" and calls:
                 answered = {

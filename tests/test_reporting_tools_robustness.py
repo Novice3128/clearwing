@@ -198,3 +198,15 @@ class TestMissingArgumentValidation:
         tool_result = json.loads(state["messages"][-1].content)
         assert "missing required argument(s)" in tool_result["error"]
         assert "filepath" in tool_result["error"]
+
+    def test_tilde_path_writes_where_it_reports(self, tmp_path, monkeypatch):
+        """The write and the verification must target the same file: a
+        bare `~` used to write ./~ while the check looked in $HOME."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        out = tmp_path / "report.md"
+        result = save_report.func(
+            filepath="~/report.md", format="markdown", scan_data=dict(GOOD_SCAN_DATA)
+        )
+        assert result["status"] == "saved"
+        assert result["path"] == str(out.resolve())
+        assert out.is_file()

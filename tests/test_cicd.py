@@ -456,3 +456,75 @@ class TestDriveWithAutoDecline:
         )
         messages = graph.get_state(config).values["messages"]
         assert len(messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_abandons_after_max_declines(self):
+        """A model that keeps re-requesting gated tools must not keep the
+        unattended run burning LLM calls until the wall-clock deadline."""
+        from types import SimpleNamespace
+
+        from clearwing.agent.runtime import NativeAgentGraph
+        from clearwing.agent.tooling import interrupt, tool
+        from clearwing.llm.messages import AIMessage
+        from clearwing.runners.cicd.runner import drive_with_auto_decline
+
+        @tool(name="gated_tool")
+        def gated_tool() -> dict:
+            """Tool guarded by a human-approval gate."""
+            if not interrupt("Approve?"):
+                return {"gated": "denied"}
+            return {"gated": "approved"}
+
+        graph = NativeAgentGraph(
+            llm=object(),
+            native_tools=[],
+            tools=[gated_tool],
+            system_prompt_fn=lambda s: "sys",
+            model_name="m",
+            session_id=None,
+            state_updater_fn=lambda *a, **k: {},
+            knowledge_graph_populator_fn=None,
+            input_guardrail_tool_names=frozenset(),
+            output_guardrail_tool_names=frozenset(),
+            enable_cost_tracker=False,
+            enable_episodic_memory=False,
+            enable_audit=False,
+            enable_knowledge_graph=False,
+            enable_input_guardrail=False,
+            enable_output_guardrail=False,
+            enable_event_bus=False,
+            enable_context_summarizer=False,
+        )
+
+        async def relentless_step(st):
+            # Always re-requests the gate, decline after decline.
+            st.setdefault("messages", []).append(
+                AIMessage(
+                    content="need gate",
+                    tool_calls=[
+                        SimpleNamespace(
+                            fn_name="gated_tool", call_id=f"c{len(st['messages'])}", fn_arguments={}
+                        )
+                    ],
+                )
+            )
+            return {}
+
+        graph._aassistant_step = relentless_step
+        config = {"configurable": {"thread_id": "cicd-decline-3"}}
+
+        await drive_with_auto_decline(
+            graph,
+            {"messages": []},
+            config,
+            limits_exceeded=lambda: False,
+            max_declines=3,
+        )
+
+        messages = graph.get_state(config).values["messages"]
+        denied = [
+            m
+            for m in messages
+            if getattr(m, "type", "") == "tool" and "denied" in m.content
+        ]
+        assert len(denied) == 3

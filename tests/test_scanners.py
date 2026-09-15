@@ -199,6 +199,50 @@ class TestVulnerabilityScanner:
         assert any("after 3 attempts" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
+    async def test_nvd_retries_rate_limit_statuses(self, scanner, monkeypatch):
+        """NVD rate-limits arrive as HTTP 429 without an exception; they
+        must enter the retry path instead of silently returning empty."""
+        import asyncio as aio
+
+        calls: list[str] = []
+
+        class _StatusResponse:
+            def __init__(self, status):
+                self._status = status
+
+            @property
+            def status(self):
+                return self._status
+
+            async def json(self):
+                return {"vulnerabilities": []}
+
+        class _FakeGet:
+            def __init__(self, status):
+                self._status = status
+
+            async def __aenter__(self):
+                return _StatusResponse(self._status)
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                calls.append(url)
+                return _FakeGet(429 if len(calls) < 3 else 200)
+
+        async def _no_sleep(_delay):
+            return None
+
+        scanner.session = _FakeSession()
+        monkeypatch.setattr(aio, "sleep", _no_sleep)
+
+        result = await scanner._query_nvd("http")
+        assert result == []
+        assert len(calls) == 3
+
+    @pytest.mark.asyncio
     async def test_engine_closes_scanner_even_when_scan_raises(self):
         """PR #20 regression: `CoreEngine._vulnerability_scan` wraps the
         scanner in `try/finally: await scanner.close()` so the

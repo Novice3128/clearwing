@@ -516,6 +516,13 @@ def create_app():
         def _turn_active() -> bool:
             return turn_task is not None and not turn_task.done()
 
+        def _graph_has_pending(graph_ref: Any, config_ref: dict) -> bool:
+            # Fake graphs in tests may lack get_state; treat as no pending.
+            try:
+                return bool(getattr(graph_ref.get_state(config_ref), "next", ()))
+            except Exception:
+                return False
+
         async def _reject_busy_frame() -> bool:
             """True when the handler may keep serving; False when the client is gone."""
             return await _safe_send(
@@ -525,6 +532,20 @@ def create_app():
                         "message": (
                             "A turn is already running — "
                             'send {"type": "stop"} to cancel it first'
+                        )
+                    },
+                }
+            )
+
+        async def _reject_pending_approval_frame() -> bool:
+            return await _safe_send(
+                {
+                    "type": "error",
+                    "data": {
+                        "message": (
+                            "An approval is still pending — answer it with "
+                            '{"type": "approve", "approved": true|false} or '
+                            'discard it with {"type": "stop"} first'
                         )
                     },
                 }
@@ -656,23 +677,24 @@ def create_app():
                     }
                 ):
                     return
+            else:
+                values = getattr(snapshot, "values", None)
+                messages_after = (values or {}).get("messages", [])
+                produced_new = before is None or len(messages_after) > before
+                if produced_new:
+                    content = _last_ai_content(values)
+                    if content:
+                        if transcript_ref:
+                            transcript_ref.add_agent(content)
+                        if not await _safe_send(
+                            {
+                                "type": "agent_message",
+                                "data": {"content": content},
+                            }
+                        ):
+                            return
             finally:
                 turn_state["active"] = False
-            values = getattr(snapshot, "values", None)
-            messages_after = (values or {}).get("messages", [])
-            produced_new = before is None or len(messages_after) > before
-            if produced_new:
-                content = _last_ai_content(values)
-                if content:
-                    if transcript_ref:
-                        transcript_ref.add_agent(content)
-                    if not await _safe_send(
-                        {
-                            "type": "agent_message",
-                            "data": {"content": content},
-                        }
-                    ):
-                        return
             # Complete follows both success and failure, so the client never
             # waits on a resume that died mid-stream.
             await _drain_events()
@@ -739,6 +761,12 @@ def create_app():
                 elif msg_type == "message" and graph and config:
                     if _turn_active():
                         if not await _reject_busy_frame():
+                            break
+                        continue
+                    if _graph_has_pending(graph, config):
+                        # A user message on top of a suspended tool batch
+                        # would orphan its tool_use (provider 400 next turn).
+                        if not await _reject_pending_approval_frame():
                             break
                         continue
 
