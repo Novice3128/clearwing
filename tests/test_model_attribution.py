@@ -28,7 +28,12 @@ def echo_tool() -> dict:
     return {"ok": True}
 
 
-def _graph(*, session_id: str | None = None, llm: object = object()) -> NativeAgentGraph:
+def _graph(
+    *,
+    session_id: str | None = None,
+    llm: object = object(),
+    enable_episodic_memory: bool = False,
+) -> NativeAgentGraph:
     return NativeAgentGraph(
         llm=llm,
         native_tools=[],
@@ -41,7 +46,7 @@ def _graph(*, session_id: str | None = None, llm: object = object()) -> NativeAg
         input_guardrail_tool_names=frozenset(),
         output_guardrail_tool_names=frozenset(),
         enable_cost_tracker=False,
-        enable_episodic_memory=False,
+        enable_episodic_memory=enable_episodic_memory,
         enable_audit=False,
         enable_knowledge_graph=False,
         enable_input_guardrail=False,
@@ -143,9 +148,12 @@ class TestEpisodeAttribution:
             )
 
         monkeypatch.setattr(runtime_mod, "EpisodicMemory", factory)
-        graph = _graph(session_id="sess19")
-        graph.episodic_memory = factory(session_id="sess19")
+        # Drive the real constructor path: the runtime must thread its own
+        # session_id into EpisodicMemory (it used to construct it bare,
+        # landing every episode with session_id='').
+        graph = _graph(session_id="sess19", enable_episodic_memory=True)
         assert constructed["session_id"] == "sess19"
+        assert graph.episodic_memory.session_id == "sess19"
 
         state = graph._get_or_create_state("epis-1")
         state["target"] = "10.1.2.3"

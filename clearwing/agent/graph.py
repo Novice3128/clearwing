@@ -140,6 +140,9 @@ def _create_llm(
     model_explicit: bool = False,
 ) -> AsyncLLMClient:
     if provider_manager is not None:
+        # model_explicit does not apply here: the manager owns per-task
+        # endpoint resolution and its client's own model_name is what the
+        # runtime attributes cost/audit against.
         return provider_manager.get_native_client(task)
     if base_url or api_key:
         # Explicit per-request credentials win outright.

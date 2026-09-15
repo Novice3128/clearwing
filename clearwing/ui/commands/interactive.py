@@ -15,6 +15,7 @@ from clearwing.agent.tools.ops.dynamic_tool_creator import get_custom_tools
 from clearwing.agent.tools.ops.kali_docker_tool import kali_cleanup
 from clearwing.data.memory import SessionStore
 from clearwing.observability.telemetry import CostTracker
+from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
 from clearwing.ui.tui import ClearwingApp
 
 logger = logging.getLogger(__name__)
@@ -25,8 +26,9 @@ def add_parser(subparsers):
     parser.add_argument(
         "--model",
         default=None,
-        help="LLM model name (default: resolved from config.yaml / env, "
-        "falling back to claude-sonnet-4-6)",
+        help="LLM model name; when omitted (or with --base-url, where the "
+        "endpoint's own model is guessed) the model is resolved from "
+        "config.yaml / env, falling back to claude-sonnet-4-6",
     )
     parser.add_argument("--target", help="Initial target IP address")
     parser.add_argument("--resume", metavar="SESSION_ID", help="Resume a previous session by ID")
@@ -74,10 +76,14 @@ def handle(cli, args):
         if session:
             cli.console.print(f"[green]Resuming session {session.session_id}[/green]")
             args.target = session.target
-            # The session's stored model was an explicit choice when saved.
+            # A stored value equal to the legacy argparse default is
+            # ambiguous: sessions saved before that default was removed
+            # stored the placeholder even when the user never chose a
+            # model, and promoting it would override config.yaml on
+            # resume. Treat it as "defer"; pass --model to pin a model.
             if session.model:
                 args.model = session.model
-                args.model_explicit = True
+                args.model_explicit = session.model != DEFAULT_ANTHROPIC_MODEL
         else:
             cli.console.print(f"[red]Session {resume_id} not found.[/red]")
             return
