@@ -59,7 +59,11 @@ Initializes an agent session. Must be sent before `message` or
 
 `target`, `base_url`, and `api_key` are forwarded to
 `create_agent(...)`; they default to empty / `None` if omitted.
-`model` defaults to `"claude-sonnet-4-6"`.
+`model` empty or omitted means "defer to config.yaml / env"; a
+non-empty value is an explicit choice that wins over the configured
+model even when it equals the placeholder. The `started` frame echoes
+the model that was actually configured (which may differ from the
+frame's value).
 
 ### `message`
 
@@ -486,14 +490,17 @@ frames **do** nest under `data`).
 
 ### `started`
 
-Sent exactly once in response to a client `start` frame.
+Sent exactly once in response to a client `start` frame. `model` is
+the model that was actually configured (resolved from config.yaml /
+env when the start frame's model field was empty), not necessarily the
+frame's value.
 
 ```json
 {
   "type": "started",
   "session_id": "a1b2c3d4",
   "target": "10.0.0.1",
-  "model": "claude-sonnet-4-6"
+  "model": "glm-5.3"
 }
 ```
 

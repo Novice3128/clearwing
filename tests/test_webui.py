@@ -1,5 +1,6 @@
 """Tests for the web UI module."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -457,6 +458,76 @@ class TestAgentSessionFlow:
         content = report.read_text(encoding="utf-8")
         assert "[approval approved by operator]" in content
         assert "post approval answer" in content
+
+    def test_message_turn_carries_target_into_graph_state(
+        self, client, monkeypatch, results_dir
+    ):
+        """Issue #19: the start-frame target must ride along with every
+        message so episodes are attributable (recall used to find nothing
+        because every row landed with target='unknown')."""
+        captured: dict = {}
+
+        class _CaptureGraph(_FakeGraph):
+            async def astream(self, input_msg, config, stream_mode="values"):
+                captured.update(input_msg)
+                for ev in self.events:
+                    yield ev
+
+        fake = _CaptureGraph(events=[{"messages": [_FakeAI()]}])
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "10.9.8.7", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "message", "content": "scan it"})
+            while True:
+                if ws.receive_json()["type"] == "complete":
+                    break
+
+        assert captured["target"] == "10.9.8.7"
+        assert captured["messages"][0]["content"] == "scan it"
+
+    def test_start_frame_reports_resolved_model(self, client, monkeypatch):
+        """Issue #21/#22 surface: `started` echoes the model that actually
+        got configured, and an empty model field defers to config."""
+
+        class _LabeledGraph(_FakeGraph):
+            llm = SimpleNamespace(model_name="glm-5.3")
+
+        fake = _LabeledGraph()
+        captured: dict = {}
+
+        def make_agent(**kwargs):
+            captured.update(kwargs)
+            return fake
+
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", make_agent)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": ""})
+            started = ws.receive_json()
+            assert started["type"] == "started"
+            assert started["model"] == "glm-5.3"
+            assert captured["model_name"] is None
+            assert captured["model_explicit"] is False
+
+    def test_start_frame_with_non_string_model_is_treated_as_unset(
+        self, client, monkeypatch
+    ):
+        """Codex P2: a truthy non-string model used to crash `.strip()`
+        before the error-frame path, tearing down the socket silently."""
+        captured: dict = {}
+
+        def make_agent(**kwargs):
+            captured.update(kwargs)
+            return _FakeGraph()
+
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", make_agent)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": 12345})
+            started = ws.receive_json()
+            assert started["type"] == "started"
+            assert captured["model_name"] is None
+            assert captured["model_explicit"] is False
 
 
 class TestStopFrame:

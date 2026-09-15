@@ -65,6 +65,11 @@ class CostTracker:
     _DEFAULT_MODEL = "claude-sonnet-4-6"
 
     @classmethod
+    def has_pricing(cls, model: str | None) -> bool:
+        """True when *model* has an explicit pricing entry (no fallback)."""
+        return bool(model) and model in cls.PRICING
+
+    @classmethod
     def estimate_cost(
         cls,
         input_tokens: int,

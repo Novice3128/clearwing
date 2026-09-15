@@ -109,6 +109,7 @@ class TestGraphConstruction:
                 "claude-sonnet-4-6",
                 base_url=None,
                 api_key=None,
+                model_explicit=False,
             )
             # The native client is threaded straight through — no bind_tools.
             assert graph.llm is mock_llm
@@ -144,6 +145,7 @@ class TestGraphConstruction:
                 "my-model",
                 base_url="http://localhost:8000/v1",
                 api_key="test-key",
+                model_explicit=False,
             )
 
 

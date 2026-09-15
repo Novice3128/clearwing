@@ -61,6 +61,23 @@ class TestCreateLLMConfigFallback:
         graph_mod._create_llm("kimi-k2")
         assert captured["endpoint"].model == "kimi-k2"
 
+    def test_explicit_default_named_model_beats_config(self, monkeypatch):
+        """Issue #22: explicitly choosing claude-sonnet-4-6 used to be
+        mistaken for the placeholder and lose to the configured model."""
+        captured = _patch(monkeypatch)  # config resolves glm-5.3
+        graph_mod._create_llm("claude-sonnet-4-6", model_explicit=True)
+        assert captured["endpoint"].model == "claude-sonnet-4-6"
+
+    def test_placeholder_with_flag_still_defers_to_config(self, monkeypatch):
+        captured = _patch(monkeypatch)
+        graph_mod._create_llm("claude-sonnet-4-6")
+        assert captured["endpoint"].model == "glm-5.3"
+
+    def test_none_model_defers_to_config(self, monkeypatch):
+        captured = _patch(monkeypatch)
+        graph_mod._create_llm(None)
+        assert captured["endpoint"].model == "glm-5.3"
+
     def test_default_source_allows_model_override(self, monkeypatch):
         captured = _patch(
             monkeypatch, source="default", model="claude-sonnet-4-6",

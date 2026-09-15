@@ -132,13 +132,17 @@ def build_react_graph(
 
 
 def _create_llm(
-    model_name: str,
+    model_name: str | None,
     base_url: str | None = None,
     api_key: str | None = None,
     provider_manager: ProviderManager | None = None,
     task: str = "default",
+    model_explicit: bool = False,
 ) -> AsyncLLMClient:
     if provider_manager is not None:
+        # model_explicit does not apply here: the manager owns per-task
+        # endpoint resolution and its client's own model_name is what the
+        # runtime attributes cost/audit against.
         return provider_manager.get_native_client(task)
     if base_url or api_key:
         # Explicit per-request credentials win outright.
@@ -154,21 +158,29 @@ def _create_llm(
     # bare cli_model used to take the "CLI flags win" branch, which never
     # consulted config.yaml / env — every chat session then died with
     # "no API key or base URL configured".
+    #
+    # model_explicit disambiguates "the user typed this model" from "the
+    # entry point's placeholder": an explicit choice must win even when it
+    # happens to equal DEFAULT_ANTHROPIC_MODEL (issue #22), while a
+    # placeholder/None defers to the configured provider model.
     endpoint = resolve_llm_endpoint()
     if model_name and (
-        endpoint.source == "default" or model_name != DEFAULT_ANTHROPIC_MODEL
+        model_explicit
+        or endpoint.source == "default"
+        or model_name != DEFAULT_ANTHROPIC_MODEL
     ):
         endpoint = dataclasses.replace(endpoint, model=model_name)
     return ProviderManager.for_endpoint(endpoint).get_native_client("default")
 
 
 def create_agent(
-    model_name: str = "claude-sonnet-4-6",
+    model_name: str | None = "claude-sonnet-4-6",
     custom_tools: list = None,
     session_id: str = None,
     base_url: str = None,
     api_key: str = None,
     provider_manager: ProviderManager | None = None,
+    model_explicit: bool = False,
 ):
     all_tools = get_all_tools()
     if custom_tools:
@@ -183,7 +195,9 @@ def create_agent(
     # `build_react_graph` builds the NativeToolSpec list from `all_tools`.
     agent_limits = None
     if provider_manager is None:
-        llm = _create_llm(model_name, base_url=base_url, api_key=api_key)
+        llm = _create_llm(
+            model_name, base_url=base_url, api_key=api_key, model_explicit=model_explicit
+        )
         agent_limits = _default_agent_limits()
     else:
         llm = _create_llm(
@@ -191,15 +205,18 @@ def create_agent(
             base_url=base_url,
             api_key=api_key,
             provider_manager=provider_manager,
+            model_explicit=model_explicit,
         )
         agent_limits = provider_manager.get_agent_limits("default")
 
+    # The graph's model_name is a display/audit fallback label; cost pricing
+    # and audit use the client's resolved model (see _aassistant_step).
     return build_react_graph(
         llm_with_tools=llm,
         tools=all_tools,
         system_prompt_fn=build_system_prompt,
         state_schema=AgentState,
-        model_name=model_name,
+        model_name=model_name or DEFAULT_ANTHROPIC_MODEL,
         session_id=session_id,
         agent_limits=agent_limits,
     )

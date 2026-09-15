@@ -15,6 +15,7 @@ from clearwing.agent.tools.ops.dynamic_tool_creator import get_custom_tools
 from clearwing.agent.tools.ops.kali_docker_tool import kali_cleanup
 from clearwing.data.memory import SessionStore
 from clearwing.observability.telemetry import CostTracker
+from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
 from clearwing.ui.tui import ClearwingApp
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,11 @@ logger = logging.getLogger(__name__)
 def add_parser(subparsers):
     parser = subparsers.add_parser("interactive", help="Start interactive AI agent")
     parser.add_argument(
-        "--model", default="claude-sonnet-4-6", help="LLM model name (default: claude-sonnet-4-6)"
+        "--model",
+        default=None,
+        help="LLM model name; when omitted (or with --base-url, where the "
+        "endpoint's own model is guessed) the model is resolved from "
+        "config.yaml / env, falling back to claude-sonnet-4-6",
     )
     parser.add_argument("--target", help="Initial target IP address")
     parser.add_argument("--resume", metavar="SESSION_ID", help="Resume a previous session by ID")
@@ -49,6 +54,10 @@ def add_parser(subparsers):
 
 def handle(cli, args):
     """Run the interactive AI agent loop."""
+    # `--model` unset means "defer to config.yaml / env" (#8/#22): the old
+    # argparse default was indistinguishable from an explicit choice and
+    # short-circuited the config provider section.
+    args.model_explicit = args.model is not None
     if not _preflight_check(cli, args):
         return
 
@@ -67,12 +76,27 @@ def handle(cli, args):
         if session:
             cli.console.print(f"[green]Resuming session {session.session_id}[/green]")
             args.target = session.target
-            args.model = session.model
+            # A stored value equal to the legacy argparse default is
+            # ambiguous on its own: sessions saved before that default was
+            # removed stored the placeholder even when the user never chose
+            # a model. New sessions persist the choice intent alongside
+            # (model_explicit); legacy rows default to "defer". An explicit
+            # --model on this invocation still wins over the stored value.
+            if session.model and args.model is None:
+                args.model = session.model
+                if session.model != DEFAULT_ANTHROPIC_MODEL:
+                    args.model_explicit = True
+                else:
+                    args.model_explicit = bool(getattr(session, "model_explicit", False))
         else:
             cli.console.print(f"[red]Session {resume_id} not found.[/red]")
             return
     else:
-        session = store.create(target=args.target or "", model=args.model)
+        session = store.create(
+            target=args.target or "",
+            model=args.model or "",
+            model_explicit=getattr(args, "model_explicit", args.model is not None),
+        )
 
     # Launch TUI or legacy mode
     use_tui = not getattr(args, "no_tui", False)
@@ -113,8 +137,9 @@ def _preflight_check(cli, args) -> bool:
 
     # Skip the "valid model" warning when the user is pointing at a
     # custom endpoint — we have no way to know what models OpenRouter /
-    # Ollama / LM Studio / vLLM serve.
-    if not has_cli_endpoint and not has_clearwing_env:
+    # Ollama / LM Studio / vLLM serve — or when no model was chosen (the
+    # configured provider decides).
+    if not has_cli_endpoint and not has_clearwing_env and args.model is not None:
         valid_models = [
             "claude-sonnet-4-6",
             "claude-opus-4-7",
@@ -143,6 +168,7 @@ def _run_tui(cli, args, session=None):
         session_id=session_id,
         base_url=getattr(args, "base_url", None),
         api_key=getattr(args, "api_key", None),
+        model_explicit=getattr(args, "model_explicit", args.model is not None),
     )
     app.run()
 
@@ -159,7 +185,7 @@ def _run_interactive_legacy(cli, args, session=None):
     cli.console.print(
         Panel.fit(
             "[bold cyan]Clearwing Interactive Agent[/bold cyan]\n"
-            f"Model: {args.model}\n"
+            f"Model: {args.model or '(from config)'}\n"
             "Type 'quit' or 'exit' to end session."
         )
     )
@@ -167,8 +193,10 @@ def _run_interactive_legacy(cli, args, session=None):
     thread_id = session.thread_id if session else "interactive-session"
     graph = create_agent(
         model_name=args.model,
+        session_id=session.session_id if session else None,
         base_url=getattr(args, "base_url", None),
         api_key=getattr(args, "api_key", None),
+        model_explicit=getattr(args, "model_explicit", args.model is not None),
     )
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -280,8 +308,12 @@ def _run_interactive_legacy(cli, args, session=None):
                     graph = create_agent(
                         model_name=args.model,
                         custom_tools=custom_tools,
+                        session_id=session.session_id if session else None,
                         base_url=getattr(args, "base_url", None),
                         api_key=getattr(args, "api_key", None),
+                        model_explicit=getattr(
+                            args, "model_explicit", args.model is not None
+                        ),
                     )
                     cli.console.print("[dim]Graph recompiled with new custom tools.[/dim]")
 
