@@ -126,6 +126,79 @@ class TestVulnerabilityScanner:
         assert scanner.session is None
 
     @pytest.mark.asyncio
+    async def test_nvd_query_retries_transient_failures(self, scanner, monkeypatch):
+        """Issue #20: one NVD timeout must not drop the query outright."""
+        import asyncio as aio
+
+        calls: list[str] = []
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return {"vulnerabilities": []}
+
+        class _FakeGet:
+            def __init__(self, exc):
+                self._exc = exc
+
+            async def __aenter__(self):
+                if self._exc is not None:
+                    raise self._exc
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                calls.append(url)
+                return _FakeGet(aio.TimeoutError() if len(calls) < 3 else None)
+
+        async def _no_sleep(_delay):
+            return None
+
+        scanner.session = _FakeSession()
+        monkeypatch.setattr(aio, "sleep", _no_sleep)
+
+        result = await scanner._query_nvd("http")
+        assert result == []
+        assert len(calls) == 3  # two timeouts retried, third attempt succeeded
+
+    @pytest.mark.asyncio
+    async def test_nvd_query_gives_up_after_retries(self, scanner, monkeypatch, caplog):
+        import asyncio as aio
+
+        calls: list[str] = []
+
+        class _FakeGet:
+            async def __aenter__(self):
+                raise aio.TimeoutError()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                calls.append(url)
+                return _FakeGet()
+
+        async def _no_sleep(_delay):
+            return None
+
+        scanner.session = _FakeSession()
+        monkeypatch.setattr(aio, "sleep", _no_sleep)
+
+        with caplog.at_level("WARNING", logger="clearwing.scanning.vulnerability_scanner"):
+            result = await scanner._query_nvd("http")
+
+        assert result == []
+        assert len(calls) == 3
+        assert any("after 3 attempts" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_engine_closes_scanner_even_when_scan_raises(self):
         """PR #20 regression: `CoreEngine._vulnerability_scan` wraps the
         scanner in `try/finally: await scanner.close()` so the

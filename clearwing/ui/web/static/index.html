@@ -58,6 +58,10 @@
                      color: var(--text); font-size: 14px; }
   #input-bar button { padding: 10px 20px; background: var(--accent); color: #fff;
                       border: none; border-radius: 6px; cursor: pointer; }
+  #input-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #input-bar #stop-btn { background: transparent; color: var(--red);
+                         border: 1px solid var(--red); }
+  #input-bar #stop-btn:not(:disabled):hover { background: #2d1215; }
 
   footer { background: var(--surface); border-top: 1px solid var(--border);
            padding: 6px 20px; font-size: 11px; color: var(--dim);
@@ -103,7 +107,8 @@
   <div id="input-bar">
     <input id="msg-input" placeholder="Type a message..." autofocus
            onkeydown="if(event.key==='Enter')sendMessage()">
-    <button onclick="sendMessage()">Send</button>
+    <button id="stop-btn" onclick="stopAgent()" disabled>Stop</button>
+    <button id="send-btn" onclick="sendMessage()">Send</button>
   </div>
 </div>
 
@@ -116,6 +121,16 @@
 const THINK_RE = /<think>[\s\S]*?<\/think>\s*/g;
 let ws = null;
 const opsState = {};
+// A turn runs server-side between our `message`/`approve` frame and the
+// matching `complete`/`stopped` frame; while one is running the only frame
+// the server accepts is `stop`.
+let turnBusy = false;
+
+function setTurnBusy(busy) {
+  turnBusy = busy;
+  document.getElementById('send-btn').disabled = busy;
+  document.getElementById('stop-btn').disabled = !busy;
+}
 
 function updateOpsPanel() {
   const panel = document.getElementById('ops-panel');
@@ -260,7 +275,13 @@ function startSession() {
       case 'error':
         addMessage(`Error: ${data.message || JSON.stringify(data)}`, 'error');
         break;
+      case 'stopped':
+        setTurnBusy(false);
+        addMessage(data.cancelled_turn || data.discarded_approval
+          ? 'Stopped by operator.' : 'Nothing was running.', 'tool');
+        break;
       case 'complete': {
+        setTurnBusy(false);
         addMessage('Agent completed.', 'tool');
         if (data.report_url && webuiKey) {
           // Download via fetch + header so the key never lands in an href
@@ -325,15 +346,24 @@ function startSession() {
 function sendMessage() {
   const input = document.getElementById('msg-input');
   const text = input.value.trim();
-  if (!text || !ws) return;
+  if (!text || !ws || turnBusy) return;
   addMessage(text, 'user');
   ws.send(JSON.stringify({type: 'message', content: text}));
+  setTurnBusy(true);
   input.value = '';
+}
+
+function stopAgent() {
+  if (!ws || !turnBusy) return;
+  ws.send(JSON.stringify({type: 'stop'}));
+  setTurnBusy(false);
+  addMessage('Stop requested...', 'tool');
 }
 
 function approve(approved, btn) {
   if (!ws) return;
   ws.send(JSON.stringify({type: 'approve', approved}));
+  setTurnBusy(true);
   const parent = btn.parentElement;
   parent.querySelectorAll('button').forEach(b => b.disabled = true);
   addMessage(approved ? 'Approved.' : 'Denied.', 'tool');

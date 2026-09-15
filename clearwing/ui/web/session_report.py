@@ -7,6 +7,7 @@ and on disconnect. Unlike the model's final message, this artifact always
 exists — even when the client disconnects mid-run.
 """
 
+import json
 import logging
 import os
 import re
@@ -18,6 +19,33 @@ from clearwing.core.config import default_results_dir
 from clearwing.reporting.safety import redact_text
 
 logger = logging.getLogger(__name__)
+
+
+def coerce_text(value: Any) -> str:
+    """Normalize a WS message payload into report-safe plain text.
+
+    WS clients can send ``content: null`` / list / object; the transcript
+    render path assumes strings and used to crash on anything else, which
+    permanently broke report writing for the session (#25). Anthropic-style
+    content blocks are joined; other shapes fall back to JSON so no
+    information is silently dropped.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = [
+            part["text"]
+            for part in value
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        ]
+        if parts:
+            return "\n".join(parts)
+        return json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
 
 # The shared redact_text misses secret shapes that chat transcripts commonly
 # carry (operator-pasted LLM keys, the webui key itself, `password: ...`
@@ -65,17 +93,17 @@ class SessionTranscript:
         self.cost_usd: float | None = None
         self.tokens: int | None = None
 
-    def add_user(self, content: str) -> None:
-        self.user_messages.append(content)
+    def add_user(self, content: Any) -> None:
+        self.user_messages.append(coerce_text(content))
 
-    def add_agent(self, content: str) -> None:
-        self.agent_messages.append(content)
+    def add_agent(self, content: Any) -> None:
+        self.agent_messages.append(coerce_text(content))
 
     def add_tool(self, name: str, args: Any = None, content_length: Any = None) -> None:
         self.tool_calls.append({"name": name, "args": args, "content_length": content_length})
 
-    def add_error(self, message: str) -> None:
-        self.errors.append(message)
+    def add_error(self, message: Any) -> None:
+        self.errors.append(coerce_text(message))
 
     def set_cost(self, cost_usd: Any, tokens: Any) -> None:
         if isinstance(cost_usd, int | float):
@@ -154,13 +182,48 @@ class SessionTranscript:
         lines.append("")
         return "\n".join(lines)
 
+    def _render_fallback(self, reason: str) -> str:
+        """Minimal header-only report used when the full render fails.
+
+        The transcript can be poisoned by a shape render() cannot handle;
+        the artifact itself must still land (#25), with an honest note.
+        """
+        return "\n".join(
+            [
+                "# Clearwing Session Report",
+                "",
+                "| Field | Value |",
+                "|-------|-------|",
+                f"| Session | {_md_cell(self.session_id)} |",
+                f"| Target | {_md_cell(self.target) or '(none)'} |",
+                f"| Model | {_md_cell(self.model)} |",
+                f"| Started | {_md_cell(self.started_at)} |",
+                f"| Updated | {_md_cell(self.updated_at)} |",
+                f"| User requests | {len(self.user_messages)} |",
+                f"| Agent responses | {len(self.agent_messages)} |",
+                f"| Tool calls | {len(self.tool_calls)} |",
+                f"| Errors | {len(self.errors)} |",
+                "",
+                f"Note: full transcript render failed ({reason}); "
+                "this report contains the session summary only.",
+                "",
+            ]
+        )
+
     def write(self) -> Path:
         """Render and atomically write ``report.md``; returns its path."""
         self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            body = self.render()
+        except Exception as exc:
+            logger.warning(
+                "Session report render failed; writing fallback report", exc_info=True
+            )
+            body = self._render_fallback(f"{type(exc).__name__}: {exc}")
         path = self.report_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".md.tmp")
-        tmp.write_text(self.render(), encoding="utf-8")
+        tmp.write_text(body, encoding="utf-8")
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
         # The transcript can carry target credentials; keep the artifact
