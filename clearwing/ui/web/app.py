@@ -723,7 +723,14 @@ def create_app():
                     # Initialize agent. An empty model field means "defer to
                     # config.yaml/env"; a non-empty one is an explicit choice
                     # that must win over the configured model (issue #22).
-                    model = (data.get("model") or "").strip() or None
+                    # Non-string junk counts as "not provided" rather than
+                    # crashing the handler before the error frame can be sent.
+                    raw_model = data.get("model")
+                    model = (
+                        raw_model.strip() or None
+                        if isinstance(raw_model, str)
+                        else None
+                    )
                     target = data.get("target", "")
                     handler_target = target
                     session_id = uuid.uuid4().hex[:8]

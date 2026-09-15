@@ -510,6 +510,25 @@ class TestAgentSessionFlow:
             assert captured["model_name"] is None
             assert captured["model_explicit"] is False
 
+    def test_start_frame_with_non_string_model_is_treated_as_unset(
+        self, client, monkeypatch
+    ):
+        """Codex P2: a truthy non-string model used to crash `.strip()`
+        before the error-frame path, tearing down the socket silently."""
+        captured: dict = {}
+
+        def make_agent(**kwargs):
+            captured.update(kwargs)
+            return _FakeGraph()
+
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", make_agent)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": 12345})
+            started = ws.receive_json()
+            assert started["type"] == "started"
+            assert captured["model_name"] is None
+            assert captured["model_explicit"] is False
+
 
 class TestStopFrame:
     """#6: an operator must be able to cancel a running/pending agent turn."""
