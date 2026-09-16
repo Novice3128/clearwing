@@ -56,6 +56,18 @@ class ContextSummarizer:
         history with an orphaned ``tool_use``/``tool_result`` pair — and
         flag-bearing messages are kept verbatim by policy.
         """
+        if isinstance(message, dict):
+            # Dict-shaped (legacy LangChain-style) messages: a tool result
+            # (``role: tool`` / ``tool_call_id``) or an assistant turn
+            # carrying ``tool_calls`` must never be summarized away —
+            # covering either orphans the paired tool_use (provider 400).
+            # No in-repo caller emits this shape today; defensive.
+            if (
+                message.get("role") == "tool"
+                or message.get("tool_call_id")
+                or message.get("tool_calls")
+            ):
+                return False
         content = getattr(message, "content", None) or ""
         if not isinstance(content, str):
             content = str(content)
@@ -91,14 +103,17 @@ class ContextSummarizer:
     ) -> dict[str, Any]:
         """(Re)generate the running summary over the oldest 70% of *messages*.
 
-        Returns ``{"text": str, "covered_count": int, "view": list}``.
-        ``view`` is *messages* with the covered segment removed — the caller
-        replaces its history with it, which is what keeps the threshold from
-        re-firing (and re-billing a summary LLM call) on every step.
-        ``covered_count`` is the cumulative number of summarized messages
-        across epochs. When the old segment holds nothing newly coverable
-        the prior state is returned unchanged and the LLM is NOT called
-        (coverage unchanged -> reuse; issue #38).
+        Returns ``{"text": str, "covered_count": int, "view": list,
+        "usage": dict | None}``. ``view`` is *messages* with the covered
+        segment removed — the caller replaces its history with it, which is
+        what keeps the threshold from re-firing (and re-billing a summary
+        LLM call) on every step. ``covered_count`` is the cumulative number
+        of summarized messages across epochs. ``usage`` carries the summary
+        call's token counts (input/output/cached) when the provider
+        reported them, so callers can book the summarizer's spend; None on
+        every path that skipped the LLM. When the old segment holds nothing
+        newly coverable the prior state is returned unchanged and the LLM
+        is NOT called (coverage unchanged -> reuse; issue #38).
 
         *prior* is the previous ``{"text", "covered_count"}`` state; its text
         is fed to the summarization prompt so knowledge accumulates across
@@ -110,6 +125,7 @@ class ContextSummarizer:
                 "text": prior.get("text", ""),
                 "covered_count": prior.get("covered_count", 0),
                 "view": messages,
+                "usage": None,
             }
 
         total = len(messages)
@@ -124,6 +140,7 @@ class ContextSummarizer:
                 "text": prior.get("text", ""),
                 "covered_count": prior.get("covered_count", 0),
                 "view": list(messages),
+                "usage": None,
             }
 
         prior_text = prior.get("text") or ""
@@ -150,6 +167,37 @@ class ContextSummarizer:
         )
         summary_text = response_text(summary_response)
 
+        # Token usage of the summary call, when the provider reported it.
+        # Defensive getattr throughout: fake clients and older genai builds
+        # may not expose usage (or its detail fields) at all — anything that
+        # is not a concrete int token count yields None so callers never
+        # book a hallucinated figure.
+        usage_obj = getattr(summary_response, "usage", None)
+        usage_input = getattr(usage_obj, "prompt_tokens", None)
+        usage_output = getattr(usage_obj, "completion_tokens", None)
+        usage = None
+        if isinstance(usage_input, int) and isinstance(usage_output, int):
+            details = getattr(usage_obj, "prompt_tokens_details", None)
+            usage_cached = getattr(details, "cached_tokens", None) if details else None
+            usage = {
+                "input_tokens": usage_input,
+                "output_tokens": usage_output,
+                "cached_tokens": usage_cached if isinstance(usage_cached, int) else 0,
+            }
+
+        if not summary_text.strip():
+            # Empty/whitespace summary: committing it would REPLACE the
+            # covered messages with nothing — silently destroying history
+            # (and any knowledge the prior summary held). Keep the prior
+            # state and the original view; the usage is still returned so
+            # the billed call is not hidden from the caller's accounting.
+            return {
+                "text": prior.get("text", ""),
+                "covered_count": prior.get("covered_count", 0),
+                "view": list(messages),
+                "usage": usage,
+            }
+
         covered_ids = {id(m) for m in to_summarize}
         view = [m for m in messages if id(m) not in covered_ids]
         covered_count = prior.get("covered_count", 0) + len(to_summarize)
@@ -161,4 +209,9 @@ class ContextSummarizer:
             len(to_summarize),
             covered_count,
         )
-        return {"text": summary_text, "covered_count": covered_count, "view": view}
+        return {
+            "text": summary_text,
+            "covered_count": covered_count,
+            "view": view,
+            "usage": usage,
+        }

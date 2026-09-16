@@ -1996,7 +1996,18 @@ class AsyncLLMClient:
                         dispatched=True,
                     )
                 else:
-                    self._settle_spend_call(reservation, response)
+                    try:
+                        self._settle_spend_call(reservation, response)
+                    except Exception as exc:
+                        # Settle must never strand an ACTIVE reservation
+                        # (e.g. a malformed response whose usage blows up
+                        # settlement): the reservation would stay booked
+                        # forever and enforcing runs would under-report
+                        # their remaining budget. Close it as an ambiguous
+                        # failure — the generation may have been billed —
+                        # then surface the original error.
+                        self._fail_spend_call(reservation, exc, dispatched=True)
+                        raise
             return response
 
     async def _attempt_with_reservation(self, op, reserve) -> ChatResponse | None:
@@ -2020,7 +2031,13 @@ class AsyncLLMClient:
                 dispatched=True,
             )
         else:
-            self._settle_spend_call(reservation, response)
+            try:
+                self._settle_spend_call(reservation, response)
+            except Exception as exc:
+                # Same dangling-reservation guard as _with_retries: close
+                # the attempt as an ambiguous failure, then re-raise.
+                self._fail_spend_call(reservation, exc, dispatched=True)
+                raise
         return response
 
     @staticmethod

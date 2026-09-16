@@ -342,3 +342,125 @@ class TestContextSummarizer:
         kwargs = mock_llm.aask_text.call_args.kwargs
         assert kwargs["cache_prefix"] is True
         assert kwargs["prompt_cache_key"] == "sess-1:wi-1"
+
+    @pytest.mark.asyncio
+    async def test_summarize_returns_usage_when_provider_reported_it(self):
+        # The summary LLM call is real spend: its usage must ride on the
+        # result so callers (runtime, hunter) can book it.
+        messages = [HumanMessage(content=f"Msg {i}") for i in range(10)]
+
+        class _Usage:
+            prompt_tokens = 700
+            completion_tokens = 90
+            total_tokens = 790
+
+            class prompt_tokens_details:  # noqa: N805 - simple namespace
+                cached_tokens = 100
+
+        mock_llm = AsyncMock()
+        mock_llm.aask_text.return_value = MagicMock(
+            first_text="summary", usage=_Usage()
+        )
+
+        result = await self.summarizer.summarize(messages, mock_llm)
+
+        assert result["usage"] == {
+            "input_tokens": 700,
+            "output_tokens": 90,
+            "cached_tokens": 100,
+        }
+
+    @pytest.mark.asyncio
+    async def test_summarize_usage_none_without_concrete_tokens(self):
+        # Fakes/older builds without real usage figures must yield None —
+        # never a hallucinated number.
+        messages = [HumanMessage(content=f"Msg {i}") for i in range(10)]
+        mock_llm = AsyncMock()
+        # MagicMock auto-attributes are not ints.
+        mock_llm.aask_text.return_value = MagicMock(first_text="summary")
+
+        result = await self.summarizer.summarize(messages, mock_llm)
+        assert result["usage"] is None
+
+    @pytest.mark.asyncio
+    async def test_summarize_usage_none_on_early_returns(self):
+        # Empty history and nothing-newly-coverable skip the LLM entirely.
+        mock_llm = AsyncMock()
+        result = await self.summarizer.summarize([], mock_llm)
+        assert result["usage"] is None
+
+        from clearwing.llm import ToolMessage
+
+        messages = [
+            AIMessage(content="", tool_calls=[{"id": "c1", "name": "t", "args": {}}]),
+            ToolMessage(content="result", tool_call_id="c1"),
+        ] * 10
+        result = await self.summarizer.summarize(messages, mock_llm, prior=None)
+        assert result["usage"] is None
+        mock_llm.aask_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_summary_does_not_compact_history(self):
+        # An empty/whitespace summary must not replace the covered messages
+        # with nothing: the prior state and the original view survive, and
+        # the billed usage is still surfaced.
+        messages = [HumanMessage(content=f"Msg {i}") for i in range(10)]
+        prior = {"text": "previous summary", "covered_count": 4}
+
+        class _Usage:
+            prompt_tokens = 500
+            completion_tokens = 0
+            total_tokens = 500
+
+        mock_llm = AsyncMock()
+        mock_llm.aask_text.return_value = MagicMock(
+            first_text="   ", usage=_Usage()
+        )  # whitespace-only summary
+
+        result = await self.summarizer.summarize(messages, mock_llm, prior=prior)
+
+        assert result["text"] == "previous summary"
+        assert result["covered_count"] == 4
+        assert list(result["view"]) == messages  # history untouched
+        # The call still happened and cost money — usage is returned.
+        assert result["usage"] == {
+            "input_tokens": 500,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+        }
+
+    def test_dict_tool_messages_are_not_coverable(self):
+        # Dict-shaped (legacy LangChain-style) tool traffic must stay
+        # verbatim: covering a tool result (or an assistant turn carrying
+        # tool_calls) orphans the paired tool_use — provider 400.
+        tool_result = {"role": "tool", "tool_call_id": "c1", "content": "result"}
+        assistant_with_calls = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "name": "t", "args": {}}],
+        }
+        plain_user = {"role": "user", "content": "hello"}
+
+        assert not self.summarizer._is_coverable(tool_result)
+        assert not self.summarizer._is_coverable(assistant_with_calls)
+        # Plain dict messages remain summarizable as before.
+        assert self.summarizer._is_coverable(plain_user)
+
+    @pytest.mark.asyncio
+    async def test_dict_tool_messages_survive_compaction(self):
+        # End to end: dict tool traffic in the old segment stays in the
+        # compacted view.
+        messages: list = [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "t", "args": {}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "tool output"},
+        ] * 5
+        messages.extend(HumanMessage(content=f"Msg {i}") for i in range(10))
+
+        mock_llm = AsyncMock()
+        mock_llm.aask_text.return_value = MagicMock(first_text="summary")
+
+        result = await self.summarizer.summarize(messages, mock_llm)
+
+        view_ids = {id(m) for m in result["view"]}
+        for m in messages[:10]:  # the old segment's dict tool traffic
+            assert id(m) in view_ids

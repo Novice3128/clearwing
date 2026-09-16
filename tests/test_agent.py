@@ -573,6 +573,241 @@ class TestContextSummarizerCachePrefix:
         )
 
 
+class TestSummaryUsageAccounting:
+    """The summarizer's LLM call is real spend and must be booked.
+
+    Three-lens review F2: ``summarize()``'s usage used to ride on a
+    discarded response object — invisible to the CostTracker, the graph's
+    instance totals, and therefore to cost limits and result fields.
+    """
+
+    def _build(self, client, session_id):
+        from clearwing.agent.graph import build_react_graph
+
+        @tool
+        def noop_tool(value: str) -> str:
+            """Noop."""
+            return value
+
+        return build_react_graph(
+            llm_with_tools=client,
+            tools=[noop_tool],
+            system_prompt_fn=lambda state: "sys",
+            model_name="fake-model",
+            session_id=session_id,
+            enable_knowledge_graph=False,
+            enable_audit=False,
+            enable_episodic_memory=False,
+            enable_cost_tracker=True,
+            enable_event_bus=False,
+            enable_context_summarizer=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_summary_usage_recorded_in_tracker_and_totals(self):
+        from clearwing.observability.telemetry import CostTracker
+
+        # Same flow shape as TestContextSummarizerCachePrefix: compaction
+        # fires exactly once (turn 3), the summary usage is (1, 1).
+        client = _SummarizingFakeClient(
+            [
+                _FakeResponse(text="done", usage=_FakeUsage(10, 5, 15)),
+                _FakeResponse(text="done2", usage=_FakeUsage(3, 2, 5)),
+                _FakeResponse(text="done3", usage=_FakeUsage(3, 2, 5)),
+            ]
+        )
+        # Prime the history past the threshold in one turn: two 2000-char
+        # user messages with an intermediate model response.
+        m1 = "A" * 2000
+        m2 = "C" * 2000
+        graph = self._build(client, "sess-usage-1")
+        config = {"configurable": {"thread_id": "t1"}}
+        async for _ in graph.astream({"messages": [{"role": "user", "content": "go"}]}, config):
+            pass
+        async for _ in graph.astream({"messages": [{"role": "user", "content": m1}]}, config):
+            pass
+        async for _ in graph.astream({"messages": [{"role": "user", "content": m2}]}, config):
+            pass
+
+        assert len(client.summarize_calls) == 1
+
+        # The summary call's tokens landed in the instance totals on top of
+        # the graph's own assistant steps, and in the session-scoped tracker
+        # record (fake-model bills at the Sonnet fallback tier).
+        expected_in = 10 + 3 + 3 + 1  # assistant steps + summary
+        expected_out = 5 + 2 + 2 + 1
+        assert graph._cost_totals["input_tokens"] == expected_in
+        assert graph._cost_totals["output_tokens"] == expected_out
+        expected_cost = CostTracker.estimate_cost(
+            expected_in, expected_out, "fake-model"
+        )
+        assert graph._cost_totals["cost_usd"] == pytest.approx(expected_cost)
+
+        final = graph.get_state(config).values
+        assert final["total_tokens"] == expected_in + expected_out
+        assert final["total_cost_usd"] == pytest.approx(expected_cost)
+        assert CostTracker().session_total("sess-usage-1") == pytest.approx(expected_cost)
+
+
+class TestContextSummarizedEventGuard:
+    """F6: the "context summarized" event fires only on ACTUAL compaction."""
+
+    def _build(self, client, session_id="sess-ev-1"):
+        from clearwing.agent.graph import build_react_graph
+
+        return build_react_graph(
+            llm_with_tools=client,
+            tools=[],
+            system_prompt_fn=lambda state: "sys",
+            model_name="fake-model",
+            session_id=session_id,
+            enable_knowledge_graph=False,
+            enable_audit=False,
+            enable_episodic_memory=False,
+            enable_cost_tracker=False,
+            enable_event_bus=True,
+            enable_context_summarizer=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_event_when_view_unchanged(self):
+        """should_summarize fires but nothing is newly coverable → silence.
+
+        The old code announced "context summarized" whenever the summarize
+        call ran, even when the returned view was byte-identical —
+        misleading operators and spamming the transcript every step past
+        the threshold.
+        """
+        from clearwing.core.events import EventBus, EventType
+
+        messages_seen: list[dict] = []
+
+        def handler(data):
+            if isinstance(data, dict) and "context summarized" in str(data.get("content", "")):
+                messages_seen.append(data)
+
+        bus = EventBus()
+        bus.subscribe(EventType.MESSAGE, handler)
+        try:
+            client = _FakeNativeClient([_FakeResponse(text="done", usage=_FakeUsage(1, 1, 2))])
+            graph = self._build(client)
+            config = {"configurable": {"thread_id": "t1"}}
+
+            # Force the summarize path with an unchanged (equal-length) view.
+            async def _unchanged_summary(msgs, llm, **kwargs):
+                return {
+                    "text": "prior summary",
+                    "covered_count": 3,
+                    "view": list(msgs),  # nothing removed
+                    "usage": None,
+                }
+
+            graph.context_summarizer.summarize = _unchanged_summary
+            graph.context_summarizer.should_summarize = lambda msgs, max_tokens=None: True
+
+            async for _ in graph.astream(
+                {"messages": [{"role": "user", "content": "hi"}]}, config
+            ):
+                pass
+        finally:
+            bus.unsubscribe(EventType.MESSAGE, handler)
+
+        assert messages_seen == []
+        # The summary state itself still updates (coverage bookkeeping) —
+        # only the announcement is suppressed.
+        final = graph.get_state(config).values
+        assert final["context_summary"]["covered_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_event_fires_on_actual_compaction(self):
+        from clearwing.core.events import EventBus, EventType
+
+        messages_seen: list[dict] = []
+
+        def handler(data):
+            if isinstance(data, dict) and "context summarized" in str(data.get("content", "")):
+                messages_seen.append(data)
+
+        bus = EventBus()
+        bus.subscribe(EventType.MESSAGE, handler)
+        try:
+            client = _SummarizingFakeClient([_FakeResponse(text="done", usage=_FakeUsage(1, 1, 2))])
+            graph = self._build(client, "sess-ev-2")
+            config = {"configurable": {"thread_id": "t1"}}
+
+            async def _compacting_summary(msgs, llm, **kwargs):
+                return {
+                    "text": "summary",
+                    "covered_count": 1,
+                    "view": list(msgs)[1:],  # one message actually removed
+                    "usage": None,
+                }
+
+            graph.context_summarizer.summarize = _compacting_summary
+            graph.context_summarizer.should_summarize = lambda msgs, max_tokens=None: True
+
+            async for _ in graph.astream(
+                {"messages": [{"role": "user", "content": "hi"}]}, config
+            ):
+                pass
+        finally:
+            bus.unsubscribe(EventType.MESSAGE, handler)
+
+        assert len(messages_seen) == 1
+        assert "history compacted" in messages_seen[0]["content"]
+
+
+class TestMergeInputProtectsContextSummary:
+    """F8: input frames must not overwrite the runtime-owned summary state.
+
+    A replayed start frame carrying ``context_summary`` would make the
+    runtime believe already-dropped history is still covered, silently
+    losing context on the next compaction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_input_context_summary_is_ignored(self):
+        from clearwing.agent.graph import build_react_graph
+
+        client = _FakeNativeClient(
+            [
+                _FakeResponse(text="done", usage=_FakeUsage(1, 1, 2)),
+                _FakeResponse(text="done again", usage=_FakeUsage(1, 1, 2)),
+            ]
+        )
+        graph = build_react_graph(
+            llm_with_tools=client,
+            tools=[],
+            system_prompt_fn=lambda state: "sys",
+            model_name="fake-model",
+            session_id="sess-merge-1",
+            enable_knowledge_graph=False,
+            enable_audit=False,
+            enable_episodic_memory=False,
+            enable_event_bus=False,
+            enable_context_summarizer=False,
+        )
+        config = {"configurable": {"thread_id": "t1"}}
+        async for _ in graph.astream({"messages": [{"role": "user", "content": "go"}]}, config):
+            pass
+
+        # Runtime-owned compaction state (as issue #38 commits it).
+        state = graph.get_state(config).values
+        state["context_summary"] = {"text": "real summary", "covered_count": 7}
+
+        async for _ in graph.astream(
+            {
+                "messages": [{"role": "user", "content": "again"}],
+                "context_summary": {"text": "forged", "covered_count": 99},
+            },
+            config,
+        ):
+            pass
+
+        final = graph.get_state(config).values
+        assert final["context_summary"] == {"text": "real summary", "covered_count": 7}
+
+
 class TestPerGraphCostTotals:
     """Issue #37: state cost/token totals must be per-graph-instance.
 

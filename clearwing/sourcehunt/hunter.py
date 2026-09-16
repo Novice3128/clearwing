@@ -1755,9 +1755,37 @@ class NativeHunter:
                         "text": result["text"],
                         "covered_count": result["covered_count"],
                     }
+                    # The summary call is real spend: add its usage to the
+                    # hunt totals and the attributed CostTracker record —
+                    # same attribution id as the main calls below.
+                    summary_usage = result.get("usage")
+                    if summary_usage and (
+                        summary_usage.get("input_tokens") or summary_usage.get("output_tokens")
+                    ):
+                        s_in = int(summary_usage.get("input_tokens") or 0)
+                        s_out = int(summary_usage.get("output_tokens") or 0)
+                        s_cached = int(summary_usage.get("cached_tokens") or 0)
+                        total_cost_usd += _estimate_cost_usd(
+                            s_in, s_out, self.llm.model_name, s_cached
+                        )
+                        CostTracker().record_llm_call(
+                            s_in,
+                            s_out,
+                            self.llm.model_name,
+                            cached_tokens=s_cached,
+                            provider=getattr(self.llm, "provider_name", None),
+                            session_id=current_session_id() or self.ctx.session_id,
+                        )
                     visible_read_ranges.clear()
                     overlapping_refreshes.clear()
-                    logger.info("Hunter context summarized: %d → %d messages", pre, len(messages))
+                    if len(messages) < pre:
+                        # Announce only ACTUAL compaction: an unchanged view
+                        # (nothing newly coverable) is not a summary event.
+                        logger.info(
+                            "Hunter context summarized: %d → %d messages",
+                            pre,
+                            len(messages),
+                        )
                 summary_note = None
                 if self.summarizer and self.context_summary and self.context_summary.get("text"):
                     summary_note = self.summarizer.summary_note(

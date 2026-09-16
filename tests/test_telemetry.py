@@ -1,5 +1,7 @@
 """Tests for the CostTracker telemetry module."""
 
+import pytest
+
 from clearwing.core.events import EventBus, EventType
 from clearwing.observability.telemetry import CostSummary, CostTracker, ToolUsage
 
@@ -131,6 +133,29 @@ class TestCostTracker:
         assert t.total_cost_usd == 0.0
         assert t.tool_calls == 0
         assert t.by_tool == {}
+        assert t.session_total("sess-a") == 0.0
+
+    def test_session_totals_accumulate_per_session(self):
+        """Operator cost-limit follow-up to #41: per-session accumulation.
+
+        The global totals pool every session in the process; the per-session
+        totals let an operator job's limit check see ITS spend (inner graph
+        calls + attributed hunts) without cross-session pollution.
+        """
+        t = CostTracker()
+        t.record_llm_call(1000, 500, "claude-sonnet-4-6", session_id="job-a")
+        t.record_llm_call(1000, 500, "claude-sonnet-4-6", session_id="job-a")
+        t.record_llm_call(1000, 0, "claude-sonnet-4-6", session_id="job-b")
+        # Unattributed calls stay out of every session bucket...
+        t.record_llm_call(1000, 0, "claude-sonnet-4-6")
+
+        assert t.session_total("job-a") == pytest.approx(2 * 0.0105)
+        assert t.session_total("job-b") == pytest.approx(0.003)
+        assert t.session_total("job-c") == 0.0
+        assert t.session_total(None) == 0.0
+        assert t.session_total("") == 0.0
+        # ...while the global total keeps pooling everything.
+        assert t.total_cost_usd == pytest.approx(2 * 0.0105 + 0.003 + 0.003)
 
     def test_record_llm_call_emits_cost_update_with_elapsed_and_provider(self):
         """New keyword args ride along in the COST_UPDATE payload."""

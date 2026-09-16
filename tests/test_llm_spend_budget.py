@@ -842,3 +842,76 @@ def test_definitely_unbilled_retry_releases_each_attempt(tmp_path, monkeypatch):
         "succeeded",
     ]
     assert ledger.spent_usd == pytest.approx(1.0)
+
+
+def test_settle_failure_closes_reservation_not_dangles(tmp_path, monkeypatch):
+    """A settlement crash must not strand an ACTIVE reservation.
+
+    A malformed response (usage=None) blows up ``_settle_spend_call`` with
+    AttributeError; before the guard the exception left the reservation
+    booked forever — enforcing runs under-reported their remaining budget
+    by its amount. The fallback closes it as an ambiguous failure (the
+    generation may have been billed) and re-raises.
+    """
+    ledger = _ledger(tmp_path, budget=10.0)
+    client = AsyncLLMClient(
+        model_name="private-priced-model",
+        provider_name="anthropic",
+        api_key="test",
+    ).with_spend_ledger(ledger, stage="hunt")
+
+    # A "successful" dispatch whose response carries no usage — settle
+    # dereferences usage.prompt_tokens_details and raises AttributeError.
+    _flaky_retry_client(monkeypatch, [SimpleNamespace(usage=None)])
+
+    with pytest.raises(AttributeError):
+        asyncio.run(
+            client.achat(messages=[ChatMessage("user", "x")], max_tokens=4)
+        )
+
+    snapshot = ledger.snapshot()
+    assert snapshot["reserved_usd"] == 0.0  # no dangling reservation
+    events = [
+        json.loads(line)
+        for line in ledger.ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    closures = [event for event in events if event["event"] == "call_settled"]
+    assert [event["status"] for event in closures] == ["ambiguous_failure"]
+    assert closures[0]["error"] == "AttributeError"
+    # Enforcing ledger: the ambiguous attempt is charged its reservation.
+    assert ledger.spent_usd == pytest.approx(4.0)
+
+
+def test_settle_failure_in_attempt_with_reservation_closes_it(tmp_path):
+    """Same guard on the one-shot retry path (reasoning/stream fallback)."""
+    ledger = _ledger(tmp_path, budget=10.0)
+    client = AsyncLLMClient(
+        model_name="private-priced-model",
+        provider_name="anthropic",
+        api_key="test",
+    ).with_spend_ledger(ledger, stage="hunt")
+
+    async def op():
+        return SimpleNamespace(usage=None)  # settle will raise
+
+    reservations = []
+
+    def reserve():
+        reservation = client._reserve_spend_call(
+            messages=[ChatMessage("user", "x")], system="", tools=None, max_tokens=4
+        )
+        reservations.append(reservation)
+        return reservation
+
+    with pytest.raises(AttributeError):
+        asyncio.run(client._attempt_with_reservation(op, reserve))
+
+    assert reservations[0].active is False
+    assert ledger.snapshot()["reserved_usd"] == 0.0
+    events = [
+        json.loads(line)
+        for line in ledger.ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    closures = [event for event in events if event["event"] == "call_settled"]
+    assert [event["status"] for event in closures] == ["ambiguous_failure"]
+    assert ledger.spent_usd == pytest.approx(4.0)

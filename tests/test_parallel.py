@@ -193,6 +193,31 @@ class TestParallelCliTargetExpansion:
 
         assert _expand_cidr_target("10.0.0.0/8") == []
 
+    def test_huge_blocks_rejected_fast_without_materializing(self):
+        """The cap check must short-circuit BEFORE iterating hosts().
+
+        10.0.0.0/8 materialized 16M strings (~26s / 1.2GB) and 0.0.0.0/0
+        would OOM before the old length check could reject. num_addresses
+        is O(1), so both must be refused in well under a second.
+        """
+        import time
+
+        from clearwing.ui.commands.parallel import _expand_cidr_target
+
+        for block in ("10.0.0.0/8", "0.0.0.0/0", "2000::/3"):
+            start = time.monotonic()
+            assert _expand_cidr_target(block) == []
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0, f"{block} took {elapsed:.2f}s to reject"
+
+    def test_boundary_block_at_cap_still_expands(self):
+        # /27 = 30 usable hosts — at the cap, allowed.
+        from clearwing.ui.commands.parallel import _expand_cidr_target
+
+        expanded = _expand_cidr_target("192.168.1.0/27")
+        assert len(expanded) == 30
+        assert expanded[0] == "192.168.1.1"
+
     def test_handle_expands_and_rejects_oversized(self, monkeypatch):
         from types import SimpleNamespace
 

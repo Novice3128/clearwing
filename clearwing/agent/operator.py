@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from clearwing.agent.graph import _create_llm, create_agent
 from clearwing.agent.runtime import Command
 from clearwing.agent.tooling import session_scope
+from clearwing.observability.telemetry import CostTracker
 from clearwing.providers import ProviderManager
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,9 @@ class OperatorAgent:
         self._turns = 0
         self._progress: list[str] = []
         self._escalated = False
+        # Job session id (set in _arun_impl): keys the per-session cost
+        # totals the limit check and result cost field read.
+        self._session_id = ""
 
     def run(self) -> OperatorResult:
         """Run the operator loop to completion (sync wrapper over :meth:`arun`)."""
@@ -139,6 +143,7 @@ class OperatorAgent:
             return await self._arun_impl(session_id, start)
 
     async def _arun_impl(self, session_id: str, start: float) -> OperatorResult:
+        self._session_id = session_id
         # Create inner agent
         graph = create_agent(
             model_name=self.config.model,
@@ -196,9 +201,12 @@ class OperatorAgent:
 
                 # Check cost limit
                 if self.config.cost_limit > 0:
-                    state = graph.get_state(config)
-                    sv = state.values if hasattr(state, "values") else {}
-                    if sv.get("total_cost_usd", 0) >= self.config.cost_limit:
+                    # Session-scoped total (graph's own calls + hunts
+                    # attributed to this job, issue #41): the graph's state
+                    # total only covers the inner agent's achat_stream
+                    # responses, so a limit read from state never saw hunt
+                    # spend — often the pipeline's largest share.
+                    if CostTracker().session_total(session_id) >= self.config.cost_limit:
                         return self._build_result(
                             graph,
                             config,
@@ -417,7 +425,15 @@ class OperatorAgent:
                 if e.get("success")
             ],
             flags_found=sv.get("flags_found", []),
-            cost_usd=sv.get("total_cost_usd", 0.0),
+            # Session-scoped spend (graph's own calls + attributed hunts,
+            # issue #41): the state total covers only the inner agent's
+            # calls, hiding the (usually dominant) hunt spend from the
+            # job's result. max() keeps graphs built with the cost tracker
+            # disabled (state-only accounting) reporting their own spend.
+            cost_usd=max(
+                CostTracker().session_total(self._session_id),
+                sv.get("total_cost_usd", 0.0),
+            ),
             tokens_used=sv.get("total_tokens", 0),
             duration_seconds=round(time.time() - start, 2),
             escalation_question=escalation_question,

@@ -22,6 +22,12 @@ def _expand_cidr_target(raw: str) -> list[str] | None:
         network = ipaddress.ip_network(raw, strict=False)
     except ValueError:
         return None
+    # Cap check BEFORE iterating hosts(): /8 materializes 16M entries
+    # (~26s / 1.2GB) and /0 OOMs before the old length check could reject.
+    # num_addresses is O(1); usable hosts are num_addresses - 2 (network +
+    # broadcast), tiny nets fewer — the bound is conservative either way.
+    if network.num_addresses - 2 > _CIDR_EXPAND_CAP:
+        return []
     hosts = [str(ip) for ip in network.hosts()]
     if len(hosts) > _CIDR_EXPAND_CAP:
         return []

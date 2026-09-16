@@ -545,6 +545,7 @@ class NativeAgentGraph:
                     # text/coverage persist, so the next step lands under
                     # the threshold again instead of re-running (and
                     # re-billing) a fresh LLM summary on every step.
+                    pre_compaction = len(messages)
                     result = await self.context_summarizer.summarize(
                         messages,
                         self.llm,
@@ -558,7 +559,45 @@ class NativeAgentGraph:
                         "text": result["text"],
                         "covered_count": result["covered_count"],
                     }
-                    if self.event_bus:
+                    # The summary LLM call is real spend: book its usage
+                    # like a main-loop call (tracker + instance totals +
+                    # state) so cost limits and result totals see it — the
+                    # usage used to ride on a discarded response object.
+                    summary_usage = result.get("usage")
+                    if summary_usage and (
+                        summary_usage.get("input_tokens") or summary_usage.get("output_tokens")
+                    ):
+                        s_input = int(summary_usage.get("input_tokens") or 0)
+                        s_output = int(summary_usage.get("output_tokens") or 0)
+                        s_cached = int(summary_usage.get("cached_tokens") or 0)
+                        summary_cost = 0.0
+                        if self.cost_tracker:
+                            summary_cost = self.cost_tracker.record_llm_call(
+                                s_input,
+                                s_output,
+                                # Same pricing attribution as the main loop:
+                                # the client's resolved model, else the
+                                # graph's label.
+                                getattr(self.llm, "model_name", None)
+                                or self.model_name,
+                                cached_tokens=s_cached,
+                                provider=getattr(self.llm, "provider_name", None),
+                                session_id=self.session_id,
+                            )
+                        self._cost_totals["cost_usd"] += summary_cost
+                        self._cost_totals["input_tokens"] += s_input
+                        self._cost_totals["output_tokens"] += s_output
+                        state["total_cost_usd"] = self._cost_totals["cost_usd"]
+                        state["total_tokens"] = (
+                            self._cost_totals["input_tokens"]
+                            + self._cost_totals["output_tokens"]
+                        )
+                    if self.event_bus and len(result["view"]) < pre_compaction:
+                        # Only announce ACTUAL compaction: when nothing was
+                        # newly coverable the view is unchanged and a
+                        # "context summarized" event would mislead operators
+                        # (and spam the transcript on every step past the
+                        # threshold).
                         self.event_bus.emit_message(
                             (
                                 f"context summarized: history compacted "
@@ -934,6 +973,13 @@ class NativeAgentGraph:
         for key, value in input_data.items():
             if key == "messages":
                 state.setdefault("messages", []).extend(value)
+            elif key == "context_summary":
+                # Runtime-owned key: this is the committed compaction state
+                # (issue #38). An input frame carrying it — e.g. a replayed
+                # start frame — would overwrite the live summary state and
+                # make the runtime believe already-dropped history is still
+                # covered, silently losing context. Input may not set it.
+                continue
             else:
                 state[key] = value
 

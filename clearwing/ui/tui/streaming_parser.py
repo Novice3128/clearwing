@@ -2,21 +2,13 @@
 
 from __future__ import annotations
 
-import re
-
+from clearwing.agent.runtime import FLAG_PATTERNS
 from clearwing.core.events import EventBus
 
-# Flag detection patterns
-FLAG_PATTERNS = [
-    re.compile(r"flag\{[^}]+\}", re.IGNORECASE),
-    re.compile(r"FLAG\{[^}]+\}"),
-    re.compile(r"HTB\{[^}]+\}"),
-    re.compile(r"CTF\{[^}]+\}"),
-    # Hex-boundary lookaround (issue #35): never match a window inside a
-    # longer hex run (e.g. a 64-hex container id); standalone MD5-style
-    # hashes still match. Aligned with runtime.FLAG_PATTERNS.
-    re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32}(?![A-Fa-f0-9])"),
-]
+# Flag detection patterns: shared verbatim with the agent runtime
+# (clearwing/agent/runtime.py) — the 32-hex lookaround especially must not
+# drift between streamed output scanning and tool-result scanning (issue
+# #35). No import cycle: agent.runtime never imports clearwing.ui.
 
 
 class StreamingParser:

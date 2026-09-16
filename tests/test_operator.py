@@ -726,3 +726,123 @@ class TestOperatorCostIsolation:
         ).run()
         assert r2.status == "completed"
         assert r2.turns == 2
+
+    @staticmethod
+    def _hunt_spending_graph(captured, usages, hunt_tokens):
+        """Real graph whose client also books hunt-style spend per call.
+
+        The first achat_stream books an extra CostTracker call attributed to
+        the job's session id — exactly what a sourcehunt hunt spawned inside
+        the job does (issue #41 ambient attribution) — so tests can assert
+        the operator's limit/result see hunt spend.
+        """
+
+        def factory(**kwargs):
+            from clearwing.agent.graph import build_react_graph
+            from clearwing.observability.telemetry import CostTracker
+
+            session_id = kwargs.get("session_id")
+            captured["session_id"] = session_id
+
+            class _Resp:
+                def __init__(self, prompt, completion):
+                    self.first_text = "working"
+                    self.texts = ["working"]
+                    self.tool_calls = []
+                    self.provider_model_name = "fake-model"
+                    self.reasoning_content = None
+
+                    class _Usage:
+                        prompt_tokens = prompt
+                        completion_tokens = completion
+                        total_tokens = prompt + completion
+
+                    self.usage = _Usage()
+
+            class _Client:
+                model_name = "fake-model"
+
+                def __init__(self):
+                    self._responses = [_Resp(p, c) for p, c in usages]
+
+                async def achat_stream(self, **kwargs_):
+                    if captured.get("hunts_fired") is None and session_id:
+                        captured["hunts_fired"] = True
+                        CostTracker().record_llm_call(
+                            hunt_tokens,
+                            0,
+                            "claude-sonnet-4-6",
+                            session_id=session_id,
+                        )
+                    return self._responses.pop(0)
+
+            return build_react_graph(
+                llm_with_tools=_Client(),
+                tools=[],
+                system_prompt_fn=lambda state: "sys",
+                model_name="fake-model",
+                session_id=session_id,
+                enable_knowledge_graph=False,
+                enable_audit=False,
+                enable_episodic_memory=False,
+                enable_event_bus=False,
+                enable_context_summarizer=False,
+            )
+
+        return factory
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_cost_limit_counts_hunt_spend(self, mock_create, mock_create_llm, mock_decide):
+        """A job's cost_limit must fire on hunt spend attributed to the job.
+
+        The limit used to read the graph's state total, which only covers
+        the inner agent's own calls — hunts (usually the pipeline's largest
+        share) were invisible, so a limited job ran them unbounded.
+        """
+        mock_create_llm.return_value = MagicMock()
+        # Turn 1 books the hunt spend; the loop's SECOND limit check (before
+        # turn 2) must trip on it.
+        mock_decide.side_effect = ["continue", "GOALS_COMPLETE"]
+
+        captured: dict = {}
+        # Inner agent call: (100 in, 20 out) at Sonnet fallback = $0.0006.
+        # Hunt: 1M input tokens at $3/M = $3.0, recorded under the job's
+        # session id during turn 1. NB side_effect IS the factory (not its
+        # result) so it receives create_agent's real kwargs — the job's
+        # session id.
+        mock_create.side_effect = self._hunt_spending_graph(
+            captured, [(100, 20)], 1_000_000
+        )
+
+        result = OperatorAgent(
+            OperatorConfig(goals=["g"], target="10.0.0.1", cost_limit=1.0)
+        ).run()
+
+        assert result.status == "cost_limit"
+        # The limit tripped only because the hunt's $3.0 counted.
+        assert result.cost_usd == pytest.approx(3.0 + 0.0006)
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_result_cost_includes_hunt_spend(self, mock_create, mock_create_llm, mock_decide):
+        mock_create_llm.return_value = MagicMock()
+        mock_decide.return_value = "GOALS_COMPLETE"
+
+        captured: dict = {}
+        mock_create.side_effect = self._hunt_spending_graph(captured, [(100, 20)], 200_000)
+
+        result = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+
+        assert result.status == "completed"
+        # $0.0006 (inner call) + 200k * $3/M = $0.6 (hunt) — the result
+        # field reports the job's whole spend, not just the graph's.
+        assert result.cost_usd == pytest.approx(0.0006 + 0.6)
