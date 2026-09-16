@@ -20,6 +20,7 @@ import pytest
 
 from clearwing.agent.runtime import NativeAgentGraph
 from clearwing.agent.tooling import tool
+from clearwing.observability.telemetry import CostTracker
 
 
 @tool(name="echo_tool")
@@ -104,9 +105,15 @@ class TestEffectiveModelAttribution:
         await graph._aassistant_step(state)
 
         cost.record_llm_call.assert_called_once_with(
-            100, 50, "glm-5.3", provider="zai"
+            100, 50, "glm-5.3", cached_tokens=0, provider="zai", session_id=None
         )
-        assert audit.log_llm_call.call_args.kwargs["model"] == "glm-5.3"
+        # Audit rows carry the PER-CALL cost returned by the tracker —
+        # not its process-wide running total (issue #10 live evidence).
+        assert (
+            audit.log_llm_call.call_args.kwargs["cost_usd"]
+            is cost.record_llm_call.return_value
+        )
+        assert audit.log_llm_call.call_args.kwargs["cached_tokens"] == 0
         assert state["messages"][-1].response_metadata["model"] == "glm-5.3"
 
     @pytest.mark.asyncio
@@ -170,7 +177,12 @@ class TestEpisodeAttribution:
 
 class TestPricingKeyNormalization:
     """Codex r2 P1: a versioned served name must not silently fall back to
-    Sonnet rates when the configured model has a real pricing entry."""
+    Sonnet rates when the configured model has a real pricing entry.
+
+    Since prefix-aware pricing resolution landed (issue #10/#36), the
+    versioned echo resolves to its tier at the pricing layer itself, so the
+    served name passes through as the pricing key and still bills at the
+    configured tier."""
 
     @pytest.mark.asyncio
     async def test_versioned_served_name_prices_with_configured(self):
@@ -182,9 +194,14 @@ class TestPricingKeyNormalization:
         state = graph._get_or_create_state("pricing-1")
         await graph._aassistant_step(state)
 
-        # Pricing uses the priced configured name; metadata and audit keep
-        # the truthful served name.
-        assert cost.record_llm_call.call_args.args[2] == "claude-opus-4-7"
+        # The versioned served name is now itself resolvable (prefix match),
+        # so it flows through as the pricing key...
+        assert cost.record_llm_call.call_args.args[2] == "claude-opus-4-7-20260901"
+        # ...and bills at exactly the configured tier's rates.
+        assert CostTracker.estimate_cost(100, 50, "claude-opus-4-7-20260901") == (
+            CostTracker.estimate_cost(100, 50, "claude-opus-4-7")
+        )
+        # Metadata and audit keep the truthful served name.
         assert state["messages"][-1].response_metadata["model"] == (
             "claude-opus-4-7-20260901"
         )

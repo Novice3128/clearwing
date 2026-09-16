@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 
 from clearwing.core.events import EventBus, EventType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,6 +60,10 @@ class CostTracker:
         # Fireworks "Standard" serving path. cached_input applies to the subset
         # of input tokens served from the provider's prompt cache.
         "glm-5.2": {"input": 1.40, "cached_input": 0.14, "output": 4.40},
+        # z.ai GLM-5.3 via the OpenAI-compatible endpoint. Rates cross-checked
+        # against actual v2-round billing (2026-09-16, issue #10 live
+        # evidence: product fallback pricing overstated spend ~2.17x).
+        "glm-5.3": {"input": 1.40, "cached_input": 0.14, "output": 4.40},
         "UnCut": {"input": 1.40, "cached_input": 0.14, "output": 4.40},
         "gpt-5.4": {"input": 2.50, "output": 15.0},
         "gpt-5.4-mini": {"input": 0.75, "output": 4.50},
@@ -64,10 +71,53 @@ class CostTracker:
 
     _DEFAULT_MODEL = "claude-sonnet-4-6"
 
+    # Unknown models that have already triggered the fallback warning.
+    _warned_pricing_models: set[str] = set()
+
+    @classmethod
+    def _resolve_pricing(cls, model: str | None) -> dict[str, float] | None:
+        """Pricing row for *model*, or None.
+
+        Case-insensitive: exact key first, then basename (``org/model``
+        endpoint-style names), then ``key + "-"`` prefix with the longest
+        key winning — providers echo versioned model names (e.g.
+        ``claude-sonnet-4-6-20260901``) and mixed-case gateway aliases
+        (``UnCut``) that would otherwise silently bill at the default tier.
+        """
+        if not isinstance(model, str) or not model.strip():
+            return None
+        name = model.strip().lower()
+        base = name.rsplit("/", 1)[-1]
+        best: tuple[int, dict[str, float]] | None = None
+        for key, row in cls.PRICING.items():
+            lowered = key.lower()
+            if lowered == base:
+                return row
+            if base.startswith(lowered + "-"):
+                if best is None or len(lowered) > best[0]:
+                    best = (len(lowered), row)
+        return best[1] if best else None
+
+    @classmethod
+    def _warn_pricing_fallback(cls, model: str | None) -> None:
+        if not isinstance(model, str):
+            return
+        key = model.strip().lower()
+        if not key or key in cls._warned_pricing_models:
+            return
+        cls._warned_pricing_models.add(key)
+        logger.warning(
+            "No PRICING entry for model %r; estimating at the %s reference "
+            "tier — reported totals will misstate this model's spend until "
+            "an entry is added",
+            model,
+            cls._DEFAULT_MODEL,
+        )
+
     @classmethod
     def has_pricing(cls, model: str | None) -> bool:
-        """True when *model* has an explicit pricing entry (no fallback)."""
-        return bool(model) and model in cls.PRICING
+        """True when *model* resolves to an explicit pricing entry (no fallback)."""
+        return cls._resolve_pricing(model) is not None
 
     @classmethod
     def estimate_cost(
@@ -80,10 +130,15 @@ class CostTracker:
         """USD cost for one call. Prices are per 1M tokens.
 
         ``cached_tokens`` (a subset of ``input_tokens``) bills at the model's
-        ``cached_input`` rate when defined, else at the full input rate. Unknown
-        models fall back to the default (Sonnet) pricing.
+        ``cached_input`` rate when defined, else at the full input rate.
+        Versioned echoes of known models (prefix match) bill at their tier;
+        unknown models fall back to the default (Sonnet) pricing with a
+        one-time-per-model warning.
         """
-        pricing = cls.PRICING.get(model, cls.PRICING[cls._DEFAULT_MODEL])
+        pricing = cls._resolve_pricing(model)
+        if pricing is None:
+            cls._warn_pricing_fallback(model)
+            pricing = cls.PRICING[cls._DEFAULT_MODEL]
         cached_rate = pricing.get("cached_input", pricing["input"])
         uncached = max(input_tokens - cached_tokens, 0)
         return (
@@ -123,6 +178,7 @@ class CostTracker:
         *,
         elapsed_ms: float | None = None,
         provider: str | None = None,
+        session_id: str | None = None,
     ) -> float:
         """Record token usage for a single LLM call and update the running cost.
 
@@ -131,11 +187,11 @@ class CostTracker:
         When an ``EventBus`` is available a ``COST_UPDATE`` event is emitted
         after updating counters.
 
-        ``elapsed_ms`` (wall-clock latency of the call) and ``provider`` are
-        optional; when supplied they ride along in the ``COST_UPDATE`` payload
-        for UI and metrics consumers. OTel spans are emitted directly at the
-        LLM boundary. Keyword-only to keep call sites explicit and future
-        additions non-breaking.
+        ``elapsed_ms`` (wall-clock latency of the call), ``provider`` and
+        ``session_id`` are optional; when supplied they ride along in the
+        ``COST_UPDATE`` payload for UI and metrics consumers — ``session_id``
+        lets scoped consumers attribute the call to a session. Keyword-only
+        to keep call sites explicit and future additions non-breaking.
         """
         cost = self.estimate_cost(input_tokens, output_tokens, model, cached_tokens)
 
@@ -155,6 +211,7 @@ class CostTracker:
                     "total_cost_usd": self.total_cost_usd,
                     "model": model,
                     "provider": provider or "unknown",
+                    "session_id": session_id,
                     "elapsed_ms": elapsed_ms or 0,
                 },
             )

@@ -72,7 +72,9 @@ class InferenceProfile:
     max_output_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
-    # Staged (schema + validation only for now; not yet on the wire):
+    # Consumed locally by the runtime, not sent as an API param: the value
+    # rides on the client as `context_budget_tokens` and drives the
+    # ContextSummarizer's hot-window threshold (runtime._aassistant_step).
     context_budget_tokens: int | None = None
     tool_choice: str | None = None
     parallel_tool_calls: bool | None = None

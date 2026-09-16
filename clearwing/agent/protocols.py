@@ -40,6 +40,9 @@ class LLMInvokable(Protocol):
         system: str | None = ...,
         tools: list[NativeToolSpec] | None = ...,
         on_text_delta: Any | None = ...,
+        cache_prefix: bool = ...,
+        prompt_cache_key: str | None = ...,
+        context_note: str | None = ...,
     ) -> ChatResponse: ...
 
 
