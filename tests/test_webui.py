@@ -984,44 +984,6 @@ class _InstantGraph:
         yield {"messages": [SimpleNamespace(type="ai", content="done", text="done")]}
 
 
-class TestLlmProgressEdgeCases:
-    def test_approve_turn_also_heartbeats(self, client, monkeypatch):
-        import json
-
-        monkeypatch.setattr("clearwing.ui.web.app._LLM_PROGRESS_INTERVAL_SECONDS", 0.05)
-        with patch("clearwing.ui.web.app.create_agent", _SlowApproveGraph):
-            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
-                ws.send_json({"type": "start", "target": "10.0.0.9"})
-                ws.send_json({"type": "approve", "approved": True})
-                types = []
-                while True:
-                    msg = json.loads(ws.receive_text())
-                    types.append(msg["type"])
-                    if msg["type"] == "complete":
-                        break
-        assert "llm_progress" in types
-        assert types[-1] == "complete"
-
-    def test_fast_turn_emits_no_heartbeat(self, client, monkeypatch):
-        # The t=0 rule: the busy-rejection frame must stay the first frame
-        # a racing second message sees, so the heartbeat never fires for a
-        # turn that finishes within one interval.
-        import json
-
-        monkeypatch.setattr("clearwing.ui.web.app._LLM_PROGRESS_INTERVAL_SECONDS", 0.5)
-        with patch("clearwing.ui.web.app.create_agent", _InstantGraph):
-            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
-                ws.send_json({"type": "start", "target": "10.0.0.9"})
-                ws.send_json({"type": "message", "content": "quick"})
-                types = []
-                while True:
-                    msg = json.loads(ws.receive_text())
-                    types.append(msg["type"])
-                    if msg["type"] == "complete":
-                        break
-        assert "llm_progress" not in types
-
-
 class _AmbientSessionProbeGraph:
     """Stands in for create_agent(): records the ambient session id its
     astream runs under (the context the agent's tool calls inherit)."""
@@ -1062,3 +1024,41 @@ class TestAmbientSessionAttribution:
 
         assert session_id
         assert _AmbientSessionProbeGraph.seen == session_id
+
+
+class TestLlmProgressEdgeCases:
+    def test_approve_turn_also_heartbeats(self, client, monkeypatch):
+        import json
+
+        monkeypatch.setattr("clearwing.ui.web.app._LLM_PROGRESS_INTERVAL_SECONDS", 0.05)
+        with patch("clearwing.ui.web.app.create_agent", _SlowApproveGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "approve", "approved": True})
+                types = []
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    types.append(msg["type"])
+                    if msg["type"] == "complete":
+                        break
+        assert "llm_progress" in types
+        assert types[-1] == "complete"
+
+    def test_fast_turn_emits_no_heartbeat(self, client, monkeypatch):
+        # The t=0 rule: the busy-rejection frame must stay the first frame
+        # a racing second message sees, so the heartbeat never fires for a
+        # turn that finishes within one interval.
+        import json
+
+        monkeypatch.setattr("clearwing.ui.web.app._LLM_PROGRESS_INTERVAL_SECONDS", 0.5)
+        with patch("clearwing.ui.web.app.create_agent", _InstantGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "quick"})
+                types = []
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    types.append(msg["type"])
+                    if msg["type"] == "complete":
+                        break
+        assert "llm_progress" not in types
