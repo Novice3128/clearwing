@@ -318,3 +318,57 @@ class TestRoundTwoAmbiguityGuards:
             with pytest.raises(RuntimeError, match="Server disconnected"):
                 asyncio.run(client._with_retries(always_disconnected))
         assert calls == 3
+
+
+class TestRoundThreeSymmetry:
+    """Codex PR-40 r3: concrete pre-dispatch proof + symmetric enforcement."""
+
+    def test_generic_send_marker_alone_is_not_proof_of_unbilled(self):
+        # "error sending request" can fire after the upload started; only
+        # concrete establishment failures (refused/dns/tls/handshake) prove
+        # pre-dispatch.
+        exc = _nested_exc(
+            "Web call failed for model test-model",
+            "error sending request",
+        )
+        assert not _client()._is_definitely_unbilled_transport_error(exc)
+
+    def test_concrete_refused_remains_proof(self):
+        exc = _nested_exc(
+            "Web call failed for model test-model",
+            "error sending request: connection refused",
+        )
+        assert _client()._is_definitely_unbilled_transport_error(exc)
+
+    def test_enforcing_ledger_refuses_plain_timeout_retries_too(self):
+        from types import SimpleNamespace
+
+        client = _client(rate_limit_max_retries=6, timeout_max_retries=2)
+        client._spend_ledger = SimpleNamespace(enforcing=True)
+        calls = 0
+
+        async def always_times_out():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("request timed out")
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            asyncio.run(client._with_retries(always_times_out))
+        assert calls == 1
+
+    def test_non_enforcing_keeps_timeout_retries(self):
+        from types import SimpleNamespace
+
+        client = _client(rate_limit_max_retries=6, timeout_max_retries=2)
+        client._spend_ledger = SimpleNamespace(enforcing=False)
+        calls = 0
+
+        async def always_times_out():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("request timed out")
+
+        with patch("clearwing.llm.native.asyncio.sleep", new=_no_sleep):
+            with pytest.raises(RuntimeError, match="timed out"):
+                asyncio.run(client._with_retries(always_times_out))
+        assert calls == 3

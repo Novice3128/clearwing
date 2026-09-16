@@ -1924,18 +1924,19 @@ class AsyncLLMClient:
                             pass
                     raise
                 if (
-                    "server disconnected" in _exception_chain_text(exc)
+                    self._is_timeout_error(exc)
                     and self._spend_ledger is not None
                     and self._spend_ledger.enforcing
                 ):
-                    # Close-after-accept is billed with the same ambiguity
-                    # as a read timeout, but unlike timeouts there is no
-                    # dedicated small cap semantics to lean on when a
-                    # budget is actively enforcing: refuse the resends
-                    # rather than risk unaccounted billable generations
-                    # (Codex PR-40 r2). Non-enforcing callers (the webui
-                    # default) keep the retry — chaos-P1 showed a single
-                    # such disconnect killing the whole task otherwise.
+                    # Billable-ambiguous failures — read timeouts and
+                    # close-after-accept disconnects alike — under an
+                    # actively enforcing spend ledger: the resends share
+                    # one reservation and only one settlement, so refuse
+                    # them rather than risk unaccounted billable
+                    # generations (Codex PR-40 r3, symmetric rule).
+                    # Non-enforcing callers (the webui default) keep the
+                    # retry — chaos-P1 showed a single such disconnect
+                    # killing the whole task otherwise.
                     if attempt > 0:
                         try:
                             exc._clearwing_attempts = attempt  # type: ignore[attr-defined]
@@ -2061,15 +2062,25 @@ class AsyncLLMClient:
         "handshake",
     )
 
+    # Concrete connection-establishment failures alone prove pre-dispatch.
+    # The generic send-phase markers ("error sending request",
+    # "connection error") can fire after the upload started, so they are
+    # not PROOF of an unbilled call on their own (Codex PR-40 r3).
+    _DEFINITELY_PRE_RESPONSE_MARKERS = (
+        "connection refused",
+        "dns error",
+        "tls",
+        "handshake",
+    )
+
     def _is_definitely_unbilled_transport_error(self, exc: Exception) -> bool:
         text = _exception_chain_text(exc)
-        if not any(marker in text for marker in self._PRE_RESPONSE_TRANSPORT_MARKERS):
+        if not any(marker in text for marker in self._DEFINITELY_PRE_RESPONSE_MARKERS):
             return False
-        # reqwest pairs the generic send-phase marker with a timeout in
-        # "error sending request ... timed out": the upload may have
-        # completed, so the combination is NOT provably pre-response
-        # (Codex PR-40 r2 P1) — treat any timeout in the chain as
-        # billable-ambiguous.
+        # A timeout anywhere in the chain cancels the verdict even when a
+        # concrete marker co-occurs: reqwest pairs "connection refused"
+        # style phrasing with timeouts in mixed failures, and the upload
+        # may have completed — billable-ambiguous, not proof.
         return not self._is_timeout_error(exc)
 
     @staticmethod
