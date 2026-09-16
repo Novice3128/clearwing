@@ -166,6 +166,21 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
+def _non_negative_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("Ignoring negative %s=%r; using %d", name, raw, default)
+        return default
+    return value
+
+
 # Bound every provider request. Completed benchmark traces put normal calls
 # well below this limit (18s max in the sampled trace), while still leaving
 # headroom for larger prompts. Operators running unusually slow local models
@@ -174,6 +189,11 @@ _LLM_CONNECT_TIMEOUT_SECONDS: float = 60.0
 _LLM_TIMEOUT_SECONDS = _positive_float_env("CLEARWING_LLM_TIMEOUT_SECONDS", 60.0)
 _LLM_READ_TIMEOUT_SECONDS: float = _LLM_TIMEOUT_SECONDS
 _LLM_TOTAL_TIMEOUT_SECONDS: float = _LLM_TIMEOUT_SECONDS
+# Transport-level timeout retries (issue #4): a single retry left every
+# call a ~4-minute silent stall on flaky links; two gives the backoff a
+# second chance while the webui's llm_progress heartbeat keeps the wait
+# visible. The effective cap stays min(rate_limit_max_retries, this).
+_LLM_TIMEOUT_RETRIES: int = _non_negative_int_env("CLEARWING_LLM_TIMEOUT_RETRIES", 2)
 
 
 class ToolInputModel(BaseModel):
@@ -533,7 +553,7 @@ class AsyncLLMClient:
         max_concurrency: int = 4,
         default_system: str = "You are a helpful assistant.",
         rate_limit_max_retries: int = 6,
-        timeout_max_retries: int = 1,
+        timeout_max_retries: int = _LLM_TIMEOUT_RETRIES,
         rate_limit_initial_backoff_seconds: float = 1.0,
         rate_limit_max_backoff_seconds: float = 60.0,
         reasoning_effort: str | None | Literal["auto"] = "auto",
@@ -1345,6 +1365,15 @@ class AsyncLLMClient:
         except Exception as exc:
             if not self._should_try_openai_http_fallback(exc):
                 raise
+            if self._is_timeout_error(exc) and not self._is_definitely_unbilled_transport_error(exc):
+                # This fallback runs INSIDE the dispatch, i.e. once per retry
+                # attempt: a read timeout means the request was sent and the
+                # provider may already be generating, so rerouting every
+                # retry through a second transport doubles the billed
+                # round-trips. Only reroute timeouts that provably never
+                # left the client. (The one-shot post-retry fallback on the
+                # streaming path is not per-retry and keeps rerouting.)
+                raise
             if (
                 self._spend_ledger is not None
                 and self._spend_ledger.enforcing
@@ -1849,7 +1878,11 @@ class AsyncLLMClient:
         Transport errors (reqwest connection/send failures) never reached a
         response, so retrying them can't double-bill — see
         ``_is_transient_transport_error``. Both share the same backoff schedule
-        and ``rate_limit_max_retries`` cap.
+        and ``rate_limit_max_retries`` cap. On the final raise the exception
+        carries ``_clearwing_attempts`` (retries consumed) so UI layers can
+        tell the user how many attempts were made (issue #4); it is only set
+        when at least one retry happened, and always via try/except so an
+        exotic exception type can't break the raise path.
         """
         attempt = 0
         while True:
@@ -1866,6 +1899,11 @@ class AsyncLLMClient:
                 if (
                     not is_rate_limit and not is_transport
                 ) or attempt >= retry_limit:
+                    if attempt > 0:
+                        try:
+                            exc._clearwing_attempts = attempt  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
                     raise
 
                 delay = self._retry_delay_seconds(exc, attempt)
@@ -1951,6 +1989,10 @@ class AsyncLLMClient:
         "reqwest error",
         "transport error",
         "without a terminal usage event",
+        # aiohttp's close-before-response wording (chaos round P1: the
+        # server accepted then dropped the connection and this was the one
+        # failure class that killed the task with zero retries).
+        "server disconnected",
     )
 
     def _is_transient_transport_error(self, exc: Exception) -> bool:

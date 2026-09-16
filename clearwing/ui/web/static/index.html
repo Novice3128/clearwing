@@ -130,6 +130,7 @@ function setTurnBusy(busy) {
   turnBusy = busy;
   document.getElementById('send-btn').disabled = busy;
   document.getElementById('stop-btn').disabled = !busy;
+  if (!busy) document.getElementById('stop-btn').textContent = 'Stop';
 }
 
 function updateOpsPanel() {
@@ -279,6 +280,13 @@ function startSession() {
         addApproval(prompt);
         break;
       }
+      case 'llm_progress':
+        // Issue #4: keep a slow/flaky LLM call's wait visible instead of a
+        // multi-minute silent stall. The stop button stays enabled, so it
+        // doubles as the waiting indicator.
+        document.getElementById('stop-btn').textContent =
+          `Stop (${data.elapsed_seconds ?? '?'}s)`;
+        break;
       case 'error':
         addMessage(`Error: ${data.message || JSON.stringify(data)}`, 'error');
         break;

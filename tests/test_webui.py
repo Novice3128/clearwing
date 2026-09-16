@@ -885,3 +885,138 @@ class TestCostSessionScoping:
                 assert first_costs[0]["data"]["total_cost_usd"] == pytest.approx(0.01)
                 assert first_costs[2]["data"]["total_cost_usd"] == pytest.approx(0.01)
                 assert first_costs[2]["data"]["total_tokens"] == 1100
+
+
+
+
+class _SlowGraph:
+    """astream takes noticeably longer than the (shortened) heartbeat cadence."""
+
+    def __init__(self, **kwargs):
+        del kwargs
+
+    async def astream(self, input_data, config, stream_mode="values"):
+        import asyncio
+
+        del input_data, config, stream_mode
+        await asyncio.sleep(0.2)
+        yield {"messages": [SimpleNamespace(type="ai", content="done", text="done")]}
+
+
+class _FailingGraph:
+    """astream raises an exception carrying the retry-count attribute."""
+
+    def __init__(self, **kwargs):
+        del kwargs
+
+    async def astream(self, input_data, config, stream_mode="values"):
+        del input_data, config, stream_mode
+        exc = RuntimeError("connection timed out")
+        exc._clearwing_attempts = 3
+        raise exc
+        yield  # pragma: no cover — keeps this an async generator
+
+
+class TestLlmProgressHeartbeat:
+    def test_heartbeat_frames_during_slow_turn(self, client, monkeypatch):
+        import json
+
+        monkeypatch.setattr("clearwing.ui.web.app._LLM_PROGRESS_INTERVAL_SECONDS", 0.05)
+        with patch("clearwing.ui.web.app.create_agent", _SlowGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "slow"})
+                types = []
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    types.append(msg["type"])
+                    if msg["type"] == "complete":
+                        break
+        assert "llm_progress" in types
+        # The heartbeat is cancelled before the terminal frames, so it can
+        # never land after complete.
+        assert types[-1] == "complete"
+
+    def test_error_frame_carries_retry_count(self, client):
+        import json
+
+        with patch("clearwing.ui.web.app.create_agent", _FailingGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "boom"})
+                error = None
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    if msg["type"] == "error":
+                        error = msg
+                    if msg["type"] == "complete":
+                        break
+        assert error is not None
+        assert error["data"]["retries"] == 3
+        assert "gave up after 3 retries" in error["data"]["message"]
+
+
+class _SlowApproveGraph:
+    """get_state for the no-op-resume probe; ainvoke takes longer than the
+    (shortened) heartbeat cadence."""
+
+    def __init__(self, **kwargs):
+        del kwargs
+
+    def get_state(self, config):
+        del config
+        return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+
+    async def ainvoke(self, command, config):
+        import asyncio
+
+        del command, config
+        await asyncio.sleep(0.2)
+        return SimpleNamespace(values={"messages": [SimpleNamespace(type="ai", content="ok")]})
+
+
+class _InstantGraph:
+    def __init__(self, **kwargs):
+        del kwargs
+
+    async def astream(self, input_data, config, stream_mode="values"):
+        del input_data, config, stream_mode
+        yield {"messages": [SimpleNamespace(type="ai", content="done", text="done")]}
+
+
+class TestLlmProgressEdgeCases:
+    def test_approve_turn_also_heartbeats(self, client, monkeypatch):
+        import json
+
+        monkeypatch.setattr("clearwing.ui.web.app._LLM_PROGRESS_INTERVAL_SECONDS", 0.05)
+        with patch("clearwing.ui.web.app.create_agent", _SlowApproveGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "approve", "approved": True})
+                types = []
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    types.append(msg["type"])
+                    if msg["type"] == "complete":
+                        break
+        assert "llm_progress" in types
+        assert types[-1] == "complete"
+
+    def test_fast_turn_emits_no_heartbeat(self, client, monkeypatch):
+        # The t=0 rule: the busy-rejection frame must stay the first frame
+        # a racing second message sees, so the heartbeat never fires for a
+        # turn that finishes within one interval.
+        import json
+
+        monkeypatch.setattr("clearwing.ui.web.app._LLM_PROGRESS_INTERVAL_SECONDS", 0.5)
+        with patch("clearwing.ui.web.app.create_agent", _InstantGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "quick"})
+                types = []
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    types.append(msg["type"])
+                    if msg["type"] == "complete":
+                        break
+        assert "llm_progress" not in types

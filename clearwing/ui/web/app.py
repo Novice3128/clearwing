@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,10 @@ from clearwing.ui.web.session_report import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Cadence of the llm_progress heartbeat frames during a running turn
+# (issue #4). Module-level so tests can shorten it.
+_LLM_PROGRESS_INTERVAL_SECONDS = 10
 
 
 def _last_ai_content(values: dict[str, Any] | None) -> str:
@@ -417,7 +422,13 @@ def create_app():
                        forwarded here; out-of-turn unscoped frames pass
                        through raw)
         - Server sends: {"type": "approval_needed", "prompt": "..."}
-        - Server sends: {"type": "error", "message": "..."}
+        - Server sends: {"type": "llm_progress", "data": {"elapsed_seconds": int}}
+          every ~10s while a turn runs (first at +10s), so slow LLM calls
+          are a visible wait instead of a silent stall
+        - Server sends: {"type": "error", "data": {"message": "...",
+                       "retries": int}} — retries is the transport retry
+                       count consumed before giving up (0/absent on
+                       fast-fail and handler-rejection frames)
         - Server sends: {"type": "stopped", "data": {"cancelled_turn": bool,
                        "discarded_approval": bool}} after a stop frame
         - Server sends: {"type": "complete", "data": {"session_id": "...",
@@ -646,6 +657,42 @@ def create_app():
                 if not await _safe_send(msg):
                     return
 
+        async def _llm_progress_heartbeat() -> None:
+            # Issue #4: a turn against a slow or flaky endpoint used to be a
+            # multi-minute silent stall. First frame at +interval (never at
+            # t=0 — the busy-rejection frame must stay the first frame a
+            # racing second message sees), then on the same cadence; exit
+            # silently once the socket is gone.
+            start = time.monotonic()
+            while True:
+                await asyncio.sleep(_LLM_PROGRESS_INTERVAL_SECONDS)
+                elapsed = int(time.monotonic() - start)
+                if not await _safe_send(
+                    {"type": "llm_progress", "data": {"elapsed_seconds": elapsed}}
+                ):
+                    return
+
+        def _cancel_heartbeat(heartbeat: asyncio.Task) -> None:
+            # Fire-and-forget: awaiting the cancel inside the turn's cleanup
+            # would let a second cancellation (stop/disconnect) interrupt it.
+            heartbeat.cancel()
+
+            def _swallow(task: asyncio.Task) -> None:
+                if not task.cancelled() and task.exception() is not None:
+                    logger.debug("llm_progress heartbeat ended: %s", task.exception())
+
+            heartbeat.add_done_callback(_swallow)
+
+        def _error_payload(e: Exception) -> dict:
+            # _with_retries attaches the retry count to the final exception
+            # so the operator can tell a fast-fail from an exhausted
+            # backoff (issue #4).
+            attempts = getattr(e, "_clearwing_attempts", 0) or 0
+            message = str(e)
+            if attempts:
+                message += f" (gave up after {attempts} retr{'y' if attempts == 1 else 'ies'})"
+            return {"type": "error", "data": {"message": message, "retries": attempts}}
+
         def _complete_payload() -> dict:
             data: dict[str, Any] = {}
             if transcript is not None:
@@ -673,22 +720,26 @@ def create_app():
             try:
                 turn_state["active"] = True
                 last_content = ""
-                async for event in graph_ref.astream(
-                    input_msg, config_ref, stream_mode="values"
-                ):
-                    msgs = event.get("messages", [])
-                    if msgs:
-                        last = msgs[-1]
-                        if hasattr(last, "content") and last.type == "ai":
-                            c = last.content
-                            if isinstance(c, list):
-                                c = "\n".join(
-                                    p["text"]
-                                    for p in c
-                                    if isinstance(p, dict) and p.get("type") == "text"
-                                )
-                            if c:
-                                last_content = c
+                heartbeat = asyncio.create_task(_llm_progress_heartbeat())
+                try:
+                    async for event in graph_ref.astream(
+                        input_msg, config_ref, stream_mode="values"
+                    ):
+                        msgs = event.get("messages", [])
+                        if msgs:
+                            last = msgs[-1]
+                            if hasattr(last, "content") and last.type == "ai":
+                                c = last.content
+                                if isinstance(c, list):
+                                    c = "\n".join(
+                                        p["text"]
+                                        for p in c
+                                        if isinstance(p, dict) and p.get("type") == "text"
+                                    )
+                                if c:
+                                    last_content = c
+                finally:
+                    _cancel_heartbeat(heartbeat)
                 if last_content:
                     if transcript_ref:
                         transcript_ref.add_agent(last_content)
@@ -703,12 +754,7 @@ def create_app():
                 logger.exception("Agent turn failed")
                 if transcript_ref:
                     transcript_ref.add_error(str(e))
-                if not await _safe_send(
-                    {
-                        "type": "error",
-                        "data": {"message": str(e)},
-                    }
-                ):
+                if not await _safe_send(_error_payload(e)):
                     return
             finally:
                 turn_state["active"] = False
@@ -733,17 +779,16 @@ def create_app():
                 except Exception:
                     before = None
                 turn_state["active"] = True
-                snapshot = await graph_ref.ainvoke(Command(resume=approved), config_ref)
+                heartbeat = asyncio.create_task(_llm_progress_heartbeat())
+                try:
+                    snapshot = await graph_ref.ainvoke(Command(resume=approved), config_ref)
+                finally:
+                    _cancel_heartbeat(heartbeat)
             except Exception as e:
                 logger.exception("Agent resume failed")
                 if transcript_ref:
                     transcript_ref.add_error(str(e))
-                if not await _safe_send(
-                    {
-                        "type": "error",
-                        "data": {"message": str(e)},
-                    }
-                ):
+                if not await _safe_send(_error_payload(e)):
                     return
             else:
                 values = getattr(snapshot, "values", None)
