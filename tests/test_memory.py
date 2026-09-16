@@ -95,6 +95,30 @@ class TestSessionStore:
     def test_delete_nonexistent_is_noop(self):
         self.store.delete("nonexistent")  # should not raise
 
+    def test_degrades_gracefully_when_home_unwritable(self, monkeypatch, tmp_path):
+        """#7: an unwritable CLEARWING_HOME (container HOME=/nonexistent)
+        must not make construction raise; the store no-ops instead."""
+        import clearwing.core.config as config_mod
+
+        blocked = tmp_path / "blocked-home"
+        blocked.write_text("")  # a file where a directory is needed
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: blocked)
+
+        store = SessionStore()  # must not raise
+        assert store.available is False
+        assert store.unavailable_reason
+        assert "not writable" in store.unavailable_reason
+        # Mutations are no-ops; create still returns an in-memory session.
+        session = store.create("10.0.0.1", "claude-sonnet-4-6")
+        assert session.session_id
+        store.save(session)
+        store.delete(session.session_id)
+        # Reads behave like an empty store.
+        assert store.list_sessions() == []
+        assert store.get_latest() is None
+        with pytest.raises(FileNotFoundError):
+            store.load(session.session_id)
+
     def test_datetime_serialization(self):
         session = self.store.create("10.0.0.1", "claude-sonnet-4-6")
         session.end_time = datetime(2025, 6, 15, 12, 30, 0)

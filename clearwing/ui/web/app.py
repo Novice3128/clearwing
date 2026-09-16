@@ -87,6 +87,27 @@ def _cors_origins() -> list[str]:
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 
+def _state_dir_status() -> tuple[bool, str]:
+    """Probe the clearwing state directory for writability (issue #7).
+
+    An unwritable CLEARWING_HOME (a container whose HOME is /nonexistent,
+    a read-only volume) breaks SessionStore and every state-writing
+    endpoint; /api/health must surface that instead of reporting "ok"
+    while /api/sessions 500s on every call.
+    """
+    from clearwing.core.config import clearwing_home
+
+    home = clearwing_home()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        probe = home / ".health_probe"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return False, f"state dir {home} is not writable: {exc}"
+    return True, ""
+
+
 def create_app():
     """Create and configure the FastAPI application."""
     app = FastAPI(
@@ -162,12 +183,23 @@ def create_app():
 
     @app.get("/api/health")
     async def health():
+        # Issue #7: the state directory's writability is part of health —
+        # degraded answers 503 so orchestration stops trusting a container
+        # whose /api/sessions would 500 on every call.
+        ok, reason = _state_dir_status()
+        if not ok:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "degraded", "service": "clearwing", "detail": reason},
+            )
         return {"status": "ok", "service": "clearwing"}
 
     @app.get("/api/sessions")
     async def list_sessions():
         """List all known sessions."""
         store = _make_session_store()
+        if not store.available:
+            raise HTTPException(status_code=503, detail=store.unavailable_reason)
         sessions = store.list_sessions()
         return [
             {
@@ -186,6 +218,8 @@ def create_app():
     async def get_session(session_id: str):
         """Get details for a specific session."""
         store = _make_session_store()
+        if not store.available:
+            raise HTTPException(status_code=503, detail=store.unavailable_reason)
         try:
             session = store.load(session_id)
         except FileNotFoundError as exc:

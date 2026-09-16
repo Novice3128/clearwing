@@ -46,6 +46,38 @@ class TestHealthEndpoint:
         assert data["service"] == "clearwing"
 
 
+class TestStateDirDegradation:
+    """#7: an unwritable CLEARWING_HOME (container HOME=/nonexistent) must
+    degrade loudly, not leave health "ok" while /api/sessions 500s."""
+
+    def _block_home(self, monkeypatch, tmp_path):
+        import clearwing.core.config as config_mod
+
+        blocked = tmp_path / "blocked-home"
+        blocked.write_text("")  # a file where a directory is needed
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: blocked)
+
+    def test_health_reports_degraded(self, client, monkeypatch, tmp_path):
+        self._block_home(monkeypatch, tmp_path)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["service"] == "clearwing"
+        assert "not writable" in data["detail"]
+
+    def test_sessions_returns_503_not_500(self, client, monkeypatch, tmp_path):
+        self._block_home(monkeypatch, tmp_path)
+        resp = client.get("/api/sessions")
+        assert resp.status_code == 503
+        assert "not writable" in resp.json()["detail"]
+
+    def test_session_detail_returns_503_not_500(self, client, monkeypatch, tmp_path):
+        self._block_home(monkeypatch, tmp_path)
+        resp = client.get("/api/sessions/abc123")
+        assert resp.status_code == 503
+
+
 class TestSessionEndpoints:
     def test_list_sessions_empty(self, client):
         with patch("clearwing.data.memory.SessionStore") as mock_store:
