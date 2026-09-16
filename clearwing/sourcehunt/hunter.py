@@ -1812,6 +1812,13 @@ class NativeHunter:
             total_cost_usd += call_cost
             # Keep process-wide cost/UI metrics separate from the OTel span,
             # which is emitted directly around the model request above.
+            # NB: no session_id here on purpose. Hunts run under their own
+            # sh-* session id (SourceHuntRunner), not the invoking webui
+            # session's — attributing the hunt id would make scoped webui
+            # consumers DROP these frames as foreign (Codex PR-39/40).
+            # Unscoped frames accumulate in whatever session has an active
+            # turn; proper parent-session attribution needs its own
+            # plumbing (see follow-up issue).
             if input_tokens or output_tokens:
                 CostTracker().record_llm_call(
                     input_tokens,

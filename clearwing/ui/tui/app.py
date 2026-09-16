@@ -391,7 +391,9 @@ class ClearwingApp(App):
 
             except Exception as exc:
                 logger.exception("Agent loop error")
-                feed.add_message(f"Error: {exc}", "error")
+                attempts = getattr(exc, "_clearwing_attempts", 0) or 0
+                suffix = f" (gave up after {attempts} retr{'y' if attempts == 1 else 'ies'})" if attempts else ""
+                feed.add_message(f"Error: {exc}{suffix}", "error")
 
     # ------------------------------------------------------------------
     # Key binding actions

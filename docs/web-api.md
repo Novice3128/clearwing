@@ -116,11 +116,15 @@ interface BusEnvelope<T> {
 }
 ```
 
-Three server frames do **not** use this envelope because they are
+Four server frames do **not** use this envelope because they are
 emitted inline by the WebSocket handler itself rather than forwarded
-from the bus — `started`, the streaming `agent_message` reply, and
-the inline `error` frame. Their shapes are documented under
-[Inline server frames](#inline-server-frames).
+from the bus — `started`, the streaming `agent_message` reply, the
+inline `error` frame, and `llm_progress`. Their shapes are documented
+under [Inline server frames](#inline-server-frames).
+
+Clients MUST ignore frames with an unrecognized `type` (and unknown
+fields within known frames) — the server may add frames like
+`llm_progress` at any time.
 
 Payload serialization rules (`clearwing/ui/web/app.py` lines
 303–317):
@@ -501,9 +505,21 @@ with `"completed"` or `"error"` when the run settles. Payload is
 
 These frames originate in the WebSocket handler itself rather than
 the `EventBus`. They share the top-level `type` discriminator but
-their fields sit alongside `type`, not nested under `data` (with one
-exception — the inline streaming `agent_message` and inline `error`
-frames **do** nest under `data`).
+their fields sit alongside `type`, not nested under `data` (with three
+exceptions — the inline streaming `agent_message`, inline `error`, and
+`llm_progress` frames **do** nest under `data`).
+
+### `llm_progress`
+
+Emitted every 10 seconds while a message/approve turn is still running
+(first frame at +10s) — this covers tool executions between LLM rounds
+too — so a slow or flaky endpoint is a visible wait instead of a
+multi-minute silent stall. The turn's terminal `agent_message` /
+`error` / `complete` frame follows it.
+
+```json
+{"type": "llm_progress", "data": {"elapsed_seconds": 30}}
+```
 
 ### `started`
 
@@ -537,12 +553,16 @@ the client as `tool_start` / `tool_result` bus frames.
 ### `error` (inline)
 
 Produced when the `message` or `approve` handler catches an
-exception while driving the graph.
+exception while driving the graph. `retries` is the number of
+transport retries the LLM layer consumed before giving up (0 for
+fast-fail errors; absent on handler-rejection frames like busy or
+missing-agent); the message carries a human-readable suffix when
+retries happened.
 
 ```json
 {
   "type": "error",
-  "data": {"message": "ProviderTimeout: no response in 30s"}
+  "data": {"message": "ProviderTimeout: no response in 30s (gave up after 2 retries)", "retries": 2}
 }
 ```
 
