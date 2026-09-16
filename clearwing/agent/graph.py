@@ -147,12 +147,22 @@ def _create_llm(
         # runtime attributes cost/audit against.
         return provider_manager.get_native_client(task)
     if base_url or api_key:
-        # Explicit per-request credentials win outright.
+        # Explicit per-request credentials win for THEIR fields only
+        # (issue #16): an unset or placeholder model still defers to
+        # env/config instead of being guessed from the base_url hostname.
+        # config_provider is deliberately not forced to {} — config.yaml
+        # fills whatever the frame left blank (per-field merge in
+        # resolve_llm_endpoint).
+        effective_model = (
+            model_name
+            if model_name
+            and (model_explicit or model_name != DEFAULT_ANTHROPIC_MODEL)
+            else None
+        )
         endpoint = resolve_llm_endpoint(
-            cli_model=model_name,
+            cli_model=effective_model,
             cli_base_url=base_url,
             cli_api_key=api_key,
-            config_provider={},
         )
         return ProviderManager.for_endpoint(endpoint).get_native_client("default")
     # No per-request credentials: resolve from env / config.yaml instead.

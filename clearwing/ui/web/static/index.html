@@ -123,7 +123,9 @@ let ws = null;
 const opsState = {};
 // A turn runs server-side between our `message`/`approve` frame and the
 // matching `complete`/`stopped` frame; while one is running the only frame
-// the server accepts is `stop`.
+// the server accepts is `stop`. A complete with status "awaiting_approval"
+// keeps the session busy — the turn only truly ends when the approval is
+// answered or the operator stops.
 let turnBusy = false;
 
 function setTurnBusy(busy) {
@@ -227,7 +229,11 @@ function startSession() {
     document.getElementById('chat').style.display = 'flex';
 
     ws.send(JSON.stringify({
-      type: 'start', target, model,
+      type: 'start', target,
+      // Empty fields are omitted rather than sent as "" — an empty model
+      // must defer to config.yaml/env, and empty credentials must not
+      // clobber a configured provider (partial-fill semantics).
+      model: model || undefined,
       base_url: baseUrl || undefined,
       api_key: apiKey || undefined,
     }));
@@ -300,8 +306,20 @@ function startSession() {
           ? 'Stopped by operator.' : 'Nothing was running.', 'tool');
         break;
       case 'complete': {
-        setTurnBusy(false);
-        addMessage('Agent completed.', 'tool');
+        // `status` says how the turn actually ended (absent = "ok" for
+        // pre-status servers). "awaiting_approval" is NOT a finish: the
+        // graph is suspended at an approval gate, so the session stays
+        // busy until the operator answers (or stops).
+        const status = data.status || 'ok';
+        if (status === 'awaiting_approval') {
+          setTurnBusy(true);
+          addMessage('Waiting for approval…', 'tool');
+        } else {
+          setTurnBusy(false);
+          if (status === 'ok') addMessage('Agent completed.', 'tool');
+          else if (status === 'error') addMessage('Turn finished with errors.', 'error');
+          // "stopped" already produced its message via the stopped frame.
+        }
         if (data.report_url && webuiKey) {
           // Download via fetch + header so the key never lands in an href
           // (browser history) or the server's access log query string.

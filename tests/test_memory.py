@@ -3,6 +3,7 @@
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -95,6 +96,30 @@ class TestSessionStore:
     def test_delete_nonexistent_is_noop(self):
         self.store.delete("nonexistent")  # should not raise
 
+    def test_degrades_gracefully_when_home_unwritable(self, monkeypatch, tmp_path):
+        """#7: an unwritable CLEARWING_HOME (container HOME=/nonexistent)
+        must not make construction raise; the store no-ops instead."""
+        import clearwing.core.config as config_mod
+
+        blocked = tmp_path / "blocked-home"
+        blocked.write_text("")  # a file where a directory is needed
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: blocked)
+
+        store = SessionStore()  # must not raise
+        assert store.available is False
+        assert store.unavailable_reason
+        assert "not writable" in store.unavailable_reason
+        # Mutations are no-ops; create still returns an in-memory session.
+        session = store.create("10.0.0.1", "claude-sonnet-4-6")
+        assert session.session_id
+        store.save(session)
+        store.delete(session.session_id)
+        # Reads behave like an empty store.
+        assert store.list_sessions() == []
+        assert store.get_latest() is None
+        with pytest.raises(FileNotFoundError):
+            store.load(session.session_id)
+
     def test_datetime_serialization(self):
         session = self.store.create("10.0.0.1", "claude-sonnet-4-6")
         session.end_time = datetime(2025, 6, 15, 12, 30, 0)
@@ -103,6 +128,98 @@ class TestSessionStore:
         assert isinstance(loaded.start_time, datetime)
         assert isinstance(loaded.end_time, datetime)
         assert loaded.end_time.year == 2025
+
+    def test_deferred_session_row_gets_resolved_model(self):
+        """#28: interactive sessions created with model="" (defer to config)
+        must carry the graph's resolved model once it exists."""
+        from types import SimpleNamespace
+
+        from clearwing.ui.commands.interactive import _sync_session_model
+
+        session = self.store.create("10.0.0.1", model="")
+        graph = SimpleNamespace(llm=SimpleNamespace(model_name="glm-5.3"))
+        _sync_session_model(session, graph)
+        assert session.model == "glm-5.3"
+        self.store.save(session)
+        assert self.store.load(session.session_id).model == "glm-5.3"
+
+    def test_sync_session_model_noops(self):
+        from types import SimpleNamespace
+
+        from clearwing.ui.commands.interactive import _sync_session_model
+
+        # No session → nothing to do; graph without an llm/model_name or an
+        # unchanged model must not fabricate or clobber values.
+        _sync_session_model(None, SimpleNamespace(llm=SimpleNamespace(model_name="m")))
+        session = self.store.create("10.0.0.1", model="kimi-k2")
+        _sync_session_model(session, object())
+        assert session.model == "kimi-k2"
+        _sync_session_model(
+            session, SimpleNamespace(llm=SimpleNamespace(model_name="kimi-k2"))
+        )
+        assert session.model == "kimi-k2"
+
+
+class TestTuiSessionWriteBack:
+    """Three-lens review (F8): the TUI exit write-back (resolved model +
+    status) must survive `app.run()` raising — the graph only exists after
+    the TUI's on_mount, so a crash used to skip the write-back entirely."""
+
+    def _run(self, monkeypatch, run_outcome):
+        import clearwing.ui.commands.interactive as interactive
+
+        saved = {}
+
+        class _FakeStore:
+            def save(self, session):
+                saved["session"] = session
+
+        monkeypatch.setattr(interactive, "SessionStore", _FakeStore)
+
+        class _FakeApp:
+            def __init__(self, **kwargs):
+                self._agent_graph = SimpleNamespace(
+                    llm=SimpleNamespace(model_name="glm-5.3")
+                )
+
+            def run(self):
+                run_outcome()
+
+        monkeypatch.setattr(interactive, "ClearwingApp", _FakeApp)
+
+        session = SimpleNamespace(session_id="sec-tui", status="running", model="")
+        cli = SimpleNamespace(console=SimpleNamespace(print=lambda *a, **k: None))
+        args = SimpleNamespace(
+            target="t",
+            model=None,
+            model_explicit=False,
+            base_url=None,
+            api_key=None,
+        )
+        return interactive, saved, session, cli, args
+
+    def test_normal_exit_writes_back_completed_and_model(self, monkeypatch):
+        interactive, saved, session, cli, args = self._run(monkeypatch, lambda: None)
+
+        interactive._run_tui(cli, args, session)
+
+        assert session.model == "glm-5.3"
+        assert session.status == "completed"
+        assert saved["session"] is session
+
+    def test_crashing_tui_still_writes_back_model(self, monkeypatch):
+        def boom():
+            raise RuntimeError("tui exploded")
+
+        interactive, saved, session, cli, args = self._run(monkeypatch, boom)
+
+        with pytest.raises(RuntimeError):
+            interactive._run_tui(cli, args, session)
+
+        # The crash must not lose the write-back: model resolved, row saved.
+        assert session.model == "glm-5.3"
+        assert session.status == "error"
+        assert saved["session"] is session
 
 
 # =========================================================================

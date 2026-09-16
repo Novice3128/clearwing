@@ -15,7 +15,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN adduser --system --no-create-home clearwing
+# A real, user-owned home is required: clearwing_home() writes
+# ~/.clearwing (sessions, memory, reports). --no-create-home used to leave
+# HOME=/nonexistent, which made every SessionStore touch 500 (#7).
+RUN adduser --system --group --home /home/clearwing clearwing
 
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin

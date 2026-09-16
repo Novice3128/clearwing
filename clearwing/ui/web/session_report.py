@@ -7,6 +7,7 @@ and on disconnect. Unlike the model's final message, this artifact always
 exists — even when the client disconnects mid-run.
 """
 
+import html
 import json
 import logging
 import os
@@ -75,8 +76,43 @@ def session_report_path(session_id: str) -> Path:
 
 
 def _md_cell(value: Any) -> str:
+    """Render one table-cell value inert (issue #24, three-lens review).
+
+    Table fields (Target/Model/tool args/...) are attacker-controllable
+    too: on top of redaction, the pipe/newline guards keep the cell from
+    breaking out of its column, bracket escaping keeps link/image syntax
+    from binding, and html.escape keeps raw HTML (`<img onerror>`, ...)
+    inert — the same neutralization level as :func:`_md_neutralize`.
+    """
     text = _redact(str(value if value is not None else ""))
-    return text.replace("|", "\\|").replace("\n", " ").strip()
+    text = text.replace("|", "\\|").replace("\n", " ")
+    text = text.replace("[", "\\[").replace("]", "\\]")
+    return html.escape(text, quote=False).strip()
+
+
+# Issue #24: transcript text is attacker-controllable prose (operator input,
+# model output, error strings). Rendered raw it can forge report structure
+# (headings, lists, block quotes, ~~~ fences, GFM tables), phishing links
+# ([x](url)) and raw HTML (<img>, <script>). Each line therefore gets its
+# leading block marker backslash-escaped, its brackets escaped so link/image
+# syntax cannot bind, its pipes escaped so table rows cannot be forged (a
+# `| a | b |` line starts with `|`, not a block marker, so the marker rules
+# above cannot catch it); & < > are HTML-escaped. Plain prose is unchanged.
+_MD_BLOCK_MARKER = re.compile(r"^(\s*)([#>\-*+=`~])")
+_MD_ORDERED_MARKER = re.compile(r"^(\s*)(\d{1,9})([.)])(\s|$)")
+_MD_INLINE_BRACKETS = re.compile(r"([\[\]])")
+
+
+def _md_neutralize(text: str) -> str:
+    """Make untrusted transcript text inert as markdown (issue #24)."""
+    safe_lines = []
+    for line in text.splitlines():
+        line = _MD_BLOCK_MARKER.sub(r"\1\\\2", line)
+        line = _MD_ORDERED_MARKER.sub(r"\1\2\\\3\4", line)
+        line = _MD_INLINE_BRACKETS.sub(r"\\\1", line)
+        line = line.replace("|", "\\|")
+        safe_lines.append(html.escape(line, quote=False))
+    return "\n".join(safe_lines)
 
 
 class SessionTranscript:
@@ -142,7 +178,7 @@ class SessionTranscript:
             for i, msg in enumerate(self.user_messages, 1):
                 lines.append(f"### Request {i}")
                 lines.append("")
-                lines.append(_redact(msg).strip() or "(empty)")
+                lines.append(_md_neutralize(_redact(msg).strip()) or "(empty)")
                 lines.append("")
 
         if self.agent_messages:
@@ -151,7 +187,7 @@ class SessionTranscript:
             for i, msg in enumerate(self.agent_messages, 1):
                 lines.append(f"### Response {i}")
                 lines.append("")
-                lines.append(_redact(msg).strip() or "(empty)")
+                lines.append(_md_neutralize(_redact(msg).strip()) or "(empty)")
                 lines.append("")
 
         if self.tool_calls:
@@ -174,7 +210,7 @@ class SessionTranscript:
             lines.append("## Errors")
             lines.append("")
             for err in self.errors:
-                lines.append(f"- {_redact(err).strip()}")
+                lines.append(f"- {_md_neutralize(_redact(err).strip())}")
             lines.append("")
 
         lines.append(

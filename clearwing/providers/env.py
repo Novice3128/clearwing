@@ -1,7 +1,10 @@
 """Endpoint resolution for the multi-provider LLM layer.
 
-Clearwing picks an LLM from five possible sources, in precedence
-order (highest wins):
+Clearwing picks an LLM from five possible sources. Since the per-field
+merge (issues #8/#16/#28) each of base_url / model / api_key resolves
+independently down this ladder (highest wins, empty strings count as
+unset), so a partially-filled CLI or webui start frame defers its
+missing fields to the tiers below instead of shadowing them:
 
     0. Process routing   (installed once by a machine-mode command)
     1. CLI flags         (--base-url / --api-key / --model)
@@ -219,6 +222,20 @@ def _endpoint_from_runtime(cfg: dict[str, Any]) -> LLMEndpoint | None:
     )
 
 
+def _clean_field(value: Any) -> str | None:
+    """Normalize a config/CLI source field: None/empty/whitespace → unset.
+
+    A start frame or YAML file can carry `model: ""` (or `"  "`); treating
+    those as "explicitly empty" would shadow the configured provider value
+    (issues #8/#16/#28), so they normalize to None and defer down the
+    per-field ladder.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
 def resolve_llm_endpoint(
     cli_model: str | None = None,
     cli_base_url: str | None = None,
@@ -227,11 +244,28 @@ def resolve_llm_endpoint(
 ) -> LLMEndpoint:
     """Merge CLI / env / config / default sources into one endpoint.
 
-    Precedence (highest wins):
-        1. CLI flags
+    Fields merge PER FIELD (issues #8/#16/#28): each of base_url / model /
+    api_key resolves independently down the ladder, so a partially-filled
+    CLI (or webui start frame) no longer shadows the rest of the
+    configured provider — `--base-url` alone keeps the configured model
+    instead of guessing one from the hostname.
+
+    Per-field precedence (highest wins, empty strings count as unset):
+        1. CLI flags / start-frame fields
         2. CLEARWING_BASE_URL / CLEARWING_API_KEY / CLEARWING_MODEL
-        3. config_provider dict (from YAML)
-        4. Anthropic default via ANTHROPIC_API_KEY
+        3. config.yaml `provider:` section
+        4. Default (Anthropic claude-sonnet-4-6 via ANTHROPIC_API_KEY)
+
+    One field is NOT purely per-field: the config api_key is scoped to the
+    config base_url. When the final base_url came from the CLI/env tier
+    (e.g. a webui start frame pointing at an arbitrary host), the
+    config-layer credential is excluded from the api_key merge — it must
+    never authenticate a different endpoint than the one the config block
+    named. `model` merging is unaffected.
+
+    The returned `source` names the strongest tier that contributed any
+    field ("cli" | "env" | "config" | "default"), which keeps mixed-source
+    endpoints debuggable via `describe()`.
 
     Args:
         cli_model:    Value of `--model` if passed.
@@ -265,123 +299,80 @@ def resolve_llm_endpoint(
         if ep is not None:
             return ep
 
-    # 1. CLI flags win when any are set
-    if cli_base_url or cli_model or cli_api_key:
-        return _endpoint_from_fields(
-            model=cli_model,
-            base_url=cli_base_url,
-            api_key=cli_api_key,
-            source="cli",
-        )
+    # Per-field sources, strongest tier first. Empty strings normalize to
+    # unset so a blank start-frame field defers instead of shadowing.
+    cli_base_url = _clean_field(cli_base_url)
+    cli_model = _clean_field(cli_model)
+    cli_api_key = _clean_field(cli_api_key)
+    env_base_url = _clean_field(os.environ.get(ENV_BASE_URL))
+    env_api_key = _clean_field(os.environ.get(ENV_API_KEY))
+    env_model = _clean_field(os.environ.get(ENV_MODEL))
 
-    # 2. CLEARWING_* env vars
-    env_base_url = os.environ.get(ENV_BASE_URL)
-    env_api_key = os.environ.get(ENV_API_KEY)
-    env_model = os.environ.get(ENV_MODEL)
+    cfg_auth = _normalize_auth_flow(
+        config_provider.get("auth") or config_provider.get("auth_flow")
+    )
+    cfg_base_url = _clean_field(config_provider.get("base_url"))
+    cfg_model = _clean_field(config_provider.get("model"))
+    cfg_api_key = _resolve_config_secret(config_provider.get("api_key"))
+    cfg_adapter = config_provider.get("adapter")  # None if unset
 
-    # Model-only override (CLEARWING_MODEL set, CLEARWING_BASE_URL not set):
-    # inherit base_url + api_key from config so we don't accidentally route to
-    # Anthropic direct when a custom endpoint is already configured.
-    if env_model and not env_base_url and config_provider:
-        env_base_url = config_provider.get("base_url") or env_base_url
-        if env_base_url:
-            logger.info(
-                "CLEARWING_MODEL=%s set without CLEARWING_BASE_URL; "
-                "inheriting base_url=%s from provider config",
-                env_model, env_base_url,
-            )
-        if not env_api_key:
-            env_api_key = _resolve_config_secret(config_provider.get("api_key"))
+    has_cli = bool(cli_base_url or cli_model or cli_api_key)
+    has_env = bool(env_base_url or env_model or env_api_key)
 
-    if env_base_url or env_model:
-        if env_base_url:
-            if _is_anthropic_compat_base_url(env_base_url):
-                return LLMEndpoint(
-                    provider="anthropic",
-                    model=env_model or _default_anthropic_compat_model(env_base_url),
-                    base_url=env_base_url,
-                    api_key=env_api_key or os.environ.get(ENV_ANTHROPIC_KEY),
-                    source="env",
-                )
-            return LLMEndpoint(
-                provider="openai_compat",
-                model=env_model or _default_openai_compat_model(env_base_url),
-                base_url=env_base_url,
-                api_key=env_api_key or _placeholder_for(env_base_url),
-                source="env",
-            )
+    # Config-level OAuth flows (auth: openai-oauth / claude-code) describe a
+    # whole endpoint, not a per-field contribution: they apply only when no
+    # CLI/env field competes, exactly as before the per-field merge.
+    if not has_cli and not has_env and cfg_auth == "openai_codex":
+        cfg_base_url = cfg_base_url or _openai_codex_default_base_url()
+        cfg_model = cfg_model or _openai_codex_default_model()
         return LLMEndpoint(
-            provider="anthropic",
-            model=env_model or DEFAULT_ANTHROPIC_MODEL,
+            provider="openai_codex",
+            model=str(cfg_model),
+            base_url=str(cfg_base_url),
+            api_key=_openai_oauth_access_token(),
+            source="config",
+        )
+    if not has_cli and not has_env and cfg_auth == "anthropic_oauth":
+        cfg_model = cfg_model or DEFAULT_ANTHROPIC_MODEL
+        return LLMEndpoint(
+            provider="anthropic_oauth",
+            model=str(cfg_model),
             base_url=None,
-            api_key=env_api_key or os.environ.get(ENV_ANTHROPIC_KEY),
-            source="env",
+            api_key=_anthropic_oauth_access_token(),
+            source="config",
         )
 
-    # 3. YAML config.yaml provider: section
-    if config_provider:
-        cfg_auth = _normalize_auth_flow(
-            config_provider.get("auth") or config_provider.get("auth_flow")
-        )
-        if cfg_auth == "openai_codex":
-            cfg_base_url = config_provider.get("base_url") or _openai_codex_default_base_url()
-            cfg_model = config_provider.get("model") or _openai_codex_default_model()
-            return LLMEndpoint(
-                provider="openai_codex",
-                model=str(cfg_model),
-                base_url=str(cfg_base_url),
-                api_key=_openai_oauth_access_token(),
-                source="config",
-            )
-        if cfg_auth == "anthropic_oauth":
-            cfg_model = config_provider.get("model") or DEFAULT_ANTHROPIC_MODEL
-            return LLMEndpoint(
-                provider="anthropic_oauth",
-                model=str(cfg_model),
-                base_url=None,
-                api_key=_anthropic_oauth_access_token(),
-                source="config",
-            )
+    # 1-3. Per-field merge: CLI > CLEARWING_* env > config.yaml.
+    base_url = cli_base_url or env_base_url or cfg_base_url
+    model = cli_model or env_model or cfg_model
+    # Credential scoping: the config api_key authenticates the endpoint the
+    # config block itself named, so it may only ride along when the final
+    # base_url came from the config tier (same rule the adapter override
+    # follows below). A CLI/env-supplied base_url — e.g. a webui start frame
+    # pointing at an arbitrary host — must never receive the config-layer
+    # credential. The model merge above is deliberately unaffected (#16:
+    # a deferred model stays deferred).
+    if cli_base_url or env_base_url:
+        api_key = cli_api_key or env_api_key
+    else:
+        api_key = cli_api_key or env_api_key or cfg_api_key
+    has_cfg = bool(cfg_base_url or cfg_model or cfg_api_key)
+    source = (
+        "cli" if has_cli else "env" if has_env else "config" if has_cfg else "default"
+    )
+    # An adapter override describes the endpoint its config block named; it
+    # does not follow a CLI/env base_url that replaced the configured one.
+    adapter = cfg_adapter if (cfg_adapter and base_url == cfg_base_url) else None
 
-        cfg_base_url = config_provider.get("base_url")
-        cfg_model = config_provider.get("model")
-        cfg_api_key = _resolve_config_secret(config_provider.get("api_key"))
-        cfg_adapter = config_provider.get("adapter")  # None if unset
-        if cfg_base_url:
-            if _is_anthropic_compat_base_url(cfg_base_url):
-                return LLMEndpoint(
-                    provider="anthropic",
-                    model=cfg_model or _default_anthropic_compat_model(cfg_base_url),
-                    base_url=cfg_base_url,
-                    api_key=cfg_api_key or os.environ.get(ENV_ANTHROPIC_KEY),
-                    source="config",
-                    adapter=cfg_adapter,
-                )
-            return LLMEndpoint(
-                provider="openai_compat",
-                model=cfg_model or _default_openai_compat_model(cfg_base_url),
-                base_url=cfg_base_url,
-                api_key=cfg_api_key or _placeholder_for(cfg_base_url),
-                source="config",
-                adapter=cfg_adapter,
-            )
-        if cfg_model or cfg_api_key:
-            return LLMEndpoint(
-                provider="anthropic",
-                model=cfg_model or DEFAULT_ANTHROPIC_MODEL,
-                base_url=None,
-                api_key=cfg_api_key or os.environ.get(ENV_ANTHROPIC_KEY),
-                source="config",
-                adapter=cfg_adapter,
-            )
-
-    # 4. Default — Anthropic direct via ANTHROPIC_API_KEY
-    return LLMEndpoint(
-        provider="anthropic",
-        model=DEFAULT_ANTHROPIC_MODEL,
-        base_url=None,
-        api_key=os.environ.get(ENV_ANTHROPIC_KEY),
-        source="default",
+    # 4. `_endpoint_from_fields` supplies the default tier (Anthropic
+    # direct, DEFAULT_ANTHROPIC_MODEL, ANTHROPIC_API_KEY) for whatever the
+    # merge left unset.
+    return _endpoint_from_fields(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        source=source,
+        adapter=adapter,
     )
 
 
