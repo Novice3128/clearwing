@@ -431,7 +431,7 @@ the mission succeeds, runs out of budget, or exceeds max steps.
 
 ```bash
 clearwing parallel <targets...>
-  [--max-concurrent N]        # default: 5
+  [--max-parallel N]          # default: 3
   [--depth basic|standard|deep]
   [--output-dir DIR]
 ```

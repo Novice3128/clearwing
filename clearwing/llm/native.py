@@ -912,14 +912,7 @@ class AsyncLLMClient:
         temperature, max_tokens = self._codex_safe_params(temperature, max_tokens)
         if self.provider_name == "openai_codex":
             top_p = None  # Codex gateway rejects sampling params
-        reservation = self._reserve_spend_call(
-            messages=request_messages,
-            system=system_prompt,
-            tools=tools,
-            max_tokens=max_tokens,
-        )
         started = time.monotonic()
-        dispatched = False
         try:
             options = ChatOptions(
                 temperature=temperature,
@@ -952,10 +945,21 @@ class AsyncLLMClient:
 
             async with self._semaphore:
                 client = self._build_client(Client)
-                dispatched = True
+
+                def _reserve():
+                    # Per-attempt reservation (issue #42): each retry books
+                    # and settles its own reservation inside _with_retries.
+                    return self._reserve_spend_call(
+                        messages=request_messages,
+                        system=system_prompt,
+                        tools=tools,
+                        max_tokens=max_tokens,
+                    )
+
                 try:
                     response = await self._with_retries(
-                        lambda: self._achat_with_provider_policy(client, request, options)
+                        lambda: self._achat_with_provider_policy(client, request, options),
+                        reserve=_reserve,
                     )
                 except Exception as exc:
                     if (
@@ -970,13 +974,13 @@ class AsyncLLMClient:
                         self.reasoning_effort = None
                         options = self._rebuild_options_without_reasoning(options)
                         response = await self._with_retries(
-                            lambda: self._achat_with_provider_policy(client, request, options)
+                            lambda: self._achat_with_provider_policy(client, request, options),
+                            reserve=_reserve,
                         )
                     else:
                         raise
         except BaseException as exc:
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            self._fail_spend_call(reservation, exc, dispatched=dispatched)
             logger.warning(
                 "LLM call failed for model=%s provider=%s in %dms: %s",
                 self.model_name,
@@ -987,7 +991,6 @@ class AsyncLLMClient:
             _record_call(self.model_name, elapsed_ms, None, None, 0, ok=False)
             raise
 
-        self._settle_spend_call(reservation, response)
         usage = response.usage
         elapsed_ms = int((time.monotonic() - started) * 1000)
         prompt_tokens = usage.prompt_tokens
@@ -1075,14 +1078,7 @@ class AsyncLLMClient:
         temperature, max_tokens = self._codex_safe_params(temperature, max_tokens)
         if self.provider_name == "openai_codex":
             top_p = None  # Codex gateway rejects sampling params
-        reservation = self._reserve_spend_call(
-            messages=request_messages,
-            system=system_prompt,
-            tools=tools,
-            max_tokens=max_tokens,
-        )
         started = time.monotonic()
-        dispatched = False
         try:
             options = ChatOptions(
                 temperature=temperature,
@@ -1098,9 +1094,17 @@ class AsyncLLMClient:
             async with self._semaphore:
                 client = self._build_client(Client)
 
+                def _reserve():
+                    # Per-attempt reservation (issue #42): each retry books
+                    # and settles its own reservation inside _with_retries.
+                    return self._reserve_spend_call(
+                        messages=request_messages,
+                        system=system_prompt,
+                        tools=tools,
+                        max_tokens=max_tokens,
+                    )
+
                 async def _consume(opts: ChatOptions) -> ChatResponse | None:
-                    nonlocal dispatched
-                    dispatched = True
                     stream = await client.astream_chat(self.model_name, request, opts)
                     async for event in stream:
                         if event.content:
@@ -1110,7 +1114,9 @@ class AsyncLLMClient:
                     return None
 
                 try:
-                    response = await self._with_retries(lambda: _consume(options))
+                    response = await self._with_retries(
+                        lambda: _consume(options), reserve=_reserve
+                    )
                 except Exception as exc:
                     if (
                         options.reasoning_effort is not None
@@ -1124,7 +1130,9 @@ class AsyncLLMClient:
                         )
                         self.reasoning_effort = None
                         options = self._rebuild_options_without_reasoning(options)
-                        response = await _consume(options)
+                        response = await self._attempt_with_reservation(
+                            lambda: _consume(options), _reserve
+                        )
                     elif self._should_try_openai_http_fallback(exc) and (
                         not (self._spend_ledger is not None and self._spend_ledger.enforcing)
                         or self._is_definitely_unbilled_transport_error(exc)
@@ -1137,10 +1145,13 @@ class AsyncLLMClient:
                             self.base_url,
                             exc,
                         )
-                        response = await self._openai_chat_http_fallback(
-                            request,
-                            options,
-                            on_text_delta=on_text_delta,
+                        response = await self._attempt_with_reservation(
+                            lambda: self._openai_chat_http_fallback(
+                                request,
+                                options,
+                                on_text_delta=on_text_delta,
+                            ),
+                            _reserve,
                         )
                     else:
                         raise
@@ -1148,7 +1159,6 @@ class AsyncLLMClient:
                     raise RuntimeError("LLM stream ended without a terminal usage event")
         except BaseException as exc:
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            self._fail_spend_call(reservation, exc, dispatched=dispatched)
             logger.warning(
                 "LLM stream failed for model=%s provider=%s in %dms: %s",
                 self.model_name,
@@ -1172,7 +1182,6 @@ class AsyncLLMClient:
                 )
             raise
 
-        self._settle_spend_call(reservation, response)
         usage = response.usage
         details = usage.prompt_tokens_details
         prompt_tokens = usage.prompt_tokens
@@ -1890,7 +1899,7 @@ class AsyncLLMClient:
             ),
         )
 
-    async def _with_retries(self, op) -> ChatResponse:
+    async def _with_retries(self, op, *, reserve=None) -> ChatResponse | None:
         """Retry *op* on rate-limit AND transient transport errors.
 
         Transport errors (reqwest connection/send failures) never reached a
@@ -1901,12 +1910,25 @@ class AsyncLLMClient:
         tell the user how many attempts were made (issue #4); it is only set
         when at least one retry happened, and always via try/except so an
         exotic exception type can't break the raise path.
+
+        Per-attempt spend ledger (issue #42): when *reserve* is given, EVERY
+        attempt runs under its own reservation — success settles it against
+        the attempt's usage, failure closes it (ambiguous failures consume
+        the reserved amount; definitely-unbilled ones release it). A single
+        reservation around the whole retry loop could settle only the final
+        attempt while the provider billed each billable-ambiguous resend,
+        so retries silently under-accounted spend.
         """
         attempt = 0
         while True:
+            reservation = reserve() if reserve is not None else None
             try:
-                return await op()
-            except Exception as exc:
+                response = await op()
+            except BaseException as exc:
+                if reservation is not None:
+                    self._fail_spend_call(reservation, exc, dispatched=True)
+                if not isinstance(exc, Exception):
+                    raise
                 is_rate_limit = self._is_rate_limit_error(exc)
                 is_transport = self._is_transient_transport_error(exc)
                 retry_limit = (
@@ -1930,10 +1952,13 @@ class AsyncLLMClient:
                 ):
                     # Billable-ambiguous failures — read timeouts and
                     # close-after-accept disconnects alike — under an
-                    # actively enforcing spend ledger: the resends share
-                    # one reservation and only one settlement, so refuse
-                    # them rather than risk unaccounted billable
-                    # generations (Codex PR-40 r3, symmetric rule).
+                    # actively enforcing spend ledger: each resend now books
+                    # its own reservation (so retries are accounted), but
+                    # an ambiguous attempt consumes its full reservation,
+                    # which under a tight limit starves the retry anyway.
+                    # Keep refusing rather than risk unaccounted billable
+                    # generations (Codex PR-40 r3, symmetric rule) until
+                    # per-attempt accounting has live evidence.
                     # Non-enforcing callers (the webui default) keep the
                     # retry — chaos-P1 showed a single such disconnect
                     # killing the whole task otherwise.
@@ -1958,6 +1983,62 @@ class AsyncLLMClient:
                     exc,
                 )
                 await asyncio.sleep(delay)
+                continue
+            if reservation is not None:
+                if response is None:
+                    # A stream that ended without a terminal usage event —
+                    # the caller raises. The generation may still have been
+                    # billed in full, so close the attempt as an ambiguous
+                    # failure instead of settling at zero usage.
+                    self._fail_spend_call(
+                        reservation,
+                        RuntimeError("LLM stream ended without a terminal usage event"),
+                        dispatched=True,
+                    )
+                else:
+                    try:
+                        self._settle_spend_call(reservation, response)
+                    except Exception as exc:
+                        # Settle must never strand an ACTIVE reservation
+                        # (e.g. a malformed response whose usage blows up
+                        # settlement): the reservation would stay booked
+                        # forever and enforcing runs would under-report
+                        # their remaining budget. Close it as an ambiguous
+                        # failure — the generation may have been billed —
+                        # then surface the original error.
+                        self._fail_spend_call(reservation, exc, dispatched=True)
+                        raise
+            return response
+
+    async def _attempt_with_reservation(self, op, reserve) -> ChatResponse | None:
+        """Run ONE dispatch under its own spend reservation (issue #42).
+
+        Companion to ``_with_retries(reserve=...)`` for the one-shot retry
+        paths (reasoning-effort retry, OpenAI HTTP stream fallback): the
+        attempt settles on success and closes its reservation on failure,
+        so no dispatch ever rides on an already-consumed reservation.
+        """
+        reservation = reserve()
+        try:
+            response = await op()
+        except BaseException as exc:
+            self._fail_spend_call(reservation, exc, dispatched=True)
+            raise
+        if response is None:
+            self._fail_spend_call(
+                reservation,
+                RuntimeError("LLM stream ended without a terminal usage event"),
+                dispatched=True,
+            )
+        else:
+            try:
+                self._settle_spend_call(reservation, response)
+            except Exception as exc:
+                # Same dangling-reservation guard as _with_retries: close
+                # the attempt as an ambiguous failure, then re-raise.
+                self._fail_spend_call(reservation, exc, dispatched=True)
+                raise
+        return response
 
     @staticmethod
     def _rebuild_options_without_reasoning(options: ChatOptions) -> ChatOptions:

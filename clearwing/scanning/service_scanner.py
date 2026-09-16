@@ -1,6 +1,9 @@
 import asyncio
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ServiceScanner:
@@ -69,6 +72,17 @@ class ServiceScanner:
 
         tasks = [detect_service(port) for port in open_ports]
         await asyncio.gather(*tasks)
+
+        # Issue #14: a total banner-grab failure used to look like "open
+        # ports, no services" — warn so the empty result is not silently
+        # misread as service-less targets.
+        if open_ports and services and all(not s.get("banner") for s in services):
+            logger.warning(
+                "service detection on %s: no banner could be grabbed from "
+                "any of the %d open ports (timeouts/refused connections)",
+                target,
+                len(services),
+            )
 
         return services
 

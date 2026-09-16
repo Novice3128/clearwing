@@ -4,6 +4,8 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 
 def _astream_of(events):
     """Return an async-generator function yielding the given events."""
@@ -610,3 +612,352 @@ class TestOperatorRun:
 
         # Should exit cleanly after first turn yields empty
         assert result.turns <= 1
+
+
+class TestOperatorCostIsolation:
+    """Issue #37: operator jobs must not read each other's spend.
+
+    The inner graphs used to write the process-wide CostTracker running
+    total into graph state, so a second job in the same process reported
+    (and budget-checked against) every earlier job's accumulated cost.
+    """
+
+    @staticmethod
+    def _real_graph(client):
+        """Build a REAL NativeAgentGraph around a fake LLM client."""
+        from clearwing.agent.graph import build_react_graph
+
+        def factory(**kwargs):
+            return build_react_graph(
+                llm_with_tools=client,
+                tools=[],
+                system_prompt_fn=lambda state: "sys",
+                model_name="fake-model",
+                session_id=kwargs.get("session_id"),
+                enable_knowledge_graph=False,
+                enable_audit=False,
+                enable_episodic_memory=False,
+                enable_event_bus=False,
+                enable_context_summarizer=False,
+            )
+
+        return factory
+
+    @staticmethod
+    def _client(usages):
+        """Fake client whose achat_stream replays text responses with usage."""
+        class _Resp:
+            def __init__(self, prompt, completion):
+                self.first_text = "working"
+                self.texts = ["working"]
+                self.tool_calls = []
+                self.provider_model_name = "fake-model"
+                self.reasoning_content = None
+
+                class _Usage:
+                    prompt_tokens = prompt
+                    completion_tokens = completion
+                    total_tokens = prompt + completion
+
+                self.usage = _Usage()
+
+        class _Client:
+            model_name = "fake-model"
+
+            def __init__(self, responses):
+                self._responses = list(responses)
+
+            async def achat_stream(self, **kwargs):
+                return self._responses.pop(0)
+
+        return _Client([_Resp(p, c) for p, c in usages])
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_second_job_reports_only_its_own_spend(
+        self, mock_create, mock_create_llm, mock_decide
+    ):
+        mock_decide.return_value = "GOALS_COMPLETE"
+        mock_create_llm.return_value = MagicMock()
+
+        job1 = self._real_graph(self._client([(3000, 500)]))
+        job2 = self._real_graph(self._client([(100, 20)]))
+        mock_create.side_effect = [job1(), job2()]
+
+        r1 = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+        r2 = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.2")).run()
+
+        # Sonnet fallback pricing (fake-model): job2 must report only its
+        # own call — not job1's 0.0165 on top of it.
+        assert r2.cost_usd == pytest.approx((100 * 3 + 20 * 15) / 1_000_000)
+        assert r1.cost_usd == pytest.approx((3000 * 3 + 500 * 15) / 1_000_000)
+        assert r2.tokens_used == 120
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_cost_limit_of_second_job_unpolluted(
+        self, mock_create, mock_create_llm, mock_decide
+    ):
+        mock_create_llm.return_value = MagicMock()
+        # Job 1 spends 0.0165 per turn. Job 2 spends 0.0006 per turn; its
+        # limit of 0.001 must be evaluated against ITS OWN spend only — a
+        # second turn has to fit under the limit and the run must complete.
+        # (The mocked _adecide_next is shared across both jobs: each one
+        # consumes one "continue" + one "GOALS_COMPLETE".)
+        mock_decide.side_effect = ["continue", "GOALS_COMPLETE"] * 2
+
+        job1 = self._real_graph(self._client([(3000, 500), (3000, 500)]))
+        job2 = self._real_graph(self._client([(100, 20), (100, 20)]))
+        mock_create.side_effect = [job1(), job2()]
+
+        r1 = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+        assert r1.status == "completed"
+
+        r2 = OperatorAgent(
+            OperatorConfig(goals=["g"], target="10.0.0.2", cost_limit=0.001)
+        ).run()
+        assert r2.status == "completed"
+        assert r2.turns == 2
+
+    @staticmethod
+    def _hunt_spending_graph(captured, usages, hunt_tokens):
+        """Real graph whose client also books hunt-style spend per call.
+
+        The first achat_stream books an extra CostTracker call attributed to
+        the job's session id — exactly what a sourcehunt hunt spawned inside
+        the job does (issue #41 ambient attribution) — so tests can assert
+        the operator's limit/result see hunt spend.
+        """
+
+        def factory(**kwargs):
+            from clearwing.agent.graph import build_react_graph
+            from clearwing.observability.telemetry import CostTracker
+
+            session_id = kwargs.get("session_id")
+            captured["session_id"] = session_id
+
+            class _Resp:
+                def __init__(self, prompt, completion):
+                    self.first_text = "working"
+                    self.texts = ["working"]
+                    self.tool_calls = []
+                    self.provider_model_name = "fake-model"
+                    self.reasoning_content = None
+
+                    class _Usage:
+                        prompt_tokens = prompt
+                        completion_tokens = completion
+                        total_tokens = prompt + completion
+
+                    self.usage = _Usage()
+
+            class _Client:
+                model_name = "fake-model"
+
+                def __init__(self):
+                    self._responses = [_Resp(p, c) for p, c in usages]
+
+                async def achat_stream(self, **kwargs_):
+                    if captured.get("hunts_fired") is None and session_id:
+                        captured["hunts_fired"] = True
+                        CostTracker().record_llm_call(
+                            hunt_tokens,
+                            0,
+                            "claude-sonnet-4-6",
+                            session_id=session_id,
+                        )
+                    return self._responses.pop(0)
+
+            return build_react_graph(
+                llm_with_tools=_Client(),
+                tools=[],
+                system_prompt_fn=lambda state: "sys",
+                model_name="fake-model",
+                session_id=session_id,
+                enable_knowledge_graph=False,
+                enable_audit=False,
+                enable_episodic_memory=False,
+                enable_event_bus=False,
+                enable_context_summarizer=False,
+            )
+
+        return factory
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_cost_limit_counts_hunt_spend(self, mock_create, mock_create_llm, mock_decide):
+        """A job's cost_limit must fire on hunt spend attributed to the job.
+
+        The limit used to read the graph's state total, which only covers
+        the inner agent's own calls — hunts (usually the pipeline's largest
+        share) were invisible, so a limited job ran them unbounded.
+        """
+        mock_create_llm.return_value = MagicMock()
+        # Turn 1 books the hunt spend; the loop's SECOND limit check (before
+        # turn 2) must trip on it.
+        mock_decide.side_effect = ["continue", "GOALS_COMPLETE"]
+
+        captured: dict = {}
+        # Inner agent call: (100 in, 20 out) at Sonnet fallback = $0.0006.
+        # Hunt: 1M input tokens at $3/M = $3.0, recorded under the job's
+        # session id during turn 1. NB side_effect IS the factory (not its
+        # result) so it receives create_agent's real kwargs — the job's
+        # session id.
+        mock_create.side_effect = self._hunt_spending_graph(
+            captured, [(100, 20)], 1_000_000
+        )
+
+        result = OperatorAgent(
+            OperatorConfig(goals=["g"], target="10.0.0.1", cost_limit=1.0)
+        ).run()
+
+        assert result.status == "cost_limit"
+        # The limit tripped only because the hunt's $3.0 counted.
+        assert result.cost_usd == pytest.approx(3.0 + 0.0006)
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_result_cost_includes_hunt_spend(self, mock_create, mock_create_llm, mock_decide):
+        mock_create_llm.return_value = MagicMock()
+        mock_decide.return_value = "GOALS_COMPLETE"
+
+        captured: dict = {}
+        mock_create.side_effect = self._hunt_spending_graph(captured, [(100, 20)], 200_000)
+
+        result = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+
+        assert result.status == "completed"
+        # $0.0006 (inner call) + 200k * $3/M = $0.6 (hunt) — the result
+        # field reports the job's whole spend, not just the graph's.
+        assert result.cost_usd == pytest.approx(0.0006 + 0.6)
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_result_tokens_include_hunt_spend(self, mock_create, mock_create_llm, mock_decide):
+        """PR #44 review P2: tokens_used mirrors cost attribution.
+
+        Hunt tokens are recorded against the job's session id (the cost
+        field already picks them up), but tokens_used used to read only the
+        inner graph's state — the job reported full cost next to a token
+        count missing the pipeline's main workload.
+        """
+        mock_create_llm.return_value = MagicMock()
+        mock_decide.return_value = "GOALS_COMPLETE"
+
+        captured: dict = {}
+        mock_create.side_effect = self._hunt_spending_graph(captured, [(100, 20)], 200_000)
+
+        result = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+
+        assert result.status == "completed"
+        # 200k hunt input tokens + the inner call's (100, 20) — not the
+        # graph-state 120 alone.
+        assert result.tokens_used == 200_000 + 120
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_job_session_entry_forgotten_after_run(
+        self, mock_create, mock_create_llm, mock_decide
+    ):
+        """PR #44 review P2: the job's session entry must be retired.
+
+        Operator ids are uuid4().hex[:8]; in a long-lived process a
+        colliding id would inherit this job's spend. arun() now forgets
+        the entry on completion — the RESULT still reports the spend.
+        """
+        from clearwing.observability.telemetry import CostTracker
+
+        mock_create_llm.return_value = MagicMock()
+        mock_decide.return_value = "GOALS_COMPLETE"
+
+        captured: dict = {}
+        mock_create.side_effect = self._hunt_spending_graph(captured, [(100, 20)], 200_000)
+
+        result = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+
+        assert result.status == "completed"
+        assert result.cost_usd == pytest.approx(0.0006 + 0.6)
+        # But the tracker no longer holds an entry for the job's id.
+        job_session_id = captured["session_id"]
+        assert CostTracker().session_total(job_session_id) == 0.0
+        assert CostTracker().session_tokens(job_session_id) == (0, 0)
+
+
+class TestSupervisorUsageAccounting:
+    """PR #44 review P1: the operator LLM's own calls must be booked.
+
+    ``_adecide_next`` calls ``operator_llm.aask_text()`` every turn, but
+    ``session_scope`` only attributes calls the runtime books — the
+    supervisor's usage was invisible to the session total, so the cost
+    limit and result ignored a potentially expensive operator_model.
+    """
+
+    @staticmethod
+    def _fake_operator_llm(first_text: str, prompt_tokens: int, completion_tokens: int):
+        from types import SimpleNamespace
+
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=None,
+        )
+
+        class _Client:
+            model_name = "claude-opus-4-6"
+            provider_name = "anthropic"
+
+            async def aask_text(self, **kwargs):
+                del kwargs
+                return SimpleNamespace(
+                    first_text=first_text, texts=[first_text], usage=usage
+                )
+
+        return _Client()
+
+    @patch("clearwing.agent.operator._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_supervisor_spend_counts_toward_cost_limit(self, mock_create, mock_create_llm):
+        # NB: patch operator's OWN _create_llm binding — the module imports
+        # the name from graph, so patching graph._create_llm would leave the
+        # real client (and this host's config.yaml endpoint) in play.
+        mock_graph = TestOperatorRun._make_mock_graph(["scanning..."])
+        mock_create.return_value = mock_graph
+        # Opus supervisor: 1M input + 100 output = $15 + $0.0075 = $15.0075.
+        mock_create_llm.return_value = self._fake_operator_llm(
+            "Continue with the next goal.", 1_000_000, 100
+        )
+
+        result = OperatorAgent(
+            OperatorConfig(goals=["g"], target="10.0.0.1", cost_limit=5.0)
+        ).run()
+
+        # Turn 1 runs; the supervisor decision is booked; the loop's SECOND
+        # limit check must trip on the supervisor spend alone.
+        assert result.status == "cost_limit"
+        assert result.cost_usd == pytest.approx(15.0075)  # beats state's 0.01
+        assert result.tokens_used == 1_000_100  # beats state's 100

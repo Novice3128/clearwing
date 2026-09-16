@@ -113,15 +113,57 @@ FLAG_PATTERNS = [
     re.compile(r"FLAG\{[^}]+\}"),
     re.compile(r"HTB\{[^}]+\}"),
     re.compile(r"CTF\{[^}]+\}"),
-    re.compile(r"[A-Fa-f0-9]{32}"),
+    # Hex-boundary lookaround (issue #35): a bare 32-hex class matched any
+    # window of longer hex strings — a 64-hex container id scanned as TWO
+    # "flags". Every window of a longer hex run has a hex neighbour, so the
+    # lookarounds reject them all while a standalone 32-hex (MD5-style
+    # flag) still matches.
+    re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32}(?![A-Fa-f0-9])"),
 ]
+
+# Identifier fields embedded in structured tool results — bookkeeping, not
+# CTF loot. Masked before flag scanning so long hex ids (container ids,
+# image digests, ...) can never register as flags (issue #35).
+_FLAG_SCAN_EXEMPT_KEYS = frozenset(
+    {
+        "container_id",
+        "kali_container_id",
+        "image_id",
+        "sandbox_id",
+        "session_id",
+        "checkpoint_id",
+        "run_id",
+        "request_id",
+        "trace_id",
+    }
+)
+
+
+def _strip_id_fields(data: Any) -> Any:
+    """Recursively replace known identifier values with a placeholder."""
+    if isinstance(data, dict):
+        return {
+            key: ("<id>" if key in _FLAG_SCAN_EXEMPT_KEYS else _strip_id_fields(value))
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [_strip_id_fields(item) for item in data]
+    return data
 
 
 def detect_flags(text: str) -> list[dict[str, str]]:
-    flags = []
+    flags: list[dict[str, str]] = []
+    seen: set[str] = set()
     for pattern in FLAG_PATTERNS:
         for match in pattern.finditer(text):
-            flags.append({"flag": match.group(), "pattern": pattern.pattern})
+            flag = match.group()
+            # Cross-pattern dedup, order-preserving (issue #35): the
+            # case-insensitive flag{} pattern and the exact-case FLAG{}
+            # pattern both fire on the same capture.
+            if flag in seen:
+                continue
+            seen.add(flag)
+            flags.append({"flag": flag, "pattern": pattern.pattern})
     return flags
 
 
@@ -230,6 +272,16 @@ class NativeAgentGraph:
         # _merge_input copies arbitrary input keys into state, so a state
         # key could be clobbered to re-grant the budget (issue #23).
         self._loop_counters: dict[str, dict[str, int]] = {}
+        # Per-graph cost/token accumulation (issue #37). The CostTracker is
+        # a process-wide singleton, so its running totals pool EVERY session
+        # and operator job in the process — writing them into state made
+        # each job report the cross-job total. Accumulate on the instance
+        # instead (like _loop_counters, deliberately NOT state: _merge_input
+        # copies arbitrary input keys into state): webui graphs live one per
+        # session, operator jobs build one graph per job, so instance totals
+        # are per-session/per-job by construction. The global tracker stays
+        # for process-level observation only.
+        self._cost_totals: dict[str, float] = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
 
         self.cost_tracker = (
             CostTracker() if enable_cost_tracker and capabilities.has("telemetry") else None
@@ -488,7 +540,71 @@ class NativeAgentGraph:
             )
             if should:
                 try:
-                    messages = await self.context_summarizer.summarize(messages, self.llm)
+                    # Compaction is committed to state (issue #38): the
+                    # covered messages leave the history and the summary
+                    # text/coverage persist, so the next step lands under
+                    # the threshold again instead of re-running (and
+                    # re-billing) a fresh LLM summary on every step.
+                    pre_compaction = len(messages)
+                    result = await self.context_summarizer.summarize(
+                        messages,
+                        self.llm,
+                        prior=state.get("context_summary"),
+                        prompt_cache_key=self.session_id or None,
+                    )
+                    if result["view"] is not messages:
+                        state["messages"] = result["view"]
+                        messages = list(result["view"])
+                    state["context_summary"] = {
+                        "text": result["text"],
+                        "covered_count": result["covered_count"],
+                    }
+                    # The summary LLM call is real spend: book its usage
+                    # like a main-loop call (tracker + instance totals +
+                    # state) so cost limits and result totals see it — the
+                    # usage used to ride on a discarded response object.
+                    summary_usage = result.get("usage")
+                    if summary_usage and (
+                        summary_usage.get("input_tokens") or summary_usage.get("output_tokens")
+                    ):
+                        s_input = int(summary_usage.get("input_tokens") or 0)
+                        s_output = int(summary_usage.get("output_tokens") or 0)
+                        s_cached = int(summary_usage.get("cached_tokens") or 0)
+                        summary_cost = 0.0
+                        if self.cost_tracker:
+                            summary_cost = self.cost_tracker.record_llm_call(
+                                s_input,
+                                s_output,
+                                # Same pricing attribution as the main loop:
+                                # the client's resolved model, else the
+                                # graph's label.
+                                getattr(self.llm, "model_name", None)
+                                or self.model_name,
+                                cached_tokens=s_cached,
+                                provider=getattr(self.llm, "provider_name", None),
+                                session_id=self.session_id,
+                            )
+                        self._cost_totals["cost_usd"] += summary_cost
+                        self._cost_totals["input_tokens"] += s_input
+                        self._cost_totals["output_tokens"] += s_output
+                        state["total_cost_usd"] = self._cost_totals["cost_usd"]
+                        state["total_tokens"] = (
+                            self._cost_totals["input_tokens"]
+                            + self._cost_totals["output_tokens"]
+                        )
+                    if self.event_bus and len(result["view"]) < pre_compaction:
+                        # Only announce ACTUAL compaction: when nothing was
+                        # newly coverable the view is unchanged and a
+                        # "context summarized" event would mislead operators
+                        # (and spam the transcript on every step past the
+                        # threshold).
+                        self.event_bus.emit_message(
+                            (
+                                f"context summarized: history compacted "
+                                f"({result['covered_count']} messages covered by summary)"
+                            ),
+                            "system",
+                        )
                 except Exception:
                     logger.debug("Context summarization failed", exc_info=True)
 
@@ -509,6 +625,20 @@ class NativeAgentGraph:
         # per-step context note is appended after the breakpoint and never
         # cached. Both are inert on providers without caching.
         context_note = self.dynamic_context_fn(state) if self.dynamic_context_fn else None
+        # The session summary rides in the same post-breakpoint tail
+        # (issue #38): injecting it into the message history — or worse,
+        # the system prompt — would mutate the cacheable prefix on every
+        # re-summarization. As a tail note it is byte-stable between
+        # re-summarizations, so the prefix stays a cache hit.
+        if self.context_summarizer:
+            summary_state = state.get("context_summary") or {}
+            summary_text = summary_state.get("text") or ""
+            if summary_text:
+                summary_block = self.context_summarizer.summary_note(summary_text)
+                context_note = (
+                    "\n\n".join(part for part in (summary_block, context_note) if part)
+                    or None
+                )
         response = await self.llm.achat_stream(
             messages=chat_messages,
             system=system,
@@ -567,20 +697,29 @@ class NativeAgentGraph:
         )
         state.setdefault("messages", []).append(ai_message)
 
-        if self.cost_tracker and (input_tokens or output_tokens):
-            call_cost = self.cost_tracker.record_llm_call(
-                input_tokens,
-                output_tokens,
-                pricing_model,
-                cached_tokens=cached_tokens,
-                provider=provider_name,
-                session_id=self.session_id,
+        if input_tokens or output_tokens:
+            call_cost = 0.0
+            if self.cost_tracker:
+                call_cost = self.cost_tracker.record_llm_call(
+                    input_tokens,
+                    output_tokens,
+                    pricing_model,
+                    cached_tokens=cached_tokens,
+                    provider=provider_name,
+                    session_id=self.session_id,
+                )
+            # Instance totals (issue #37): state must report THIS graph's
+            # spend, not the tracker's cross-session/cross-job running total.
+            self._cost_totals["cost_usd"] += call_cost
+            self._cost_totals["input_tokens"] += input_tokens
+            self._cost_totals["output_tokens"] += output_tokens
+            state["total_cost_usd"] = self._cost_totals["cost_usd"]
+            state["total_tokens"] = (
+                self._cost_totals["input_tokens"] + self._cost_totals["output_tokens"]
             )
-            state["total_cost_usd"] = self.cost_tracker.total_cost_usd
-            state["total_tokens"] = self.cost_tracker.input_tokens + self.cost_tracker.output_tokens
-            if self.audit_logger:
-                # Per-call cost, not the tracker's process-wide running total:
-                # the cumulative value double-counts when audit rows are
+            if self.audit_logger and self.cost_tracker:
+                # Per-call cost, not the graph's running total: the
+                # cumulative value double-counts when audit rows are
                 # summed per session (issue #10 live evidence).
                 self.audit_logger.log_llm_call(
                     model=effective_model,
@@ -760,7 +899,16 @@ class NativeAgentGraph:
             for key, value in extra_updates.items():
                 state[key] = value
 
-            found_flags = detect_flags(content)
+            # Flag scan (issue #35): structured tool results embed long hex
+            # identifiers (container ids, ...) that must not count as loot.
+            # The hex-boundary pattern stops windows inside longer hex runs,
+            # and known id fields are masked before scanning the serialized
+            # form so a bare 32-hex id value can't pose as an MD5 flag.
+            if isinstance(data, (dict, list)):
+                scan_text = json.dumps(_strip_id_fields(data), default=str)
+            else:
+                scan_text = content
+            found_flags = detect_flags(scan_text)
             if found_flags:
                 new_flags.extend(found_flags)
 
@@ -825,6 +973,13 @@ class NativeAgentGraph:
         for key, value in input_data.items():
             if key == "messages":
                 state.setdefault("messages", []).extend(value)
+            elif key == "context_summary":
+                # Runtime-owned key: this is the committed compaction state
+                # (issue #38). An input frame carrying it — e.g. a replayed
+                # start frame — would overwrite the live summary state and
+                # make the runtime believe already-dropped history is still
+                # covered, silently losing context. Input may not set it.
+                continue
             else:
                 state[key] = value
 

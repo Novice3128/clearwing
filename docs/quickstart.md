@@ -67,10 +67,11 @@ Scan a specific port range with service detection:
 clearwing scan 192.168.1.10 -p 22,80,443,8080 --detect-services
 ```
 
-Scan a whole CIDR in parallel:
+Scan a whole CIDR in parallel (each block expands to at most 32 hosts;
+larger blocks are rejected — enumerate them explicitly):
 
 ```bash
-clearwing parallel 192.168.1.0/24 --max-concurrent 10
+clearwing parallel 192.168.1.0/27 --max-parallel 10
 ```
 
 Results are persisted to a SQLite DB at `~/.clearwing/clearwing.db`.

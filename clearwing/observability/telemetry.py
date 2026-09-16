@@ -166,6 +166,20 @@ class CostTracker:
         self.tool_calls: int = 0
         self.by_tool: dict[str, ToolUsage] = {}
         self.cost_limit: float | None = None
+        # Per-session cost accumulation (operator cost_limit follow-up to
+        # issue #41): the global totals pool every session in the process,
+        # but an operator job's limit check and result cost must see only
+        # ITS spend — the inner graph's calls plus hunts attributed to the
+        # job's session id. Keyed by the session_id passed to
+        # record_llm_call; updated under the same lock as the global
+        # counters (single-key dict add is what the GIL makes safe anyway).
+        self._session_totals: dict[str, float] = {}
+        # Parallel per-session token totals, (input, output). Kept in a
+        # parallel dict so session_total()'s float contract stays
+        # unchanged; read via session_tokens() so callers (operator result
+        # fields) can report attributed token volume next to attributed
+        # cost (PR #44 review).
+        self._session_tokens: dict[str, tuple[int, int]] = {}
         self._initialized = True
 
     # ------------------------------------------------------------------
@@ -193,8 +207,10 @@ class CostTracker:
         ``elapsed_ms`` (wall-clock latency of the call), ``provider`` and
         ``session_id`` are optional; when supplied they ride along in the
         ``COST_UPDATE`` payload for UI and metrics consumers — ``session_id``
-        lets scoped consumers attribute the call to a session. Keyword-only
-        to keep call sites explicit and future additions non-breaking.
+        lets scoped consumers attribute the call to a session, and also
+        accumulates a per-session cost total queryable via
+        :meth:`session_total`. Keyword-only to keep call sites explicit and
+        future additions non-breaking.
         """
         cost = self.estimate_cost(input_tokens, output_tokens, model, cached_tokens)
 
@@ -202,6 +218,15 @@ class CostTracker:
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
             self.total_cost_usd += cost
+            if session_id:
+                self._session_totals[session_id] = (
+                    self._session_totals.get(session_id, 0.0) + cost
+                )
+                prev_in, prev_out = self._session_tokens.get(session_id, (0, 0))
+                self._session_tokens[session_id] = (
+                    prev_in + input_tokens,
+                    prev_out + output_tokens,
+                )
 
         try:
             EventBus().emit(
@@ -232,6 +257,51 @@ class CostTracker:
             usage.calls += 1
             usage.total_duration_ms += duration_ms
 
+    def session_total(self, session_id: str | None) -> float:
+        """Cumulative USD recorded for *session_id* (0.0 when unattributed).
+
+        Every ``record_llm_call`` carrying a ``session_id`` accumulates here:
+        the runtime attributes each assistant step to its graph's session,
+        and operator jobs wrap their whole loop in a ``session_scope`` so
+        spawned hunts land on the job's id too. Operators use this (not the
+        graph's state total) for cost limits and result fields, so hunt
+        spend is enforced/reported instead of invisible.
+        """
+        if not session_id:
+            return 0.0
+        with self._lock:
+            return self._session_totals.get(session_id, 0.0)
+
+    def session_tokens(self, session_id: str | None) -> tuple[int, int]:
+        """``(input, output)`` token totals recorded for *session_id*.
+
+        Same attribution set as :meth:`session_total`: every
+        ``record_llm_call`` carrying the id accumulates here, so callers
+        that report session-scoped cost (operator result fields) can report
+        the matching token volume — including spend booked outside the
+        graph state (hunts, supervisor calls).
+        """
+        if not session_id:
+            return (0, 0)
+        with self._lock:
+            return self._session_tokens.get(session_id, (0, 0))
+
+    def forget_session(self, session_id: str | None) -> None:
+        """Drop *session_id*'s per-session cost/token entries.
+
+        Webui and operator session ids are 8-hex UUID prefixes; in a
+        long-lived process a colliding id would inherit the earlier
+        session's spend (bogus cost limits and inflated result cost).
+        Owners call this on session teardown. Unknown ids are a no-op;
+        global counters are untouched (process-wide totals keep every
+        call).
+        """
+        if not session_id:
+            return
+        with self._lock:
+            self._session_totals.pop(session_id, None)
+            self._session_tokens.pop(session_id, None)
+
     def get_summary(self) -> CostSummary:
         """Return a point-in-time snapshot of all tracked metrics."""
         with self._lock:
@@ -258,3 +328,5 @@ class CostTracker:
             self.total_cost_usd = 0.0
             self.tool_calls = 0
             self.by_tool = {}
+            self._session_totals = {}
+            self._session_tokens = {}

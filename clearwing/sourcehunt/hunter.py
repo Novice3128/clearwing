@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from clearwing.agent.tooling import current_session_id
 from clearwing.agent.tools.hunt import (
     HunterContext,
     build_deep_agent_tools,
@@ -1548,6 +1549,10 @@ class NativeHunter:
     max_repeated_skips: int = 15  # hard cap on total skipped degenerate-loop calls before giving up
     lead_checkpoint_calls: int = 4
     summarizer: ContextSummarizer | None = field(default=None)
+    # Running summary state (issue #38): {"text": str, "covered_count": int}.
+    # The text is re-injected after the cache breakpoint (context-note tail)
+    # instead of riding inside the message history.
+    context_summary: dict[str, object] | None = field(default=None)
 
     def _should_stop(self, step: int, cost_usd: float) -> str | None:
         """Return a stop reason string, or None to continue."""
@@ -1733,10 +1738,66 @@ class NativeHunter:
             with spend_metadata(model_call_id=model_call_id):
                 if self.summarizer and self.summarizer.should_summarize(messages):
                     pre = len(messages)
-                    messages = await self.summarizer.summarize(messages, self.llm)
+                    # Compaction is committed to the local history and the
+                    # summary text persists (issue #38): the note rides after
+                    # the cache breakpoint, so the surviving prefix stays a
+                    # cache hit between re-summarizations.
+                    result = await self.summarizer.summarize(
+                        messages,
+                        self.llm,
+                        prior=self.context_summary,
+                        prompt_cache_key=(
+                            f"{self.ctx.session_id or ''}:{self.ctx.work_item_id or ''}"
+                        ),
+                    )
+                    messages = result["view"]
+                    self.context_summary = {
+                        "text": result["text"],
+                        "covered_count": result["covered_count"],
+                    }
+                    # The summary call is real spend: add its usage to the
+                    # hunt totals and the attributed CostTracker record —
+                    # same attribution id as the main calls below.
+                    summary_usage = result.get("usage")
+                    if summary_usage and (
+                        summary_usage.get("input_tokens") or summary_usage.get("output_tokens")
+                    ):
+                        s_in = int(summary_usage.get("input_tokens") or 0)
+                        s_out = int(summary_usage.get("output_tokens") or 0)
+                        s_cached = int(summary_usage.get("cached_tokens") or 0)
+                        total_cost_usd += _estimate_cost_usd(
+                            s_in, s_out, self.llm.model_name, s_cached
+                        )
+                        # Token totals must move with the cost (PR #44
+                        # review P2): the summary call's usage used to
+                        # reach total_cost_usd but not the token counters,
+                        # so HunterRunResult.tokens_used and pool/run
+                        # aggregates under-counted vs cost.
+                        total_input_tokens += s_in
+                        total_output_tokens += s_out
+                        CostTracker().record_llm_call(
+                            s_in,
+                            s_out,
+                            self.llm.model_name,
+                            cached_tokens=s_cached,
+                            provider=getattr(self.llm, "provider_name", None),
+                            session_id=current_session_id() or self.ctx.session_id,
+                        )
                     visible_read_ranges.clear()
                     overlapping_refreshes.clear()
-                    logger.info("Hunter context summarized: %d → %d messages", pre, len(messages))
+                    if len(messages) < pre:
+                        # Announce only ACTUAL compaction: an unchanged view
+                        # (nothing newly coverable) is not a summary event.
+                        logger.info(
+                            "Hunter context summarized: %d → %d messages",
+                            pre,
+                            len(messages),
+                        )
+                summary_note = None
+                if self.summarizer and self.context_summary and self.context_summary.get("text"):
+                    summary_note = self.summarizer.summary_note(
+                        str(self.context_summary["text"])
+                    )
 
                 provider_name = getattr(self.llm, "provider_name", None)
                 active_tools = [] if final_synthesis_turn else self.tools
@@ -1766,6 +1827,9 @@ class NativeHunter:
                     prompt_cache_key=(
                         f"{self.ctx.session_id or ''}:{self.ctx.work_item_id or ''}"
                     ),
+                    # Post-breakpoint tail (issue #38): the session summary
+                    # must never ride inside the cacheable prefix.
+                    context_note=summary_note,
                 )
                 input_tokens = response.usage.prompt_tokens or 0
                 output_tokens = response.usage.completion_tokens or 0
@@ -1812,13 +1876,14 @@ class NativeHunter:
             total_cost_usd += call_cost
             # Keep process-wide cost/UI metrics separate from the OTel span,
             # which is emitted directly around the model request above.
-            # NB: no session_id here on purpose. Hunts run under their own
-            # sh-* session id (SourceHuntRunner), not the invoking webui
-            # session's — attributing the hunt id would make scoped webui
-            # consumers DROP these frames as foreign (Codex PR-39/40).
-            # Unscoped frames accumulate in whatever session has an active
-            # turn; proper parent-session attribution needs its own
-            # plumbing (see follow-up issue).
+            # Attribution (issue #41): when the hunt was spawned from an
+            # interactive session (ambient contextvar set by the webui turn
+            # or an operator job), charge that parent session so its scoped
+            # footer/report includes the hunt spend. Standalone hunts fall
+            # back to their own sh-* execution id, which scoped webui
+            # consumers drop as foreign instead of mis-crediting whichever
+            # session happens to have an active turn. The sh-* id still keys
+            # outputs/execution semantics; only billing attribution changes.
             if input_tokens or output_tokens:
                 CostTracker().record_llm_call(
                     input_tokens,
@@ -1826,6 +1891,7 @@ class NativeHunter:
                     self.llm.model_name,
                     cached_tokens=cached_tokens,
                     provider=provider_name,
+                    session_id=current_session_id() or self.ctx.session_id,
                 )
 
             last_assistant_text = response.first_text or ""

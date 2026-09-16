@@ -1,5 +1,7 @@
 """Tests for the agent graph updates — flag detection, state expansion, guardrail integration."""
 
+import json
+
 from clearwing.agent.prompts import build_dynamic_context, build_system_prompt
 from clearwing.agent.runtime import FLAG_PATTERNS, detect_flags
 from clearwing.agent.state import AgentState
@@ -69,6 +71,39 @@ class TestFlagDetection:
 
     def test_flag_patterns_count(self):
         assert len(FLAG_PATTERNS) >= 4
+
+    def test_64_hex_container_id_is_not_two_flags(self):
+        # Issue #35: a 64-hex container id used to match the bare 32-hex
+        # pattern twice (finditer windows) and inflate flags_found.
+        container_id = "a" * 64
+        flags = detect_flags(f'{{"container_id": "{container_id}"}}')
+        assert flags == []
+
+    def test_standalone_32_hex_still_matches(self):
+        flags = detect_flags("Hash: d41d8cd98f00b204e9800998ecf8427e")
+        assert [f["flag"] for f in flags] == ["d41d8cd98f00b204e9800998ecf8427e"]
+
+    def test_cross_pattern_duplicates_are_deduped(self):
+        # "FLAG{...}" matches both the case-insensitive flag{} pattern and
+        # the exact-case FLAG{} pattern — one capture, one entry.
+        flags = detect_flags("Got FLAG{UPPERCASE_FLAG}")
+        assert [f["flag"] for f in flags] == ["FLAG{UPPERCASE_FLAG}"]
+
+    def test_structured_tool_output_with_container_id_yields_no_flag(self):
+        # Issue #35: kali tools return {"container_id": <64-hex>}; the
+        # tool-scan path masks known id fields before scanning, so the id
+        # never pollutes flags_found (while real loot still matches).
+        from clearwing.agent.runtime import _strip_id_fields
+
+        payload = {
+            "container_id": "f" * 64,
+            "kali_container_id": "e" * 64,
+            "nested": [{"image_id": "d" * 64, "note": "clean"}],
+            "output": "flag{real_loot_1}",
+        }
+        scan_text = json.dumps(_strip_id_fields(payload))
+        flags = detect_flags(scan_text)
+        assert [f["flag"] for f in flags] == ["flag{real_loot_1}"]
 
 
 class TestGetAllTools:

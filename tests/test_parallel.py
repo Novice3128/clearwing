@@ -170,3 +170,99 @@ class TestParallelExecutorScanTarget:
         assert result.target == "10.0.0.1"
         assert result.status == "cancelled"
         assert "Total cost limit reached" in result.error
+
+
+class TestParallelCliTargetExpansion:
+    """Issue #14: `parallel --targets` now expands small CIDR blocks
+    instead of passing them through as broken "hostnames"."""
+
+    def test_cidr_expands_to_hosts(self):
+        from clearwing.ui.commands.parallel import _expand_cidr_target
+
+        expanded = _expand_cidr_target("192.168.1.0/30")
+        assert expanded == ["192.168.1.1", "192.168.1.2"]
+
+    def test_plain_ip_and_hostname_pass_through(self):
+        from clearwing.ui.commands.parallel import _expand_cidr_target
+
+        assert _expand_cidr_target("10.0.0.5") is None
+        assert _expand_cidr_target("example.com") is None
+
+    def test_oversized_block_returns_empty_for_rejection(self):
+        from clearwing.ui.commands.parallel import _expand_cidr_target
+
+        assert _expand_cidr_target("10.0.0.0/8") == []
+
+    def test_huge_blocks_rejected_fast_without_materializing(self):
+        """The cap check must short-circuit BEFORE iterating hosts().
+
+        10.0.0.0/8 materialized 16M strings (~26s / 1.2GB) and 0.0.0.0/0
+        would OOM before the old length check could reject. num_addresses
+        is O(1), so both must be refused in well under a second.
+        """
+        import time
+
+        from clearwing.ui.commands.parallel import _expand_cidr_target
+
+        for block in ("10.0.0.0/8", "0.0.0.0/0", "2000::/3"):
+            start = time.monotonic()
+            assert _expand_cidr_target(block) == []
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0, f"{block} took {elapsed:.2f}s to reject"
+
+    def test_boundary_block_at_cap_still_expands(self):
+        # /27 = 30 usable hosts — at the cap, allowed.
+        from clearwing.ui.commands.parallel import _expand_cidr_target
+
+        expanded = _expand_cidr_target("192.168.1.0/27")
+        assert len(expanded) == 30
+        assert expanded[0] == "192.168.1.1"
+
+    def test_handle_expands_and_rejects_oversized(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from clearwing.ui.commands import parallel as parallel_cmd
+
+        seen: dict = {}
+
+        class _FakeExecutor:
+            def __init__(self, config):
+                seen["targets"] = list(config.targets)
+
+            def run(self):
+                return []
+
+            def get_summary(self):
+                return "summary"
+
+        monkeypatch.setattr(
+            "clearwing.runners.parallel.ParallelExecutor", _FakeExecutor
+        )
+
+        class _Console:
+            def print(self, *args, **kwargs):
+                seen.setdefault("printed", []).append(str(args))
+
+        args = SimpleNamespace(
+            targets="10.0.0.0/30,10.0.0.9",
+            max_parallel=2,
+            depth="quick",
+            cost_limit=None,
+            timeout=1,
+            model="m",
+            base_url=None,
+            api_key=None,
+        )
+        import pytest
+
+        with pytest.raises(SystemExit) as excinfo:
+            parallel_cmd.handle(SimpleNamespace(console=_Console()), args)
+        assert excinfo.value.code == 0  # clean exit after a successful run
+        assert seen["targets"] == ["10.0.0.1", "10.0.0.2", "10.0.0.9"]
+
+        with pytest.raises(SystemExit) as excinfo:
+            parallel_cmd.handle(
+                SimpleNamespace(console=_Console()),
+                SimpleNamespace(**{**vars(args), "targets": "10.0.0.0/8"}),
+            )
+        assert excinfo.value.code == 1  # oversized block rejected
