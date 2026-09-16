@@ -104,6 +104,36 @@ class TestSessionStore:
         assert isinstance(loaded.end_time, datetime)
         assert loaded.end_time.year == 2025
 
+    def test_deferred_session_row_gets_resolved_model(self):
+        """#28: interactive sessions created with model="" (defer to config)
+        must carry the graph's resolved model once it exists."""
+        from types import SimpleNamespace
+
+        from clearwing.ui.commands.interactive import _sync_session_model
+
+        session = self.store.create("10.0.0.1", model="")
+        graph = SimpleNamespace(llm=SimpleNamespace(model_name="glm-5.3"))
+        _sync_session_model(session, graph)
+        assert session.model == "glm-5.3"
+        self.store.save(session)
+        assert self.store.load(session.session_id).model == "glm-5.3"
+
+    def test_sync_session_model_noops(self):
+        from types import SimpleNamespace
+
+        from clearwing.ui.commands.interactive import _sync_session_model
+
+        # No session → nothing to do; graph without an llm/model_name or an
+        # unchanged model must not fabricate or clobber values.
+        _sync_session_model(None, SimpleNamespace(llm=SimpleNamespace(model_name="m")))
+        session = self.store.create("10.0.0.1", model="kimi-k2")
+        _sync_session_model(session, object())
+        assert session.model == "kimi-k2"
+        _sync_session_model(
+            session, SimpleNamespace(llm=SimpleNamespace(model_name="kimi-k2"))
+        )
+        assert session.model == "kimi-k2"
+
 
 # =========================================================================
 # EpisodicMemory

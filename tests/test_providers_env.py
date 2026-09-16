@@ -43,6 +43,94 @@ def clean_env(monkeypatch):
 # --- Precedence: CLI flags win over everything ----------------------------
 
 
+class TestPerFieldMerge:
+    """Issues #8/#16/#28: base_url / model / api_key merge per field, so a
+    partially-filled CLI (or webui start frame) defers its missing fields
+    to the tiers below instead of shadowing the configured provider."""
+
+    CONFIG = {
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "sk-or-config",
+        "model": "anthropic/claude-opus-4",
+    }
+
+    def test_cli_base_url_plus_config_model(self, clean_env):
+        # #8: `--base-url` alone used to guess the model from the hostname
+        # and drop the configured api_key; per-field it only overrides its
+        # own field.
+        ep = resolve_llm_endpoint(
+            cli_base_url="https://api.deepseek.com/v1",
+            config_provider=self.CONFIG,
+        )
+        assert ep.provider == "openai_compat"
+        assert ep.base_url == "https://api.deepseek.com/v1"
+        assert ep.model == "anthropic/claude-opus-4"
+        assert ep.api_key == "sk-or-config"
+        assert ep.source == "cli"
+
+    def test_cli_api_key_plus_config_endpoint(self, clean_env):
+        ep = resolve_llm_endpoint(
+            cli_api_key="sk-override",
+            config_provider=self.CONFIG,
+        )
+        assert ep.base_url == "https://openrouter.ai/api/v1"
+        assert ep.model == "anthropic/claude-opus-4"
+        assert ep.api_key == "sk-override"
+        assert ep.source == "cli"
+
+    def test_cli_model_plus_config_credentials(self, clean_env, monkeypatch):
+        """#8's core regression: `--model X` used to route the whole triple
+        to Anthropic direct (ignoring the configured endpoint); per-field it
+        only swaps the model on the configured endpoint."""
+        monkeypatch.delenv(ENV_ANTHROPIC_KEY, raising=False)
+        ep = resolve_llm_endpoint(
+            cli_model="anthropic/claude-haiku-4-5",
+            config_provider=self.CONFIG,
+        )
+        assert ep.provider == "openai_compat"
+        assert ep.base_url == "https://openrouter.ai/api/v1"
+        assert ep.model == "anthropic/claude-haiku-4-5"
+        assert ep.api_key == "sk-or-config"
+
+    def test_env_base_url_plus_config_model(self, clean_env, monkeypatch):
+        monkeypatch.setenv(ENV_BASE_URL, "https://api.deepseek.com/v1")
+        ep = resolve_llm_endpoint(config_provider=self.CONFIG)
+        assert ep.base_url == "https://api.deepseek.com/v1"
+        assert ep.model == "anthropic/claude-opus-4"
+        assert ep.source == "env"
+
+    def test_env_model_plus_config_credentials(self, clean_env, monkeypatch):
+        """CLEARWING_MODEL with a configured endpoint stays on that
+        endpoint (previously a special-cased inherit; now plain per-field)."""
+        monkeypatch.setenv(ENV_MODEL, "glm-5.3")
+        ep = resolve_llm_endpoint(config_provider=self.CONFIG)
+        assert ep.base_url == "https://openrouter.ai/api/v1"
+        assert ep.model == "glm-5.3"
+        assert ep.api_key == "sk-or-config"
+
+    def test_empty_cli_fields_count_as_unset(self, clean_env):
+        """A start frame's `model: ""` must defer, not shadow the config."""
+        ep = resolve_llm_endpoint(
+            cli_model="",
+            cli_base_url="   ",
+            config_provider=self.CONFIG,
+        )
+        assert ep.base_url == "https://openrouter.ai/api/v1"
+        assert ep.model == "anthropic/claude-opus-4"
+        assert ep.source == "config"
+
+    def test_config_adapter_does_not_follow_overridden_base_url(self, clean_env):
+        ep = resolve_llm_endpoint(
+            cli_base_url="https://api.deepseek.com/v1",
+            config_provider={**self.CONFIG, "adapter": "openai_resp"},
+        )
+        assert ep.adapter is None
+
+    def test_config_adapter_survives_when_base_url_unmatched(self, clean_env):
+        ep = resolve_llm_endpoint(config_provider={**self.CONFIG, "adapter": "openai_resp"})
+        assert ep.adapter == "openai_resp"
+
+
 class TestCLIPrecedence:
     def test_cli_base_url_routes_to_openai_compat(self, clean_env, monkeypatch):
         monkeypatch.setenv(ENV_ANTHROPIC_KEY, "sk-anthropic-ignored")

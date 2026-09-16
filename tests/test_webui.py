@@ -510,6 +510,34 @@ class TestAgentSessionFlow:
             assert captured["model_name"] is None
             assert captured["model_explicit"] is False
 
+    def test_start_frame_partial_credentials_defer_model(self, client, monkeypatch):
+        """#16: credentials without a model must defer the model to
+        config/env resolution (per-field merge) instead of letting the
+        credential branch guess one from the base_url hostname."""
+        captured: dict = {}
+
+        def make_agent(**kwargs):
+            captured.update(kwargs)
+            return _FakeGraph()
+
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", make_agent)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json(
+                {
+                    "type": "start",
+                    "target": "t",
+                    "model": "",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "api_key": "sk-frame",
+                }
+            )
+            started = ws.receive_json()
+            assert started["type"] == "started"
+        assert captured["model_name"] is None
+        assert captured["model_explicit"] is False
+        assert captured["base_url"] == "https://api.deepseek.com/v1"
+        assert captured["api_key"] == "sk-frame"
+
     def test_start_frame_with_non_string_model_is_treated_as_unset(
         self, client, monkeypatch
     ):

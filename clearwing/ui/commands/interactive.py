@@ -159,6 +159,17 @@ def _preflight_check(cli, args) -> bool:
     return True
 
 
+def _sync_session_model(session, graph) -> None:
+    """#28: a deferred model leaves the session row as model="" at creation
+    time; write the graph's resolved model back so /api/sessions and
+    --resume see what actually ran. Mutates only — callers persist the row."""
+    if session is None:
+        return
+    resolved = getattr(getattr(graph, "llm", None), "model_name", None)
+    if resolved and session.model != resolved:
+        session.model = resolved
+
+
 def _run_tui(cli, args, session=None):
     """Launch the Textual TUI."""
     session_id = session.session_id if session else None
@@ -175,6 +186,9 @@ def _run_tui(cli, args, session=None):
     if session:
         try:
             session.status = "completed"
+            # The graph is created inside the TUI's on_mount; mirror its
+            # resolved model into the session row before the final save.
+            _sync_session_model(session, getattr(app, "_agent_graph", None))
             SessionStore().save(session)
         except Exception:
             logger.debug("Failed to save session on TUI exit", exc_info=True)
@@ -198,6 +212,14 @@ def _run_interactive_legacy(cli, args, session=None):
         api_key=getattr(args, "api_key", None),
         model_explicit=getattr(args, "model_explicit", args.model is not None),
     )
+    # #28: persist the resolved model (deferred sessions are created with
+    # model=""); the autosave below and the final save carry it onward.
+    _sync_session_model(session, graph)
+    if session and session.model:
+        try:
+            SessionStore().save(session)
+        except Exception:
+            logger.debug("Failed to persist resolved session model", exc_info=True)
     config = {"configurable": {"thread_id": thread_id}}
 
     initial_state = {
