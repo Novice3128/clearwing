@@ -1823,11 +1823,20 @@ class AsyncLLMClient:
 
     def _usage_from_openai_payload(self, usage: dict[str, Any] | None) -> Usage:
         usage = usage or {}
-        details = usage.get("prompt_tokens_details") or {}
+        # Chat Completions spells these prompt_/completion_tokens; the
+        # Responses API (routed here by _chat_response_from_responses_payload)
+        # uses input_/output_tokens with input_tokens_details.cached_tokens.
+        prompt = usage.get("prompt_tokens")
+        if prompt is None:
+            prompt = usage.get("input_tokens")
+        completion = usage.get("completion_tokens")
+        if completion is None:
+            completion = usage.get("output_tokens")
+        details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
         cached = details.get("cached_tokens")
         return Usage(
-            prompt_tokens=usage.get("prompt_tokens"),
-            completion_tokens=usage.get("completion_tokens"),
+            prompt_tokens=prompt,
+            completion_tokens=completion,
             total_tokens=usage.get("total_tokens"),
             prompt_tokens_details=(
                 PromptTokensDetails(cached_tokens=cached) if cached is not None else None

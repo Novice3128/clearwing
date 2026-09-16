@@ -413,7 +413,9 @@ def create_app():
                        "model": str, "provider": str, "elapsed_ms": int}} —
                        cost/tokens are per call; total_* are session-scoped
                        running totals for this connection while its turn is
-                       active (out-of-turn frames pass through raw)
+                       active (frames attributed to other sessions are not
+                       forwarded here; out-of-turn unscoped frames pass
+                       through raw)
         - Server sends: {"type": "approval_needed", "prompt": "..."}
         - Server sends: {"type": "error", "message": "..."}
         - Server sends: {"type": "stopped", "data": {"cancelled_turn": bool,
@@ -449,18 +451,25 @@ def create_app():
         # (metrics gauges keep reading the process-global totals).
         session_cost = {"cost_usd": 0.0, "tokens": 0}
 
-        def _session_scope_cost_update(data: dict) -> dict:
+        def _session_scope_cost_update(data: dict) -> dict | None:
+            """Returns the frame to enqueue, or None to drop it.
+
+            Outside this session's turn the bus is unattributable
+            (process-wide singleton): unscoped frames pass through raw.
+            Frames carrying ANOTHER session's id never belong on this
+            socket — dropping them keeps a concurrent session's spend from
+            flashing into this session's footer. Emissions without a
+            session id (hunter, older callers) still accumulate while this
+            turn runs.
+            """
             if not turn_state["active"]:
-                # Outside this session's turn the bus is unattributable
-                # (process-wide singleton): pass the frame through untouched.
+                origin = data.get("session_id")
+                if origin is not None and origin != session_id:
+                    return None
                 return data
             origin = data.get("session_id")
             if origin is not None and origin != session_id:
-                # A concurrent session's call in the same process — keep
-                # the frame raw instead of polluting this connection's
-                # totals. Emissions without a session id (hunter, older
-                # callers) still accumulate while this turn runs.
-                return data
+                return None
             call_cost = data.get("cost")
             if isinstance(call_cost, (int, float)):
                 session_cost["cost_usd"] += float(call_cost)
@@ -525,6 +534,10 @@ def create_app():
                             and isinstance(serializable, dict)
                         ):
                             serializable = _session_scope_cost_update(serializable)
+                            if serializable is None:
+                                # A concurrent session's frame — never
+                                # reaches this socket or its transcript.
+                                return
                         message_queue.put_nowait(
                             {"type": event_type_name, "data": serializable}
                         )

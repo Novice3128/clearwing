@@ -78,23 +78,25 @@ class CostTracker:
     def _resolve_pricing(cls, model: str | None) -> dict[str, float] | None:
         """Pricing row for *model*, or None.
 
-        Exact key first, then basename (``org/model`` endpoint-style names),
-        then ``key + "-"`` prefix with the longest key winning — providers
-        echo versioned model names (e.g. ``claude-sonnet-4-6-20260901``)
-        that would otherwise silently bill at the default tier.
+        Case-insensitive: exact key first, then basename (``org/model``
+        endpoint-style names), then ``key + "-"`` prefix with the longest
+        key winning — providers echo versioned model names (e.g.
+        ``claude-sonnet-4-6-20260901``) and mixed-case gateway aliases
+        (``UnCut``) that would otherwise silently bill at the default tier.
         """
         if not isinstance(model, str) or not model.strip():
             return None
         name = model.strip().lower()
-        if name in cls.PRICING:
-            return cls.PRICING[name]
         base = name.rsplit("/", 1)[-1]
-        if base in cls.PRICING:
-            return cls.PRICING[base]
-        for key in sorted(cls.PRICING, key=len, reverse=True):
-            if base.startswith(key + "-"):
-                return cls.PRICING[key]
-        return None
+        best: tuple[int, dict[str, float]] | None = None
+        for key, row in cls.PRICING.items():
+            lowered = key.lower()
+            if lowered == base:
+                return row
+            if base.startswith(lowered + "-"):
+                if best is None or len(lowered) > best[0]:
+                    best = (len(lowered), row)
+        return best[1] if best else None
 
     @classmethod
     def _warn_pricing_fallback(cls, model: str | None) -> None:

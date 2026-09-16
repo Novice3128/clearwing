@@ -832,18 +832,16 @@ class TestCostSessionScoping:
                         break
 
         cost_frames = [f for f in frames if f["type"] == "cost_update"]
-        assert len(cost_frames) == 3
+        # The foreign session's frame never reaches this socket at all —
+        # only this session's two own frames do.
+        assert len(cost_frames) == 2
         # Session-scoped totals replace the tracker's process-global ones.
         assert cost_frames[0]["data"]["total_cost_usd"] == pytest.approx(0.01)
-        # A concurrent session's frame passes through raw instead of
-        # polluting this connection's totals.
-        assert cost_frames[1]["data"]["total_cost_usd"] == pytest.approx(99.02)
-        # ...and this session's accumulation skips it: 0.01 + 0.03.
-        assert cost_frames[2]["data"]["total_cost_usd"] == pytest.approx(0.04)
-        assert cost_frames[2]["data"]["total_tokens"] == 4400
+        assert cost_frames[1]["data"]["total_cost_usd"] == pytest.approx(0.04)
+        assert cost_frames[1]["data"]["total_tokens"] == 4400
         # Per-call fields and attribution ride along untouched.
-        assert cost_frames[2]["data"]["cost"] == 0.03
-        assert cost_frames[2]["data"]["model"] == "glm-5.3"
+        assert cost_frames[1]["data"]["cost"] == 0.03
+        assert cost_frames[1]["data"]["model"] == "glm-5.3"
 
     def test_session_report_carries_scoped_totals(self, client):
         import json
@@ -883,7 +881,7 @@ class TestCostSessionScoping:
                             break
                 # Both rounds start from a fresh budget: each session's
                 # first frame is 0.01/1100, not the previous session's tail.
-                # (3 frames per round: own, foreign pass-through, own.)
+                # (2 frames per round — the foreign frame is dropped.)
                 assert first_costs[0]["data"]["total_cost_usd"] == pytest.approx(0.01)
-                assert first_costs[3]["data"]["total_cost_usd"] == pytest.approx(0.01)
-                assert first_costs[3]["data"]["total_tokens"] == 1100
+                assert first_costs[2]["data"]["total_cost_usd"] == pytest.approx(0.01)
+                assert first_costs[2]["data"]["total_tokens"] == 1100

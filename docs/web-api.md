@@ -229,10 +229,11 @@ Fires whenever the agent detects a flag-like token
 Emitted by the cost tracker after every LLM call (`CostTracker.record_llm_call`).
 Per-call counts plus session-scoped running totals for this connection
 (the process-wide tracker's cross-session totals are deliberately NOT what
-the wire reports — issue #10). Caveat: frames emitted while this session has
-NO running turn (e.g. an `/api/operate` job in the same process) pass
-through raw, carrying the emitter's process-global totals; `elapsed_ms` is
-0 unless the caller supplied a latency.
+the wire reports — issue #10). Frames attributed to a concurrent session
+are not forwarded to this socket at all; unscoped frames emitted while
+this session has NO running turn (e.g. an `/api/operate` job in the same
+process) pass through raw with the emitter's process-global totals, and
+`elapsed_ms` is 0 unless the caller supplied a latency.
 
 | Field | Type | Notes |
 |---|---|---|

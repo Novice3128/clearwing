@@ -25,6 +25,15 @@ class TestPricingResolution:
         pricing = CostTracker._resolve_pricing("glm-5.3")
         assert pricing == {"input": 1.40, "cached_input": 0.14, "output": 4.40}
 
+    def test_mixed_case_keys_resolve(self):
+        # Codex PR-39 P1: the table carries mixed-case gateway aliases;
+        # lowercasing only the model name made "UnCut" miss its own entry
+        # and bill at Sonnet rates.
+        assert CostTracker._resolve_pricing("UnCut") == CostTracker.PRICING["UnCut"]
+        assert CostTracker._resolve_pricing("uncut") == CostTracker.PRICING["UnCut"]
+        assert CostTracker._resolve_pricing("UnCut-v2") == CostTracker.PRICING["UnCut"]
+        assert CostTracker.estimate_cost(1_000_000, 0, "UnCut") == pytest.approx(1.40)
+
     def test_versioned_echo_resolves_by_prefix(self):
         assert CostTracker._resolve_pricing("claude-sonnet-4-6-20260901") == (
             CostTracker.PRICING["claude-sonnet-4-6"]

@@ -240,9 +240,13 @@ class ClearwingApp(App):
             # The bus payload carries per-call token counts and the tracker's
             # process-wide running cost; the TUI is one process per session,
             # so accumulate the tokens locally to match the cost's scope.
+            # Legacy emitters (emit_cost) carry a cumulative `tokens` value
+            # instead — adopt it directly when the per-call fields are absent.
             per_call = (data.get("input_tokens") or 0) + (data.get("output_tokens") or 0)
             if isinstance(per_call, int) and per_call > 0:
                 self._cost_tokens_total = getattr(self, "_cost_tokens_total", 0) + per_call
+            elif isinstance(data.get("tokens"), int):
+                self._cost_tokens_total = data["tokens"]
             cost = data.get("total_cost_usd", data.get("cost_usd", 0.0))
             bar.update_cost(getattr(self, "_cost_tokens_total", 0), cost)
 
