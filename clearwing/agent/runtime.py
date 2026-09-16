@@ -113,15 +113,57 @@ FLAG_PATTERNS = [
     re.compile(r"FLAG\{[^}]+\}"),
     re.compile(r"HTB\{[^}]+\}"),
     re.compile(r"CTF\{[^}]+\}"),
-    re.compile(r"[A-Fa-f0-9]{32}"),
+    # Hex-boundary lookaround (issue #35): a bare 32-hex class matched any
+    # window of longer hex strings — a 64-hex container id scanned as TWO
+    # "flags". Every window of a longer hex run has a hex neighbour, so the
+    # lookarounds reject them all while a standalone 32-hex (MD5-style
+    # flag) still matches.
+    re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32}(?![A-Fa-f0-9])"),
 ]
+
+# Identifier fields embedded in structured tool results — bookkeeping, not
+# CTF loot. Masked before flag scanning so long hex ids (container ids,
+# image digests, ...) can never register as flags (issue #35).
+_FLAG_SCAN_EXEMPT_KEYS = frozenset(
+    {
+        "container_id",
+        "kali_container_id",
+        "image_id",
+        "sandbox_id",
+        "session_id",
+        "checkpoint_id",
+        "run_id",
+        "request_id",
+        "trace_id",
+    }
+)
+
+
+def _strip_id_fields(data: Any) -> Any:
+    """Recursively replace known identifier values with a placeholder."""
+    if isinstance(data, dict):
+        return {
+            key: ("<id>" if key in _FLAG_SCAN_EXEMPT_KEYS else _strip_id_fields(value))
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [_strip_id_fields(item) for item in data]
+    return data
 
 
 def detect_flags(text: str) -> list[dict[str, str]]:
-    flags = []
+    flags: list[dict[str, str]] = []
+    seen: set[str] = set()
     for pattern in FLAG_PATTERNS:
         for match in pattern.finditer(text):
-            flags.append({"flag": match.group(), "pattern": pattern.pattern})
+            flag = match.group()
+            # Cross-pattern dedup, order-preserving (issue #35): the
+            # case-insensitive flag{} pattern and the exact-case FLAG{}
+            # pattern both fire on the same capture.
+            if flag in seen:
+                continue
+            seen.add(flag)
+            flags.append({"flag": flag, "pattern": pattern.pattern})
     return flags
 
 
@@ -818,7 +860,16 @@ class NativeAgentGraph:
             for key, value in extra_updates.items():
                 state[key] = value
 
-            found_flags = detect_flags(content)
+            # Flag scan (issue #35): structured tool results embed long hex
+            # identifiers (container ids, ...) that must not count as loot.
+            # The hex-boundary pattern stops windows inside longer hex runs,
+            # and known id fields are masked before scanning the serialized
+            # form so a bare 32-hex id value can't pose as an MD5 flag.
+            if isinstance(data, (dict, list)):
+                scan_text = json.dumps(_strip_id_fields(data), default=str)
+            else:
+                scan_text = content
+            found_flags = detect_flags(scan_text)
             if found_flags:
                 new_flags.extend(found_flags)
 
