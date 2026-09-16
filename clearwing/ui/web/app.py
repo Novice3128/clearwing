@@ -20,6 +20,7 @@ import clearwing.observability.telemetry as telemetry
 from clearwing.agent.graph import create_agent
 from clearwing.agent.operator import OperatorAgent, OperatorConfig
 from clearwing.agent.runtime import Command
+from clearwing.agent.tooling import session_scope
 from clearwing.core.events import EventBus, EventType
 from clearwing.observability import MetricsCollector
 from clearwing.observability.integration import ObservabilityIntegration
@@ -465,13 +466,15 @@ def create_app():
         def _session_scope_cost_update(data: dict) -> dict | None:
             """Returns the frame to enqueue, or None to drop it.
 
-            Outside this session's turn the bus is unattributable
-            (process-wide singleton): unscoped frames pass through raw.
-            Frames carrying ANOTHER session's id never belong on this
-            socket — dropping them keeps a concurrent session's spend from
-            flashing into this session's footer. Emissions without a
-            session id (hunter, older callers) still accumulate while this
-            turn runs.
+            Frames now carry an attribution id (the runtime since PR #39,
+            hunts since issue #41): only frames whose id matches THIS
+            session accumulate here — a mismatching id (another webui
+            session, a standalone hunt's sh-* id) is dropped so concurrent
+            sessions never swallow each other's spend. Emissions without a
+            session id (older callers) keep the transitional behaviour and
+            still accumulate while this turn runs. Outside this session's
+            turn the bus is unattributable: matching/unscoped frames pass
+            through raw, foreign frames are dropped.
             """
             if not turn_state["active"]:
                 origin = data.get("session_id")
@@ -813,6 +816,18 @@ def create_app():
             await _drain_events()
             await _safe_send(_complete_payload())
 
+        async def _run_turn_scoped(
+            bound_session_id: str | None, turn_fn, *turn_args
+        ) -> None:
+            # Ambient session attribution (issue #41): bind this session's id
+            # around the turn so LLM spend from anything the turn spawns —
+            # including sourcehunt hunts via the agent's tool calls — is
+            # attributed to this session instead of leaking onto the bus
+            # unscoped (where it would land in whichever other session has
+            # an active turn).
+            with session_scope(bound_session_id):
+                await turn_fn(*turn_args)
+
         pump = asyncio.create_task(_pump_events())
 
         try:
@@ -917,7 +932,9 @@ def create_app():
                         input_msg["target"] = handler_target
 
                     turn_task = asyncio.create_task(
-                        _run_message_turn(graph, config, input_msg, transcript)
+                        _run_turn_scoped(
+                            session_id, _run_message_turn, graph, config, input_msg, transcript
+                        )
                     )
 
                 elif msg_type == "approve" and graph and config:
@@ -933,7 +950,9 @@ def create_app():
                         )
 
                     turn_task = asyncio.create_task(
-                        _run_approve_turn(graph, config, approved, transcript)
+                        _run_turn_scoped(
+                            session_id, _run_approve_turn, graph, config, approved, transcript
+                        )
                     )
 
                 elif msg_type == "stop":

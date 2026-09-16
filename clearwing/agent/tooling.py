@@ -14,6 +14,33 @@ from clearwing.llm.native import NativeToolSpec, ToolInputModel
 
 _TOOL_ACTIVE: ContextVar[bool] = ContextVar("_TOOL_ACTIVE", default=False)
 _TOOL_RESUME_DECISION: ContextVar[object] = ContextVar("_TOOL_RESUME_DECISION", default=Ellipsis)
+# Ambient session attribution (issue #41): the id of the interactive session
+# whose turn is currently executing in this context. Tools spawned by the
+# agent (e.g. sourcehunt hunts) read it to attribute their LLM spend to the
+# invoking session instead of leaking into whatever consumer happens to be
+# listening on the process-wide EventBus. Propagates through asyncio tasks
+# and asyncio.to_thread (both copy the context).
+_SESSION_ID: ContextVar[str | None] = ContextVar("_SESSION_ID", default=None)
+
+
+def current_session_id() -> str | None:
+    """The ambient session id for cost/event attribution, or None.
+
+    Set by the webui around each agent turn and by operator jobs around
+    ``arun``; nested consumers (hunt tool calls run via ``asyncio.to_thread``)
+    inherit it automatically.
+    """
+    return _SESSION_ID.get()
+
+
+@contextmanager
+def session_scope(session_id: str | None):
+    """Bind *session_id* as the ambient attribution id within the block."""
+    token = _SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _SESSION_ID.reset(token)
 
 
 class InterruptRequest(RuntimeError):

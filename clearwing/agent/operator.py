@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from clearwing.agent.graph import _create_llm, create_agent
 from clearwing.agent.runtime import Command
+from clearwing.agent.tooling import session_scope
 from clearwing.providers import ProviderManager
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,14 @@ class OperatorAgent:
         """Run the operator loop to completion."""
         start = time.time()
         session_id = uuid.uuid4().hex[:8]
+        # Ambient session attribution (issue #41): bind this job's session id
+        # for the whole loop so anything the inner agent spawns (sourcehunt
+        # hunts, ...) attributes its LLM spend to this job instead of leaking
+        # unscoped onto the process-wide EventBus.
+        with session_scope(session_id):
+            return await self._arun_impl(session_id, start)
 
+    async def _arun_impl(self, session_id: str, start: float) -> OperatorResult:
         # Create inner agent
         graph = create_agent(
             model_name=self.config.model,

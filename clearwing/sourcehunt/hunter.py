@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from clearwing.agent.tooling import current_session_id
 from clearwing.agent.tools.hunt import (
     HunterContext,
     build_deep_agent_tools,
@@ -1840,13 +1841,14 @@ class NativeHunter:
             total_cost_usd += call_cost
             # Keep process-wide cost/UI metrics separate from the OTel span,
             # which is emitted directly around the model request above.
-            # NB: no session_id here on purpose. Hunts run under their own
-            # sh-* session id (SourceHuntRunner), not the invoking webui
-            # session's — attributing the hunt id would make scoped webui
-            # consumers DROP these frames as foreign (Codex PR-39/40).
-            # Unscoped frames accumulate in whatever session has an active
-            # turn; proper parent-session attribution needs its own
-            # plumbing (see follow-up issue).
+            # Attribution (issue #41): when the hunt was spawned from an
+            # interactive session (ambient contextvar set by the webui turn
+            # or an operator job), charge that parent session so its scoped
+            # footer/report includes the hunt spend. Standalone hunts fall
+            # back to their own sh-* execution id, which scoped webui
+            # consumers drop as foreign instead of mis-crediting whichever
+            # session happens to have an active turn. The sh-* id still keys
+            # outputs/execution semantics; only billing attribution changes.
             if input_tokens or output_tokens:
                 CostTracker().record_llm_call(
                     input_tokens,
@@ -1854,6 +1856,7 @@ class NativeHunter:
                     self.llm.model_name,
                     cached_tokens=cached_tokens,
                     provider=provider_name,
+                    session_id=current_session_id() or self.ctx.session_id,
                 )
 
             last_assistant_text = response.first_text or ""

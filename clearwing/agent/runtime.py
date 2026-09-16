@@ -230,6 +230,16 @@ class NativeAgentGraph:
         # _merge_input copies arbitrary input keys into state, so a state
         # key could be clobbered to re-grant the budget (issue #23).
         self._loop_counters: dict[str, dict[str, int]] = {}
+        # Per-graph cost/token accumulation (issue #37). The CostTracker is
+        # a process-wide singleton, so its running totals pool EVERY session
+        # and operator job in the process — writing them into state made
+        # each job report the cross-job total. Accumulate on the instance
+        # instead (like _loop_counters, deliberately NOT state: _merge_input
+        # copies arbitrary input keys into state): webui graphs live one per
+        # session, operator jobs build one graph per job, so instance totals
+        # are per-session/per-job by construction. The global tracker stays
+        # for process-level observation only.
+        self._cost_totals: dict[str, float] = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
 
         self.cost_tracker = (
             CostTracker() if enable_cost_tracker and capabilities.has("telemetry") else None
@@ -606,20 +616,29 @@ class NativeAgentGraph:
         )
         state.setdefault("messages", []).append(ai_message)
 
-        if self.cost_tracker and (input_tokens or output_tokens):
-            call_cost = self.cost_tracker.record_llm_call(
-                input_tokens,
-                output_tokens,
-                pricing_model,
-                cached_tokens=cached_tokens,
-                provider=provider_name,
-                session_id=self.session_id,
+        if input_tokens or output_tokens:
+            call_cost = 0.0
+            if self.cost_tracker:
+                call_cost = self.cost_tracker.record_llm_call(
+                    input_tokens,
+                    output_tokens,
+                    pricing_model,
+                    cached_tokens=cached_tokens,
+                    provider=provider_name,
+                    session_id=self.session_id,
+                )
+            # Instance totals (issue #37): state must report THIS graph's
+            # spend, not the tracker's cross-session/cross-job running total.
+            self._cost_totals["cost_usd"] += call_cost
+            self._cost_totals["input_tokens"] += input_tokens
+            self._cost_totals["output_tokens"] += output_tokens
+            state["total_cost_usd"] = self._cost_totals["cost_usd"]
+            state["total_tokens"] = (
+                self._cost_totals["input_tokens"] + self._cost_totals["output_tokens"]
             )
-            state["total_cost_usd"] = self.cost_tracker.total_cost_usd
-            state["total_tokens"] = self.cost_tracker.input_tokens + self.cost_tracker.output_tokens
-            if self.audit_logger:
-                # Per-call cost, not the tracker's process-wide running total:
-                # the cumulative value double-counts when audit rows are
+            if self.audit_logger and self.cost_tracker:
+                # Per-call cost, not the graph's running total: the
+                # cumulative value double-counts when audit rows are
                 # summed per session (issue #10 live evidence).
                 self.audit_logger.log_llm_call(
                     model=effective_model,

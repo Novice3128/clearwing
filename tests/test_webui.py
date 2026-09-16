@@ -1020,3 +1020,45 @@ class TestLlmProgressEdgeCases:
                     if msg["type"] == "complete":
                         break
         assert "llm_progress" not in types
+
+
+class _AmbientSessionProbeGraph:
+    """Stands in for create_agent(): records the ambient session id its
+    astream runs under (the context the agent's tool calls inherit)."""
+
+    seen = None
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+
+    async def astream(self, input_data, config, stream_mode="values"):
+        from clearwing.agent.tooling import current_session_id
+
+        del input_data, config, stream_mode
+        _AmbientSessionProbeGraph.seen = current_session_id()
+        yield {
+            "messages": [SimpleNamespace(type="ai", content="done", text="done")]
+        }
+
+
+class TestAmbientSessionAttribution:
+    def test_turn_binds_session_id_for_spawned_tools(self, client):
+        """Issue #41: the turn context must carry the session id so hunts
+        launched by the agent's tools attribute their spend to this session
+        (and land in this session's scoped footer), not to whatever other
+        session happens to be running."""
+        import json
+
+        with patch("clearwing.ui.web.app.create_agent", _AmbientSessionProbeGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                session_id = None
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    if msg["type"] == "complete":
+                        session_id = msg["data"].get("session_id")
+                        break
+
+        assert session_id
+        assert _AmbientSessionProbeGraph.seen == session_id

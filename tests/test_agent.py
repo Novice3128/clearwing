@@ -571,3 +571,67 @@ class TestContextSummarizerCachePrefix:
         assert not any(
             m1 in str(getattr(m, "content", "") or "") for m in final["messages"]
         )
+
+
+class TestPerGraphCostTotals:
+    """Issue #37: state cost/token totals must be per-graph-instance.
+
+    The runtime used to copy the process-wide CostTracker running total
+    into state, so every graph in the process reported the pooled spend of
+    all sessions and operator jobs.
+    """
+
+    def _build(self, client, session_id):
+        from clearwing.agent.graph import build_react_graph
+
+        return build_react_graph(
+            llm_with_tools=client,
+            tools=[],
+            system_prompt_fn=lambda state: "sys",
+            model_name="fake-model",
+            session_id=session_id,
+            enable_knowledge_graph=False,
+            enable_audit=False,
+            enable_episodic_memory=False,
+            enable_event_bus=False,
+            enable_context_summarizer=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_state_totals_track_only_own_graph_calls(self):
+        client_a = _FakeNativeClient(
+            [
+                _FakeResponse(text="a1", usage=_FakeUsage(1000, 100, 1100)),
+                _FakeResponse(text="a2", usage=_FakeUsage(1000, 100, 1100)),
+            ]
+        )
+        client_b = _FakeNativeClient(
+            [_FakeResponse(text="b1", usage=_FakeUsage(500, 50, 550))]
+        )
+        graph_a = self._build(client_a, "sess-a")
+        graph_b = self._build(client_b, "sess-b")
+        config_a = {"configurable": {"thread_id": "ta"}}
+        config_b = {"configurable": {"thread_id": "tb"}}
+
+        # Interleave: A, B, then A again in the same process.
+        async for _ in graph_a.astream(
+            {"messages": [{"role": "user", "content": "go"}]}, config_a
+        ):
+            pass
+        async for _ in graph_b.astream(
+            {"messages": [{"role": "user", "content": "go"}]}, config_b
+        ):
+            pass
+        async for _ in graph_a.astream(
+            {"messages": [{"role": "user", "content": "again"}]}, config_a
+        ):
+            pass
+
+        # Sonnet fallback pricing for the unknown fake model: A's two calls
+        # are 2 * (1000*3 + 100*15)/1M — NOT including B's 500/50 call.
+        values_a = graph_a.get_state(config_a).values
+        values_b = graph_b.get_state(config_b).values
+        assert values_a["total_cost_usd"] == pytest.approx(2 * (3000 + 1500) / 1_000_000)
+        assert values_a["total_tokens"] == 2 * 1100
+        assert values_b["total_cost_usd"] == pytest.approx((500 * 3 + 50 * 15) / 1_000_000)
+        assert values_b["total_tokens"] == 550
