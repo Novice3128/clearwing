@@ -609,7 +609,8 @@ class TestStopFrame:
             }
             complete = ws.receive_json()
             assert complete["type"] == "complete"
-            assert complete["data"] == {}
+            # Issue #33: the stop-path complete reports why it fired.
+            assert complete["data"]["status"] == "stopped"
 
     def test_approve_failure_still_sends_complete(self, client, monkeypatch, results_dir):
         """Review P1: a failed resume used to die on an unbound `snapshot`,
@@ -1020,3 +1021,235 @@ class TestLlmProgressEdgeCases:
                     if msg["type"] == "complete":
                         break
         assert "llm_progress" not in types
+
+
+class _AwaitingApprovalGraph(_FakeGraph):
+    """astream finishes but leaves the graph suspended at an approval gate
+    (get_state reports pending work only once the turn has run)."""
+
+    def __init__(self):
+        super().__init__(events=[{"messages": [_FakeAI("I will run nmap")]}])
+        self.pending = False
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(
+            values={"messages": []},
+            next=("tools",) if self.pending else (),
+            tasks=[],
+        )
+
+    async def astream(self, input_msg, config, stream_mode="values"):
+        self.pending = True
+        for ev in self.events:
+            yield ev
+
+
+class _ToolMessage:
+    def __init__(self, content="tool ok"):
+        self.type = "tool"
+        self.content = content
+
+
+class _StaleResumeGraph(_FakeGraph):
+    """Approve-resume appends a tool message but no new AI text (the graph
+    parks again right after the approved tool). The previous turn's AI
+    text must not be replayed as a fresh agent_message."""
+
+    def __init__(self):
+        self.values: dict = {"messages": [_FakeAI("previous answer")]}
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values=self.values, next=(), tasks=[])
+
+    async def ainvoke(self, command, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        self.values = {"messages": [self.values["messages"][0], _ToolMessage()]}
+        return GraphStateSnapshot(values=self.values)
+
+
+class TestCompleteFrameTruth:
+    """#33: complete frames must tell the truth about how the turn ended —
+    approval pending is not "Agent completed."."""
+
+    def test_approval_pending_completes_as_awaiting_approval(
+        self, client, monkeypatch
+    ):
+        fake = _AwaitingApprovalGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "message", "content": "go"})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        complete = frames[-1]
+        assert complete["data"]["status"] == "awaiting_approval"
+        assert complete["data"]["produced_new"] is True
+
+    def test_error_turn_completes_as_error_status(self, client):
+        with patch("clearwing.ui.web.app.create_agent", _FailingGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "boom"})
+                while True:
+                    frame = ws.receive_json()
+                    if frame["type"] == "complete":
+                        break
+        assert frame["data"]["status"] == "error"
+        assert frame["data"]["produced_new"] is False
+
+    def test_plain_message_turn_completes_as_ok(self, client, monkeypatch):
+        fake = _FakeGraph(events=[{"messages": [_FakeAI()]}])
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+            ws.send_json({"type": "message", "content": "hi"})
+            while True:
+                frame = ws.receive_json()
+                if frame["type"] == "complete":
+                    break
+        assert frame["data"]["status"] == "ok"
+        assert frame["data"]["produced_new"] is True
+
+    def test_stale_resume_does_not_replay_previous_answer(self, client, monkeypatch):
+        fake = _StaleResumeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        assert not any(
+            f["type"] == "agent_message" for f in frames
+        ), "resume without new AI text must not replay the previous turn's answer"
+        assert frames[-1]["data"]["status"] == "ok"
+        assert frames[-1]["data"]["produced_new"] is False
+
+
+class TestPumpResilience:
+    """#11: a transient send failure must not kill the event pump for the
+    rest of the session."""
+
+    def test_pump_survives_transient_send_failure(self, client, monkeypatch):
+        import asyncio
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
+
+        real_send_json = FastAPIWebSocket.send_json
+        calls = {"n": 0}
+
+        async def flaky_send_json(self_ws, data, mode="text"):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("transient send failure")
+            return await real_send_json(self_ws, data, mode=mode)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_json", flaky_send_json)
+
+        class _EmittingSlowGraph:
+            def __init__(self, **kwargs):
+                del kwargs
+
+            async def astream(self, input_data, config, stream_mode="values"):
+                from clearwing.core.events import EventBus, EventType
+
+                del input_data, config, stream_mode
+                EventBus().emit(
+                    EventType.MESSAGE, {"content": "mid-turn frame", "type": "info"}
+                )
+                await asyncio.sleep(0.3)
+                yield {"messages": [SimpleNamespace(type="ai", content="done")]}
+
+        with patch("clearwing.ui.web.app.create_agent", _EmittingSlowGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "t"})
+                assert ws.receive_json()["type"] == "started"
+                ws.send_json({"type": "message", "content": "run"})
+                frames = []
+                while True:
+                    frame = ws.receive_json()
+                    frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+        # The pump's first forward attempt failed once; the retried frame
+        # still reached the client (pre-fix the pump died and the frame was
+        # silently dropped).
+        assert any(
+            f["type"] == "agent_message" and f["data"].get("content") == "mid-turn frame"
+            for f in frames
+        )
+        assert frames[-1]["data"]["status"] == "ok"
+
+
+class TestWorkerThreadEvents:
+    """#11: bus events emitted from non-loop threads (sync tools run in
+    asyncio.to_thread workers) must reach the client while the turn is
+    still running."""
+
+    def test_worker_thread_event_arrives_during_turn(self, client, monkeypatch):
+        import threading
+        import time
+
+        class _ThreadEmitGraph:
+            def __init__(self, **kwargs):
+                del kwargs
+
+            async def astream(self, input_data, config, stream_mode="values"):
+                import asyncio
+
+                del input_data, config, stream_mode
+
+                def worker():
+                    from clearwing.core.events import EventBus, EventType
+
+                    time.sleep(0.05)
+                    EventBus().emit(
+                        EventType.MESSAGE, {"content": "from worker", "type": "info"}
+                    )
+
+                threading.Thread(target=worker, daemon=True).start()
+                await asyncio.sleep(1.0)
+                yield {"messages": [SimpleNamespace(type="ai", content="done")]}
+
+        with patch("clearwing.ui.web.app.create_agent", _ThreadEmitGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "t"})
+                assert ws.receive_json()["type"] == "started"
+                ws.send_json({"type": "message", "content": "run"})
+
+                frame = ws.receive_json()
+                assert frame["type"] == "agent_message"
+                assert frame["data"]["content"] == "from worker"
+
+                # The worker frame arrived while the turn was still
+                # running (pre-fix it stayed stranded on the queue until
+                # the turn's own sleep ended the loop's blockade).
+                ws.send_json({"type": "message", "content": "probe"})
+                reply = ws.receive_json()
+                assert reply["type"] == "error"
+                assert "already running" in reply["data"]["message"]
+
+                ws.send_json({"type": "stop"})
+                while True:
+                    if ws.receive_json()["type"] == "complete":
+                        break

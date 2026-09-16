@@ -583,6 +583,45 @@ Sent in response to a client `stop` frame (see [`stop`](#stop)).
 A `complete` frame follows every `stopped` frame, same as after
 `message` / `approve` turns.
 
+### `complete`
+
+Emitted after every `message` / `approve` / `stop` turn, regardless of
+how the turn ended — the client must never be left waiting on a turn
+that died mid-stream. The `data.status` field says how it ended:
+
+| `status`              | Meaning                                                                 |
+| --------------------- | ----------------------------------------------------------------------- |
+| `"ok"`                | The turn ran to completion; nothing is pending.                         |
+| `"awaiting_approval"` | The graph is suspended at an approval gate. The session is **not** finished — answer the pending `approval_needed` frame with `approve`, or discard it with `stop`. |
+| `"stopped"`           | The turn ended because the operator sent `stop`.                        |
+| `"error"`             | The turn already emitted an `error` frame this turn.                    |
+
+`status` is backward compatible: clients written before the field
+existed treat its absence as `"ok"`.
+
+`produced_new` (boolean, present on `message` / `approve` turns) reports
+whether the turn surfaced new assistant text (a fresh `agent_message`
+frame was sent for it). `false` means no new assistant content arrived —
+for example a stale `approve` with nothing pending, or a resume that
+only appended tool output — and no previous turn's text was replayed.
+
+`session_id` / `report_path` / `report_url` appear once the agent
+session has been started (they ride along on every subsequent
+`complete`).
+
+```json
+{
+  "type": "complete",
+  "data": {
+    "status": "awaiting_approval",
+    "produced_new": true,
+    "session_id": "a1b2c3d4",
+    "report_path": "results/sessions/a1b2c3d4/report.md",
+    "report_url": "/api/reports/a1b2c3d4"
+  }
+}
+```
+
 ## Events that are emitted but not forwarded
 
 For completeness — these `EventType` values exist on the bus but the
