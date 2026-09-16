@@ -1,6 +1,31 @@
 """Parallel scanning subcommand."""
 
+import ipaddress
 import sys
+
+# Issue #14: `--targets` only accepted plain IPs/hostnames — a CIDR block
+# was passed through as a "hostname" and the scan failed downstream. CIDR
+# entries now expand to their host addresses, capped so one typo (/8)
+# can't spawn thousands of agent runs.
+_CIDR_EXPAND_CAP = 32
+
+
+def _expand_cidr_target(raw: str) -> list[str] | None:
+    """Expand a CIDR block into host IPs; None when *raw* is not CIDR.
+
+    Returns an empty list when the block exceeds the expansion cap so the
+    caller can reject it with a clear message.
+    """
+    if "/" not in raw:
+        return None
+    try:
+        network = ipaddress.ip_network(raw, strict=False)
+    except ValueError:
+        return None
+    hosts = [str(ip) for ip in network.hosts()]
+    if len(hosts) > _CIDR_EXPAND_CAP:
+        return []
+    return hosts
 
 
 def add_parser(subparsers):
@@ -42,7 +67,21 @@ def handle(cli, args):
     """Run parallel scans against multiple targets."""
     from ...runners.parallel import ParallelExecutor, ParallelScanConfig
 
-    targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+    targets: list[str] = []
+    for raw in (t.strip() for t in args.targets.split(",")):
+        if not raw:
+            continue
+        expanded = _expand_cidr_target(raw)
+        if expanded is None:
+            targets.append(raw)  # plain IP or hostname — unchanged
+        elif not expanded:
+            cli.console.print(
+                f"[red]Error: {raw} expands to more than {_CIDR_EXPAND_CAP} "
+                "hosts; enumerate the targets explicitly.[/red]"
+            )
+            sys.exit(1)
+        else:
+            targets.extend(expanded)
     if not targets:
         cli.console.print("[red]Error: No targets specified.[/red]")
         sys.exit(1)

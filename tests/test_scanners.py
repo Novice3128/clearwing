@@ -294,3 +294,183 @@ class TestOSScanner:
         """Test synchronous detect method."""
         result = scanner.detect_sync("127.0.0.1")
         assert isinstance(result, str)
+
+
+class TestRawSocketCapabilityFallback:
+    """Issue #34: syn (default) without CAP_NET_RAW silently returned []."""
+
+    @pytest.mark.asyncio
+    async def test_syn_scan_falls_back_to_connect(self, monkeypatch, caplog):
+        from clearwing.scanning import port_scanner
+
+        monkeypatch.setattr(port_scanner, "_has_raw_socket_privilege", lambda: False)
+        monkeypatch.setattr(
+            port_scanner.PortScanner,
+            "_connect_scan",
+            AsyncMock(return_value=True),
+        )
+        syn_mock = AsyncMock(side_effect=AssertionError("syn must not run unprivileged"))
+        monkeypatch.setattr(port_scanner.PortScanner, "_syn_scan", syn_mock)
+
+        with caplog.at_level(logging.WARNING, logger="clearwing.scanning.port_scanner"):
+            result = await port_scanner.PortScanner().scan(
+                "127.0.0.1", [80], scan_type="syn"
+            )
+
+        syn_mock.assert_not_called()
+        assert len(result) == 1
+        assert result[0]["port"] == 80
+        assert result[0]["scan_type_used"] == "connect"
+        assert result[0]["scan_type_fallback"] is True
+        assert any("Falling back" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_capable_process_keeps_syn(self, monkeypatch):
+        from clearwing.scanning import port_scanner
+
+        monkeypatch.setattr(port_scanner, "_has_raw_socket_privilege", lambda: True)
+        syn_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr(port_scanner.PortScanner, "_syn_scan", syn_mock)
+
+        result = await port_scanner.PortScanner().scan("127.0.0.1", [80], scan_type="syn")
+
+        syn_mock.assert_called_once()
+        assert result[0]["port"] == 80
+        assert "scan_type_fallback" not in result[0]
+
+    def test_probe_reports_permission_denied(self, monkeypatch):
+        from clearwing.scanning import port_scanner
+
+        def refused(*args, **kwargs):
+            raise PermissionError("Operation not permitted")
+
+        monkeypatch.setattr(port_scanner, "_raw_socket_probe_result", None)
+        monkeypatch.setattr(port_scanner.socket, "socket", refused)
+        try:
+            assert port_scanner._probe_raw_socket_support() is False
+            assert port_scanner._has_raw_socket_privilege() is False
+        finally:
+            port_scanner._raw_socket_probe_result = None
+
+    def test_probe_success_is_cached(self, monkeypatch):
+        from clearwing.scanning import port_scanner
+
+        class _FakeRawSocket:
+            def close(self):
+                pass
+
+        calls = []
+
+        def fake_socket(*args, **kwargs):
+            calls.append(1)
+            return _FakeRawSocket()
+
+        monkeypatch.setattr(port_scanner, "_raw_socket_probe_result", None)
+        monkeypatch.setattr(port_scanner.socket, "socket", fake_socket)
+        try:
+            assert port_scanner._probe_raw_socket_support() is True
+            port_scanner._probe_raw_socket_support()
+            assert len(calls) == 1  # cached after the first probe
+        finally:
+            port_scanner._raw_socket_probe_result = None
+
+
+class TestPortScanFailureSurfacing:
+    """Issue #14: probe failures must not masquerade as "no open ports"."""
+
+    @pytest.mark.asyncio
+    async def test_all_probes_failed_raises_descriptive_error(self, monkeypatch, caplog):
+        from clearwing.scanning import port_scanner
+
+        async def unreachable(self, target, port):
+            raise OSError("network unreachable")
+
+        monkeypatch.setattr(port_scanner.PortScanner, "_connect_scan", unreachable)
+
+        with caplog.at_level(logging.WARNING, logger="clearwing.scanning.port_scanner"):
+            with pytest.raises(RuntimeError, match="network unreachable"):
+                await port_scanner.PortScanner().scan("10.255.255.1", [22, 80], "connect")
+
+        assert any("probes failed" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_still_returns_open_ports(self, monkeypatch, caplog):
+        from clearwing.scanning import port_scanner
+
+        async def flaky(self, target, port):
+            if port == 22:
+                raise OSError("probe glitch")
+            return True
+
+        monkeypatch.setattr(port_scanner.PortScanner, "_connect_scan", flaky)
+
+        with caplog.at_level(logging.WARNING, logger="clearwing.scanning.port_scanner"):
+            result = await port_scanner.PortScanner().scan("127.0.0.1", [22, 80], "connect")
+
+        assert [r["port"] for r in result] == [80]
+        assert any("probes failed" in r.message for r in caplog.records)
+
+
+class TestScannerToolErrorEvents:
+    """Issue #14 tool layer: failures emit ERROR-level events and return
+    explicit error dicts instead of silently empty lists."""
+
+    @pytest.mark.asyncio
+    async def test_scan_ports_failure_emits_error_event(self, monkeypatch):
+        import clearwing.scanning as scanning_pkg
+        from clearwing.agent.tools.scan.scanner_tools import scan_ports
+        from clearwing.core.events import EventBus, EventType
+
+        async def boom(self, target, ports, scan_type, threads):
+            raise RuntimeError("all probes failed")
+
+        monkeypatch.setattr(scanning_pkg.PortScanner, "scan", boom)
+
+        events: list[dict] = []
+        bus = EventBus()
+        bus.subscribe(EventType.ERROR, events.append)
+        try:
+            result = await scan_ports.ainvoke({"target": "127.0.0.1"})
+        finally:
+            bus.unsubscribe(EventType.ERROR, events.append)
+
+        assert result["error"].startswith("port scan failed:")
+        assert "all probes failed" in result["error"]
+        assert events and events[0]["tool"] == "scan_ports"
+        assert "scan_ports" in events[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_scan_ports_fallback_empty_result_is_annotated(self, monkeypatch):
+        import clearwing.scanning as scanning_pkg
+        from clearwing.agent.tools.scan.scanner_tools import scan_ports
+
+        async def empty(self, target, ports, scan_type, threads):
+            return []
+
+        monkeypatch.setattr(scanning_pkg.PortScanner, "scan", empty)
+        monkeypatch.setattr(
+            scanning_pkg, "resolve_scan_type", lambda scan_type: ("connect", True)
+        )
+
+        result = await scan_ports.ainvoke({"target": "127.0.0.1", "scan_type": "syn"})
+
+        assert result["open_ports"] == []
+        assert result["scan_type_fallback"] is True
+        assert result["scan_type_used"] == "connect"
+        assert "CAP_NET_RAW" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_clean_empty_scan_stays_a_plain_list(self, monkeypatch):
+        import clearwing.scanning as scanning_pkg
+        from clearwing.agent.tools.scan.scanner_tools import scan_ports
+
+        async def empty(self, target, ports, scan_type, threads):
+            return []
+
+        monkeypatch.setattr(scanning_pkg.PortScanner, "scan", empty)
+        monkeypatch.setattr(
+            scanning_pkg, "resolve_scan_type", lambda scan_type: (scan_type, False)
+        )
+
+        result = await scan_ports.ainvoke({"target": "127.0.0.1", "scan_type": "connect"})
+        assert result == []
