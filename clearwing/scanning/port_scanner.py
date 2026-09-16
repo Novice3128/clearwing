@@ -259,16 +259,30 @@ class PortScanner:
         return False
 
     async def _connect_scan(self, target: str, port: int) -> bool:
-        """Perform TCP connect scan on a single port."""
+        """Perform TCP connect scan on a single port.
+
+        Only the expected negative outcomes of a connect scan read as "port
+        closed": connection refused (RST) and timeout (filtered). Target or
+        network level errors — DNS resolution failure (``gaierror``),
+        unreachable network (``ENETUNREACH``), ... — propagate to the
+        caller's failure ledger (issue #14), so an unscannable target is
+        distinguishable from a clean "no open ports" result instead of
+        silently producing one (PR #44 review P1).
+        """
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(target, port), timeout=self.timeout
             )
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        except (asyncio.TimeoutError, ConnectionRefusedError):
             return False
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            # The connect succeeded, so the port IS open even when the
+            # teardown handshake hiccups — never demote it to a failure.
+            logger.debug("close() failed for %s:%d", target, port, exc_info=True)
+        return True
 
     def scan_sync(
         self, target: str, ports: list[int] = None, scan_type: str = "syn"

@@ -154,8 +154,60 @@ class TestCostTracker:
         assert t.session_total("job-c") == 0.0
         assert t.session_total(None) == 0.0
         assert t.session_total("") == 0.0
+        # Token totals ride along in parallel: (input, output) per session.
+        assert t.session_tokens("job-a") == (2000, 1000)
+        assert t.session_tokens("job-b") == (1000, 0)
+        assert t.session_tokens("job-c") == (0, 0)
+        assert t.session_tokens(None) == (0, 0)
+        assert t.session_tokens("") == (0, 0)
         # ...while the global total keeps pooling everything.
         assert t.total_cost_usd == pytest.approx(2 * 0.0105 + 0.003 + 0.003)
+
+    def test_forget_session_zeroes_cost_and_tokens(self):
+        """PR #44 review P2: owners must be able to retire a session entry.
+
+        Long-lived processes (webui) had no completion path that cleared a
+        session's totals; since webui/operator ids are 8-hex UUID prefixes,
+        a colliding new session inherited the stale spend.
+        """
+        t = CostTracker()
+        t.record_llm_call(1000, 500, "claude-sonnet-4-6", session_id="collide1")
+        assert t.session_total("collide1") == pytest.approx(0.0105)
+        assert t.session_tokens("collide1") == (1000, 500)
+
+        t.forget_session("collide1")
+
+        assert t.session_total("collide1") == 0.0
+        assert t.session_tokens("collide1") == (0, 0)
+        # Global counters are NOT rewound — the process-wide total keeps
+        # every recorded call.
+        assert t.total_cost_usd == pytest.approx(0.0105)
+        assert t.input_tokens == 1000 and t.output_tokens == 500
+        # Unknown / empty ids are no-ops.
+        t.forget_session("never-recorded")
+        t.forget_session(None)
+        t.forget_session("")
+
+    def test_forget_session_prevents_collision_reuse(self):
+        """Simulated id collision: the second job must not eat the first
+        job's spend once the first job's entry was forgotten."""
+        t = CostTracker()
+        t.record_llm_call(1_000_000, 0, "claude-sonnet-4-6", session_id="ab12cd34")
+        t.forget_session("ab12cd34")  # first job ends
+
+        t.record_llm_call(100, 20, "claude-sonnet-4-6", session_id="ab12cd34")
+
+        assert t.session_total("ab12cd34") == pytest.approx((100 * 3 + 20 * 15) / 1_000_000)
+        assert t.session_tokens("ab12cd34") == (100, 20)
+
+    def test_reset_clears_session_token_entries(self):
+        t = CostTracker()
+        t.record_llm_call(10, 5, "claude-sonnet-4-6", session_id="s")
+        t.reset()
+        assert t.session_total("s") == 0.0
+        assert t.session_tokens("s") == (0, 0)
+        t.record_llm_call(10, 5, "claude-sonnet-4-6", session_id="s")
+        assert t.session_tokens("s") == (10, 5)
 
     def test_record_llm_call_emits_cost_update_with_elapsed_and_provider(self):
         """New keyword args ride along in the COST_UPDATE payload."""

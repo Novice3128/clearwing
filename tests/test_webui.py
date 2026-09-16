@@ -1062,3 +1062,68 @@ class TestLlmProgressEdgeCases:
                     if msg["type"] == "complete":
                         break
         assert "llm_progress" not in types
+
+
+class TestSessionCostTeardown:
+    """PR #44 review P2: the WS teardown forgets the session's tracker entry.
+
+    Webui session ids are 8-hex UUID prefixes; in a long-lived process a
+    colliding new session would inherit the stale spend (bogus scoped cost
+    frames / limits). The handler's teardown finally calls
+    ``CostTracker().forget_session(session_id)``.
+    """
+
+    def test_disconnect_forgets_session_cost_entry(self, client):
+        import json
+
+        from clearwing.observability.telemetry import CostTracker
+
+        class _RecordingCostGraph:
+            """Fake graph that books real tracker spend under its session
+            id — the way hunts spawned inside the session's turn do."""
+
+            session_id = None
+
+            def __init__(self, **kwargs):
+                self.session_id = kwargs.get("session_id")
+
+            async def astream(self, input_data, config, stream_mode="values"):
+                from clearwing.core.events import EventBus, EventType
+
+                del input_data, config, stream_mode
+                CostTracker().record_llm_call(
+                    1000, 100, "glm-5.3", session_id=self.session_id
+                )
+                EventBus().emit(
+                    EventType.COST_UPDATE,
+                    {
+                        "input_tokens": 1000,
+                        "output_tokens": 100,
+                        "cached_tokens": 0,
+                        "cost": 0.001,
+                        "total_cost_usd": 0.001,
+                        "model": "glm-5.3",
+                        "provider": "openai",
+                        "session_id": self.session_id,
+                        "elapsed_ms": 1,
+                    },
+                )
+                yield {"messages": [SimpleNamespace(type="ai", content="done", text="done")]}
+
+        with patch("clearwing.ui.web.app.create_agent", _RecordingCostGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                started = None
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    if msg["type"] == "started":
+                        started = msg["session_id"]
+                    if msg["type"] == "complete":
+                        break
+                # While connected, the session's entry exists.
+                assert CostTracker().session_total(started) > 0.0
+
+        # After the connection tears down, the entry is gone.
+        assert CostTracker().session_total(started) == 0.0
+        assert CostTracker().session_tokens(started) == (0, 0)

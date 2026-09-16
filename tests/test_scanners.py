@@ -1,6 +1,8 @@
+import errno
 import logging
 import os
-from unittest.mock import AsyncMock, patch
+import socket
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -409,6 +411,87 @@ class TestPortScanFailureSurfacing:
 
         assert [r["port"] for r in result] == [80]
         assert any("probes failed" in r.message for r in caplog.records)
+
+
+class TestConnectScanErrorPropagation:
+    """PR #44 review P1: the connect fallback must not swallow target-level
+    errors. Without raw-socket privileges every raw scan type resolves to a
+    connect scan (issue #34) — and ``_connect_scan`` used to return False
+    for ANY OSError, so DNS failures and unreachable networks produced a
+    "scan ran, nothing open" result for targets that were never scanned."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+            OSError(errno.ENETUNREACH, "Network is unreachable"),
+            OSError(errno.EHOSTUNREACH, "No route to host"),
+        ],
+    )
+    async def test_target_level_errors_reach_failure_ledger(self, monkeypatch, exc):
+        import asyncio
+
+        from clearwing.scanning import port_scanner
+
+        async def failing_open_connection(target, port, **kwargs):
+            raise exc
+
+        monkeypatch.setattr(asyncio, "open_connection", failing_open_connection)
+
+        # All probes fail at the target level → the aggregate error fires
+        # instead of an empty "no open ports" list.
+        with pytest.raises(RuntimeError, match="probed ports"):
+            await port_scanner.PortScanner().scan("invalid.invalid", [22, 80], "connect")
+
+    @pytest.mark.asyncio
+    async def test_target_level_error_on_some_ports_keeps_open_findings(
+        self, monkeypatch, caplog
+    ):
+        import asyncio
+
+        from clearwing.scanning import port_scanner
+
+        async def half_failing_open_connection(target, port, **kwargs):
+            if port == 22:
+                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+            # Simulate an open port: hand back a minimal writer.
+            writer = MagicMock()
+            writer.close = MagicMock()
+            writer.wait_closed = AsyncMock()
+            return (MagicMock(), writer)
+
+        monkeypatch.setattr(asyncio, "open_connection", half_failing_open_connection)
+
+        with caplog.at_level(logging.WARNING, logger="clearwing.scanning.port_scanner"):
+            result = await port_scanner.PortScanner().scan("invalid.invalid", [22, 80], "connect")
+
+        # The open port is still reported, and the failed probe lands in
+        # the failure ledger — not silently as "closed".
+        assert [r["port"] for r in result] == [80]
+        assert any("gaierror" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_refused_and_timeout_stay_closed(self, monkeypatch):
+        import asyncio
+
+        from clearwing.scanning import port_scanner
+
+        scanner = port_scanner.PortScanner()
+
+        async def refused(target, port, **kwargs):
+            raise ConnectionRefusedError()
+
+        monkeypatch.setattr(asyncio, "open_connection", refused)
+        assert await scanner._connect_scan("127.0.0.1", 1) is False
+        # A refused-only scan is a clean empty result, not an error.
+        assert await scanner.scan("127.0.0.1", [1, 2], "connect") == []
+
+        async def stalled(target, port, **kwargs):
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(asyncio, "open_connection", stalled)
+        assert await scanner._connect_scan("127.0.0.1", 1) is False
 
 
 class TestScannerToolErrorEvents:

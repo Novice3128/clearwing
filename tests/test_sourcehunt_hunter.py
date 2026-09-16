@@ -1186,3 +1186,63 @@ class TestHuntCostAttribution:
 
         assert captured, "hunter emitted no COST_UPDATE frames"
         assert all(frame["session_id"] == "web-1" for frame in captured)
+
+
+class TestHuntSummaryUsageTotals:
+    """PR #44 review P2: summary-call tokens must reach the token totals.
+
+    The summary call's cost was added to ``total_cost_usd`` and booked in
+    CostTracker, but its tokens never reached ``total_input_tokens`` /
+    ``total_output_tokens`` — ``HunterRunResult.tokens_used`` and pool/run
+    aggregates under-counted every summary call, inconsistent with the
+    cost figure next to them.
+    """
+
+    def test_summary_tokens_counted_in_tokens_used(self):
+        class _StubLLM:
+            model_name = "stub-model"
+
+            async def achat(self, *, messages, system, tools, **kwargs):
+                return ChatResponse(
+                    content=[{"text": "No findings."}],
+                    usage=Usage(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+                    provider_model_name="stub-provider",
+                )
+
+        class _StubSummarizer:
+            """Always fires; reports a (400, 40) summary usage."""
+
+            def should_summarize(self, messages, max_tokens=150_000):
+                return True
+
+            async def summarize(self, messages, llm, **kwargs):
+                return {
+                    "text": "running summary",
+                    "covered_count": 1,
+                    "view": messages,
+                    "usage": {"input_tokens": 400, "output_tokens": 40, "cached_tokens": 0},
+                }
+
+            def summary_note(self, text):
+                return f"[Session Summary]\n{text}"
+
+        ctx = HunterContext(
+            repo_path=str(FIXTURE_C_PROPAGATION),
+            findings=[],
+            file_path="src/codec_a.c",
+            session_id="sh-sumtok1",
+            specialist="general",
+        )
+        hunter = NativeHunter(
+            llm=_StubLLM(),
+            prompt="system prompt",
+            tools=[],
+            ctx=ctx,
+            max_steps=1,
+            summarizer=_StubSummarizer(),
+        )
+
+        result = asyncio.run(hunter.arun())
+
+        # Main call (11 + 7) + summary call (400 + 40).
+        assert result.tokens_used == (11 + 7) + (400 + 40)

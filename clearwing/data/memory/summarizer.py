@@ -39,10 +39,38 @@ class ContextSummarizer:
     """
 
     @staticmethod
+    def _message_role(message: Any) -> str:
+        """Role label for either message shape (object or dict)."""
+        if isinstance(message, dict):
+            return str(message.get("role", "msg"))
+        return str(getattr(message, "role", "msg"))
+
+    @staticmethod
+    def _message_text(message: Any) -> str:
+        """Content of a message as text, for either message shape.
+
+        Dict-shaped (legacy LangChain-style) messages carry ``content`` as a
+        mapping key, not an attribute — ``getattr`` on them yields None,
+        which used to silently drop their text from the summary input while
+        the compaction still removed them from history (PR #44 review P1).
+        Non-string content (block lists, ...) is stringified so whatever the
+        provider sent still reaches the summarizer verbatim.
+        """
+        if isinstance(message, dict):
+            content = message.get("content", None)
+        else:
+            content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        return str(content)
+
+    @staticmethod
     def _estimate_tokens(messages: list) -> int:
         total_chars = 0
         for msg in messages:
-            content = getattr(msg, "content", None) or str(msg)
+            content = ContextSummarizer._message_text(msg) or str(msg)
             total_chars += len(content)
             for tc in getattr(msg, "tool_calls", None) or []:
                 total_chars += len(getattr(tc, "fn_arguments_json", None) or "")
@@ -68,9 +96,7 @@ class ContextSummarizer:
                 or message.get("tool_calls")
             ):
                 return False
-        content = getattr(message, "content", None) or ""
-        if not isinstance(content, str):
-            content = str(content)
+        content = ContextSummarizer._message_text(message)
         if _FLAG_PATTERNS.search(content):
             return False
         if getattr(message, "tool_calls", None):
@@ -147,10 +173,15 @@ class ContextSummarizer:
         blocks: list[str] = []
         if prior_text:
             blocks.append(f"[prior session summary]: {prior_text}")
+        # PR #44 review P1: every covered message's content MUST reach the
+        # summary input. Dict-shaped messages used to fall through
+        # ``getattr`` here (None content) — they were selected as coverable
+        # and removed from the committed view, permanently losing their
+        # text (early user goals on long sessions).
         blocks.extend(
-            f"[{getattr(m, 'role', 'msg')}]: {getattr(m, 'content', '')}"
+            f"[{self._message_role(m)}]: {self._message_text(m)}"
             for m in to_summarize
-            if getattr(m, "content", None)
+            if self._message_text(m)
         )
         text_block = "\n\n".join(blocks)
 

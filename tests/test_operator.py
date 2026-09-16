@@ -846,3 +846,118 @@ class TestOperatorCostIsolation:
         # $0.0006 (inner call) + 200k * $3/M = $0.6 (hunt) — the result
         # field reports the job's whole spend, not just the graph's.
         assert result.cost_usd == pytest.approx(0.0006 + 0.6)
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_result_tokens_include_hunt_spend(self, mock_create, mock_create_llm, mock_decide):
+        """PR #44 review P2: tokens_used mirrors cost attribution.
+
+        Hunt tokens are recorded against the job's session id (the cost
+        field already picks them up), but tokens_used used to read only the
+        inner graph's state — the job reported full cost next to a token
+        count missing the pipeline's main workload.
+        """
+        mock_create_llm.return_value = MagicMock()
+        mock_decide.return_value = "GOALS_COMPLETE"
+
+        captured: dict = {}
+        mock_create.side_effect = self._hunt_spending_graph(captured, [(100, 20)], 200_000)
+
+        result = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+
+        assert result.status == "completed"
+        # 200k hunt input tokens + the inner call's (100, 20) — not the
+        # graph-state 120 alone.
+        assert result.tokens_used == 200_000 + 120
+
+    @patch(
+        "clearwing.agent.operator.OperatorAgent._adecide_next",
+        new_callable=AsyncMock,
+    )
+    @patch("clearwing.agent.graph._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_job_session_entry_forgotten_after_run(
+        self, mock_create, mock_create_llm, mock_decide
+    ):
+        """PR #44 review P2: the job's session entry must be retired.
+
+        Operator ids are uuid4().hex[:8]; in a long-lived process a
+        colliding id would inherit this job's spend. arun() now forgets
+        the entry on completion — the RESULT still reports the spend.
+        """
+        from clearwing.observability.telemetry import CostTracker
+
+        mock_create_llm.return_value = MagicMock()
+        mock_decide.return_value = "GOALS_COMPLETE"
+
+        captured: dict = {}
+        mock_create.side_effect = self._hunt_spending_graph(captured, [(100, 20)], 200_000)
+
+        result = OperatorAgent(OperatorConfig(goals=["g"], target="10.0.0.1")).run()
+
+        assert result.status == "completed"
+        assert result.cost_usd == pytest.approx(0.0006 + 0.6)
+        # But the tracker no longer holds an entry for the job's id.
+        job_session_id = captured["session_id"]
+        assert CostTracker().session_total(job_session_id) == 0.0
+        assert CostTracker().session_tokens(job_session_id) == (0, 0)
+
+
+class TestSupervisorUsageAccounting:
+    """PR #44 review P1: the operator LLM's own calls must be booked.
+
+    ``_adecide_next`` calls ``operator_llm.aask_text()`` every turn, but
+    ``session_scope`` only attributes calls the runtime books — the
+    supervisor's usage was invisible to the session total, so the cost
+    limit and result ignored a potentially expensive operator_model.
+    """
+
+    @staticmethod
+    def _fake_operator_llm(first_text: str, prompt_tokens: int, completion_tokens: int):
+        from types import SimpleNamespace
+
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=None,
+        )
+
+        class _Client:
+            model_name = "claude-opus-4-6"
+            provider_name = "anthropic"
+
+            async def aask_text(self, **kwargs):
+                del kwargs
+                return SimpleNamespace(
+                    first_text=first_text, texts=[first_text], usage=usage
+                )
+
+        return _Client()
+
+    @patch("clearwing.agent.operator._create_llm")
+    @patch("clearwing.agent.operator.create_agent")
+    def test_supervisor_spend_counts_toward_cost_limit(self, mock_create, mock_create_llm):
+        # NB: patch operator's OWN _create_llm binding — the module imports
+        # the name from graph, so patching graph._create_llm would leave the
+        # real client (and this host's config.yaml endpoint) in play.
+        mock_graph = TestOperatorRun._make_mock_graph(["scanning..."])
+        mock_create.return_value = mock_graph
+        # Opus supervisor: 1M input + 100 output = $15 + $0.0075 = $15.0075.
+        mock_create_llm.return_value = self._fake_operator_llm(
+            "Continue with the next goal.", 1_000_000, 100
+        )
+
+        result = OperatorAgent(
+            OperatorConfig(goals=["g"], target="10.0.0.1", cost_limit=5.0)
+        ).run()
+
+        # Turn 1 runs; the supervisor decision is booked; the loop's SECOND
+        # limit check must trip on the supervisor spend alone.
+        assert result.status == "cost_limit"
+        assert result.cost_usd == pytest.approx(15.0075)  # beats state's 0.01
+        assert result.tokens_used == 1_000_100  # beats state's 100

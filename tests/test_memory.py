@@ -464,3 +464,38 @@ class TestContextSummarizer:
         view_ids = {id(m) for m in result["view"]}
         for m in messages[:10]:  # the old segment's dict tool traffic
             assert id(m) in view_ids
+
+    @pytest.mark.asyncio
+    async def test_dict_user_content_reaches_summary_input(self):
+        # PR #44 review P1: dict-shaped user inputs used to be selected as
+        # coverable but dropped from the summary LLM's text_block
+        # (``getattr`` on a dict yields None) — then removed from the
+        # committed view, permanently losing the early user goals. The
+        # covered content must appear in the summary input.
+        goal = {"role": "user", "content": "Find the hidden flag on the target"}
+        messages: list = [goal]
+        messages.extend(
+            {"role": "assistant", "content": f"assistant note {i}"} for i in range(9)
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.aask_text.return_value = MagicMock(first_text="summary")
+
+        result = await self.summarizer.summarize(messages, mock_llm)
+
+        user_payload = mock_llm.aask_text.call_args.kwargs["user"]
+        assert "[user]: Find the hidden flag on the target" in user_payload
+        assert "[assistant]: assistant note 0" in user_payload
+        # And the covered dict messages did leave the committed view.
+        assert not any(m is goal for m in result["view"])
+
+    def test_dict_flag_message_is_not_coverable(self):
+        # Flag detection must read dict content too: a dict message bearing
+        # a flag stays verbatim instead of being summarized away.
+        flagged = {"role": "user", "content": "captured flag{dict_flag_1}"}
+        assert not self.summarizer._is_coverable(flagged)
+
+    def test_estimate_tokens_reads_dict_content(self):
+        messages = [{"role": "user", "content": "x" * 400}]
+        # 400 chars / 4 = 100 tokens; dict content must actually be read.
+        assert self.summarizer._estimate_tokens(messages) == 100

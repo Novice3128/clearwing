@@ -1041,5 +1041,9 @@ def create_app():
             if bus and handlers:
                 for et, h in handlers.items():
                     bus.unsubscribe(et, h)
+            # PR #44 review P2: retire this session's cost/token entry —
+            # 8-hex ids collide in a long-lived webui, and a stale entry
+            # would hand the colliding session this session's spend.
+            telemetry.CostTracker().forget_session(session_id)
 
     return app

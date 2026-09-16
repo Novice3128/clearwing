@@ -140,7 +140,14 @@ class OperatorAgent:
         # hunts, ...) attributes its LLM spend to this job instead of leaking
         # unscoped onto the process-wide EventBus.
         with session_scope(session_id):
-            return await self._arun_impl(session_id, start)
+            try:
+                return await self._arun_impl(session_id, start)
+            finally:
+                # PR #44 review P2: retire this job's per-session cost/token
+                # entry. The 8-hex id space collides in long-lived processes
+                # (webui/operator ids are uuid4().hex[:8]); a stale entry
+                # would hand a future colliding job this job's spend.
+                CostTracker().forget_session(session_id)
 
     async def _arun_impl(self, session_id: str, start: float) -> OperatorResult:
         self._session_id = session_id
@@ -392,6 +399,28 @@ class OperatorAgent:
             from clearwing.llm.native import response_text
 
             response = await operator_llm.aask_text(system=system, user=user)
+            # PR #44 review P1: the supervisor call is real spend. aask_text
+            # goes straight to the client — session_scope only attributes
+            # calls the runtime books — so without recording it here the
+            # job's limit check and result never saw the (possibly
+            # expensive operator_model) supervisor outlay.
+            usage_obj = getattr(response, "usage", None)
+            usage_in = getattr(usage_obj, "prompt_tokens", None)
+            usage_out = getattr(usage_obj, "completion_tokens", None)
+            if isinstance(usage_in, int) and isinstance(usage_out, int):
+                if usage_in or usage_out:
+                    details = getattr(usage_obj, "prompt_tokens_details", None)
+                    usage_cached = (
+                        getattr(details, "cached_tokens", None) if details else None
+                    )
+                    CostTracker().record_llm_call(
+                        usage_in,
+                        usage_out,
+                        getattr(operator_llm, "model_name", "unknown"),
+                        cached_tokens=usage_cached if isinstance(usage_cached, int) else 0,
+                        provider=getattr(operator_llm, "provider_name", None),
+                        session_id=self._session_id,
+                    )
             return response_text(response).strip()
         except Exception as e:
             logger.error("Operator LLM error: %s", e)
@@ -434,7 +463,15 @@ class OperatorAgent:
                 CostTracker().session_total(self._session_id),
                 sv.get("total_cost_usd", 0.0),
             ),
-            tokens_used=sv.get("total_tokens", 0),
+            # Token totals mirror the cost field's attribution (PR #44
+            # review P2): the state total covers only the inner agent's
+            # calls, while session-scoped tokens also carry hunt and
+            # supervisor usage recorded against the job's session id.
+            # max() keeps state-only accounting (tracker disabled) intact.
+            tokens_used=max(
+                int(sv.get("total_tokens", 0) or 0),
+                sum(CostTracker().session_tokens(self._session_id)),
+            ),
             duration_seconds=round(time.time() - start, 2),
             escalation_question=escalation_question,
             error=error,

@@ -1768,6 +1768,13 @@ class NativeHunter:
                         total_cost_usd += _estimate_cost_usd(
                             s_in, s_out, self.llm.model_name, s_cached
                         )
+                        # Token totals must move with the cost (PR #44
+                        # review P2): the summary call's usage used to
+                        # reach total_cost_usd but not the token counters,
+                        # so HunterRunResult.tokens_used and pool/run
+                        # aggregates under-counted vs cost.
+                        total_input_tokens += s_in
+                        total_output_tokens += s_out
                         CostTracker().record_llm_call(
                             s_in,
                             s_out,
