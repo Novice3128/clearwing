@@ -1819,6 +1819,10 @@ class NativeHunter:
                     self.llm.model_name,
                     cached_tokens=cached_tokens,
                     provider=provider_name,
+                    # Attribution lets scoped consumers (webui session
+                    # footers) drop hunts invoked by OTHER sessions instead
+                    # of accumulating them (issue #10).
+                    session_id=getattr(self.ctx, "session_id", None),
                 )
 
             last_assistant_text = response.first_text or ""

@@ -73,6 +73,14 @@ class TestPricingResolution:
         # 500k uncached at 1.40 + 500k cached at 0.14 per 1M tokens.
         assert cost == pytest.approx(0.5 * 1.40 + 0.5 * 0.14)
 
+    def test_anthropic_cache_reads_bill_at_ten_percent(self):
+        # Codex PR-39 r2 P2: cache-capable rows must define cached_input —
+        # Anthropic's official cache-read price is 10% of input.
+        cost = CostTracker.estimate_cost(1_000_000, 0, "claude-sonnet-4-6", cached_tokens=1_000_000)
+        assert cost == pytest.approx(0.30)
+        opus = CostTracker.estimate_cost(1_000_000, 0, "claude-opus-4-7", cached_tokens=500_000)
+        assert opus == pytest.approx(0.5 * 15.0 + 0.5 * 1.50)
+
 
 class TestContextNoteAssembly:
     def test_note_rides_after_the_cache_breakpoint(self):

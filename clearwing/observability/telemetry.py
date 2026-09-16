@@ -42,11 +42,14 @@ class CostTracker:
 
     # USD per 1M tokens. Adjust non-Claude rows to match your provider's
     # billing (glm-5.2 below is a self-hosted/gateway estimate).
+    # cached_input is the cache-read rate; Anthropic bills cache reads at
+    # 10% of the input price (official multiplier). OpenAI-family cached
+    # rates vary by model generation — left unset until confirmed.
     PRICING: dict[str, dict[str, float]] = {
-        "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
-        "claude-opus-4-7": {"input": 15.0, "output": 75.0},
-        "claude-opus-4-6": {"input": 15.0, "output": 75.0},
-        "claude-haiku-4-5": {"input": 0.80, "output": 4.0},
+        "claude-sonnet-4-6": {"input": 3.0, "cached_input": 0.30, "output": 15.0},
+        "claude-opus-4-7": {"input": 15.0, "cached_input": 1.50, "output": 75.0},
+        "claude-opus-4-6": {"input": 15.0, "cached_input": 1.50, "output": 75.0},
+        "claude-haiku-4-5": {"input": 0.80, "cached_input": 0.08, "output": 4.0},
         # Self-hosted / air-gapped inference has no real per-token API cost,
         # but it must stay nonzero: HunterPool's tier dispatch gate
         # (pool.py _submit_next: `spent >= budget`) uses accumulated cost as

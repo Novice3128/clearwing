@@ -246,6 +246,10 @@ function startSession() {
       case 'started':
         document.getElementById('session-info').textContent =
           `Session: ${msg.session_id} | Model: ${msg.model}`;
+        // A start frame begins a new session on this connection: the old
+        // session's footer totals must not linger until the first call.
+        document.getElementById('cost').textContent = 'Cost: $0.0000';
+        document.getElementById('tokens').textContent = 'Tokens: 0';
         addMessage(`Session started. Target: ${msg.target || '(none)'}`, 'tool');
         break;
       case 'agent_message': {
