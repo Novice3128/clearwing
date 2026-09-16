@@ -456,7 +456,9 @@ class TestAgentSessionFlow:
 
         report = results_dir / "sessions" / sid / "report.md"
         content = report.read_text(encoding="utf-8")
-        assert "[approval approved by operator]" in content
+        # The approval marker is transcript text; since #24 its brackets are
+        # markdown-escaped, so assert on the words rather than the raw form.
+        assert "approval approved by operator" in content
         assert "post approval answer" in content
 
     def test_message_turn_carries_target_into_graph_state(
@@ -754,6 +756,42 @@ class TestSessionReportHardening:
         content = path.read_text(encoding="utf-8")
         assert "abcdef1234567890" not in content
         assert "xyzvalue9876" not in content
+
+    def test_markdown_injection_is_neutralized(self, monkeypatch, tmp_path):
+        """#24: user/agent/error text is untrusted prose; rendered raw it
+        could forge report structure, phishing links, and raw HTML."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00005", model="m")
+        transcript.add_user(
+            "# 標題\n[點我](https://evil.example)\n<img src=x onerror=alert(1)>\n"
+            "- forged list item"
+        )
+        transcript.add_agent("![report](https://evil.example/fake.png)\n<pre>x</pre>")
+        transcript.add_error("1. fake ordered step\n<script>alert(2)</script>")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Structural spoofing: no injected heading/list starts a line.
+        assert not re_module.search(r"^# 標題", content, re_module.MULTILINE)
+        assert not re_module.search(r"^- forged list item", content, re_module.MULTILINE)
+        assert not re_module.search(r"^1\. fake ordered step", content, re_module.MULTILINE)
+        # Link/image syntax must not survive in bindable form.
+        assert "[點我](https://evil.example)" not in content
+        assert "![report](https://evil.example/fake.png)" not in content
+        # Raw HTML must be entity-escaped, not passed through.
+        assert "<img" not in content
+        assert "<script>" not in content
+        assert "<pre>" not in content
+        # The text itself is still readable (escaped forms keep the words).
+        assert "點我" in content
+        assert "forged list item" in content
+        assert "fake ordered step" in content
 
     def test_ws_message_with_null_content_still_writes_report(
         self, client, monkeypatch, results_dir

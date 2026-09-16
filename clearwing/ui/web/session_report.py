@@ -7,6 +7,7 @@ and on disconnect. Unlike the model's final message, this artifact always
 exists — even when the client disconnects mid-run.
 """
 
+import html
 import json
 import logging
 import os
@@ -79,6 +80,28 @@ def _md_cell(value: Any) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
+# Issue #24: transcript text is attacker-controllable prose (operator input,
+# model output, error strings). Rendered raw it can forge report structure
+# (headings, lists, block quotes), phishing links ([x](url)) and raw HTML
+# (<img>, <script>). Each line therefore gets its leading block marker
+# backslash-escaped and its brackets escaped so link/image syntax cannot
+# bind; & < > are HTML-escaped. Plain prose is unchanged.
+_MD_BLOCK_MARKER = re.compile(r"^(\s*)([#>\-*+=`])")
+_MD_ORDERED_MARKER = re.compile(r"^(\s*)(\d{1,9})([.)])(\s|$)")
+_MD_INLINE_BRACKETS = re.compile(r"([\[\]])")
+
+
+def _md_neutralize(text: str) -> str:
+    """Make untrusted transcript text inert as markdown (issue #24)."""
+    safe_lines = []
+    for line in text.splitlines():
+        line = _MD_BLOCK_MARKER.sub(r"\1\\\2", line)
+        line = _MD_ORDERED_MARKER.sub(r"\1\2\\\3\4", line)
+        line = _MD_INLINE_BRACKETS.sub(r"\\\1", line)
+        safe_lines.append(html.escape(line, quote=False))
+    return "\n".join(safe_lines)
+
+
 class SessionTranscript:
     """Accumulates one chat session's turns for deterministic reporting."""
 
@@ -142,7 +165,7 @@ class SessionTranscript:
             for i, msg in enumerate(self.user_messages, 1):
                 lines.append(f"### Request {i}")
                 lines.append("")
-                lines.append(_redact(msg).strip() or "(empty)")
+                lines.append(_md_neutralize(_redact(msg).strip()) or "(empty)")
                 lines.append("")
 
         if self.agent_messages:
@@ -151,7 +174,7 @@ class SessionTranscript:
             for i, msg in enumerate(self.agent_messages, 1):
                 lines.append(f"### Response {i}")
                 lines.append("")
-                lines.append(_redact(msg).strip() or "(empty)")
+                lines.append(_md_neutralize(_redact(msg).strip()) or "(empty)")
                 lines.append("")
 
         if self.tool_calls:
@@ -174,7 +197,7 @@ class SessionTranscript:
             lines.append("## Errors")
             lines.append("")
             for err in self.errors:
-                lines.append(f"- {_redact(err).strip()}")
+                lines.append(f"- {_md_neutralize(_redact(err).strip())}")
             lines.append("")
 
         lines.append(
