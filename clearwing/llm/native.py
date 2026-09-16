@@ -166,6 +166,24 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
+def _exception_chain_text(exc: BaseException) -> str:
+    """Lowercased str() of *exc* plus its __cause__/__context__ chain.
+
+    genai-pyo3 surfaces transport failures as a terse top-level message
+    ("Web call failed for model ...") whose real detail ("Reqwest error:
+    ... timed out") lives in the nested cause — top-level-only matching
+    misses the actual failure class (Codex PR-40 P1).
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(str(cur))
+        cur = cur.__cause__ or cur.__context__
+    return "\n".join(parts).lower()
+
+
 def _non_negative_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -2001,8 +2019,15 @@ class AsyncLLMClient:
 
     @staticmethod
     def _is_timeout_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        return "timed out" in text or "timeout" in text
+        text = _exception_chain_text(exc)
+        # "server disconnected" (aiohttp's close-after-accept wording) is
+        # billed with the same ambiguity as a read timeout — the request
+        # was sent and the provider may have generated — so it shares the
+        # conservative timeout_max_retries cap instead of the full
+        # rate-limit budget (Codex PR-40 P1).
+        return (
+            "timed out" in text or "timeout" in text or "server disconnected" in text
+        )
 
     # Subset of transport failures that provably occur *before* the request is
     # sent, so the provider never generated or billed. Safe to reroute through
@@ -2018,7 +2043,7 @@ class AsyncLLMClient:
     )
 
     def _is_definitely_unbilled_transport_error(self, exc: Exception) -> bool:
-        text = str(exc).lower()
+        text = _exception_chain_text(exc)
         return any(marker in text for marker in self._PRE_RESPONSE_TRANSPORT_MARKERS)
 
     @staticmethod

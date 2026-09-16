@@ -178,3 +178,88 @@ class TestEnvWiring:
         )
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip() == "5"
+
+
+def _nested_exc(top: str, cause: str) -> RuntimeError:
+    outer = RuntimeError(top)
+    outer.__cause__ = RuntimeError(cause)
+    return outer
+
+
+class TestExceptionChainClassification:
+    """Codex PR-40 P1s: genai nests the transport detail under a terse
+    top-level 'Web call failed' message, and 'Server disconnected' carries
+    the same billing ambiguity as a read timeout."""
+
+    def test_nested_timeout_is_classified(self):
+        exc = _nested_exc(
+            "Web call failed for model test-model",
+            "Reqwest error: error sending request: operation timed out",
+        )
+        assert _client()._is_timeout_error(exc)
+
+    def test_server_disconnected_shares_the_timeout_cap(self):
+        client = _client(rate_limit_max_retries=6, timeout_max_retries=2)
+        calls = 0
+
+        async def always_disconnected():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("Server disconnected")
+
+        with patch("clearwing.llm.native.asyncio.sleep", new=_no_sleep):
+            with pytest.raises(RuntimeError, match="Server disconnected") as exc_info:
+                asyncio.run(client._with_retries(always_disconnected))
+        # 1 attempt + timeout_max_retries(2), NOT the rate-limit budget of 6.
+        assert calls == 3
+        assert exc_info.value._clearwing_attempts == 2
+
+    def test_nested_preresponse_marker_counts_as_unbilled(self):
+        exc = _nested_exc(
+            "Web call failed for model test-model",
+            "error sending request: connection refused",
+        )
+        assert _client()._is_definitely_unbilled_transport_error(exc)
+
+    def test_dispatch_guard_blocks_nested_timeout_reroute(self):
+        client = _client()
+        rerouted = []
+
+        async def _record_fallback(*_a, **_k):
+            rerouted.append(1)
+            raise AssertionError("should not be reached")
+
+        class _NestedTimeoutClient:
+            async def achat(self, *_a, **_k):
+                raise _nested_exc(
+                    "Web call failed for model test-model", "read message timed out"
+                )
+
+        with patch.object(client, "_openai_chat_http_fallback", _record_fallback):
+            with pytest.raises(RuntimeError, match="Web call failed"):
+                asyncio.run(
+                    client._achat_provider_dispatch(_NestedTimeoutClient(), None, None)
+                )
+        assert rerouted == []
+
+    def test_dispatch_guard_allows_nested_preresponse_reroute(self):
+        client = _client()
+        rerouted = []
+
+        async def _fallback(*_a, **_k):
+            rerouted.append(1)
+            raise RuntimeError("OpenAI-compatible fallback failed with HTTP 500")
+
+        class _NestedRefusedClient:
+            async def achat(self, *_a, **_k):
+                raise _nested_exc(
+                    "Web call failed for model test-model",
+                    "error sending request: connection refused",
+                )
+
+        with patch.object(client, "_openai_chat_http_fallback", _fallback):
+            with pytest.raises(RuntimeError, match="fallback failed"):
+                asyncio.run(
+                    client._achat_provider_dispatch(_NestedRefusedClient(), None, None)
+                )
+        assert rerouted == [1]
