@@ -263,10 +263,17 @@ function startSession() {
       case 'flag_found':
         addMessage(`FLAG: ${data.flag || JSON.stringify(data)}`, 'flag');
         break;
-      case 'cost_update':
-        document.getElementById('cost').textContent = `Cost: $${(data.cost_usd || 0).toFixed(4)}`;
-        document.getElementById('tokens').textContent = `Tokens: ${data.tokens || 0}`;
+      case 'cost_update': {
+        // Telemetry frames carry per-call cost/token counts plus running
+        // session totals; the old cost_usd/tokens keys never existed on
+        // this frame (issue #10: the footer was permanently $0.00/0).
+        const cost = data.total_cost_usd ?? data.cost_usd ?? 0;
+        const tokens = data.total_tokens ??
+          ((data.input_tokens || 0) + (data.output_tokens || 0));
+        document.getElementById('cost').textContent = `Cost: $${(cost || 0).toFixed(4)}`;
+        document.getElementById('tokens').textContent = `Tokens: ${tokens || 0}`;
         break;
+      }
       case 'approval_needed': {
         const prompt = data.prompt || JSON.stringify(data);
         addApproval(prompt);

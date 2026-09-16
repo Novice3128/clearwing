@@ -100,8 +100,15 @@ class AuditLogger:
         output_tokens: int,
         cost_usd: float,
         agent: str = "main",
+        cached_tokens: int = 0,
     ) -> AuditEntry:
-        """Log an LLM API call."""
+        """Log an LLM API call.
+
+        ``cost_usd`` is the PER-CALL cost — callers used to pass the cost
+        tracker's process-wide running total, which double-counts when audit
+        rows are summed per session (issue #10). ``cached_tokens`` is the
+        subset of input tokens served from the provider's prompt cache.
+        """
         return self.log(
             "llm_call",
             agent=agent,
@@ -109,6 +116,7 @@ class AuditLogger:
                 "model": model,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cached_tokens": cached_tokens,
                 "cost_usd": cost_usd,
             },
         )

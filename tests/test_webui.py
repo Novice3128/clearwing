@@ -770,3 +770,120 @@ class TestReportDownloadEndpoint:
     def test_400_for_malformed_session_id(self, client):
         resp = client.get("/api/reports/..%2Fetc%2Fpasswd?api_key=" + API_KEY)
         assert resp.status_code in (400, 404)
+
+
+class _FakeCostGraph:
+    """Stands in for create_agent(): its astream fires COST_UPDATE events on
+    the process-wide bus (the way the real runtime's tracker does) and yields
+    one assistant state event. Emits: own-session call, foreign-session call,
+    own-session call."""
+
+    session_id = None
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+
+    async def astream(self, input_data, config, stream_mode="values"):
+        from clearwing.core.events import EventBus, EventType
+
+        del input_data, config, stream_mode
+        bus = EventBus()
+        emissions = [
+            (0.01, 1000, 100, self.session_id),
+            (0.02, 2000, 200, "someone-elses-session"),
+            (0.03, 3000, 300, self.session_id),
+        ]
+        for cost, in_, out, origin in emissions:
+            bus.emit(
+                EventType.COST_UPDATE,
+                {
+                    "input_tokens": in_,
+                    "output_tokens": out,
+                    "cached_tokens": 0,
+                    "cost": cost,
+                    # Process-global running total (polluted by other
+                    # sessions in a long-lived webui) — the adapter must
+                    # rewrite this per session (issue #10).
+                    "total_cost_usd": 99.0 + cost,
+                    "model": "glm-5.3",
+                    "provider": "openai",
+                    "session_id": origin,
+                    "elapsed_ms": 10,
+                },
+            )
+        yield {
+            "messages": [SimpleNamespace(type="ai", content="done", text="done")]
+        }
+
+
+class TestCostSessionScoping:
+    def test_cost_update_frames_are_session_scoped(self, client):
+        import json
+
+        with patch("clearwing.ui.web.app.create_agent", _FakeCostGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                frames = []
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    frames.append(msg)
+                    if msg["type"] == "complete":
+                        break
+
+        cost_frames = [f for f in frames if f["type"] == "cost_update"]
+        assert len(cost_frames) == 3
+        # Session-scoped totals replace the tracker's process-global ones.
+        assert cost_frames[0]["data"]["total_cost_usd"] == pytest.approx(0.01)
+        # A concurrent session's frame passes through raw instead of
+        # polluting this connection's totals.
+        assert cost_frames[1]["data"]["total_cost_usd"] == pytest.approx(99.02)
+        # ...and this session's accumulation skips it: 0.01 + 0.03.
+        assert cost_frames[2]["data"]["total_cost_usd"] == pytest.approx(0.04)
+        assert cost_frames[2]["data"]["total_tokens"] == 4400
+        # Per-call fields and attribution ride along untouched.
+        assert cost_frames[2]["data"]["cost"] == 0.03
+        assert cost_frames[2]["data"]["model"] == "glm-5.3"
+
+    def test_session_report_carries_scoped_totals(self, client):
+        import json
+
+        with patch("clearwing.ui.web.app.create_agent", _FakeCostGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                complete = None
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    if msg["type"] == "complete":
+                        complete = msg
+                        break
+
+        report_url = complete["data"]["report_url"]
+        report = client.get(report_url, headers=AUTH).text
+        # Session-scoped cost (0.01 + 0.03) and session-scoped tokens
+        # (4400) — not the last call's per-call token count.
+        assert "| Cost | $0.0400 |" in report
+        assert "| Tokens | 4400 |" in report
+
+    def test_second_start_rearms_session_totals(self, client):
+        import json
+
+        with patch("clearwing.ui.web.app.create_agent", _FakeCostGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                first_costs = []
+                for _round in range(2):
+                    ws.send_json({"type": "start", "target": "10.0.0.9"})
+                    ws.send_json({"type": "message", "content": "run"})
+                    while True:
+                        msg = json.loads(ws.receive_text())
+                        if msg["type"] == "cost_update":
+                            first_costs.append(msg)
+                        if msg["type"] == "complete":
+                            break
+                # Both rounds start from a fresh budget: each session's
+                # first frame is 0.01/1100, not the previous session's tail.
+                # (3 frames per round: own, foreign pass-through, own.)
+                assert first_costs[0]["data"]["total_cost_usd"] == pytest.approx(0.01)
+                assert first_costs[3]["data"]["total_cost_usd"] == pytest.approx(0.01)
+                assert first_costs[3]["data"]["total_tokens"] == 1100

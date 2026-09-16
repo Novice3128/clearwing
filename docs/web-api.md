@@ -226,15 +226,31 @@ Fires whenever the agent detects a flag-like token
 
 ### `cost_update`
 
-Periodic running-cost tick (`emit_cost(tokens, cost_usd)`).
+Emitted by the cost tracker after every LLM call (`CostTracker.record_llm_call`).
+Per-call counts plus session-scoped running totals for this connection
+(the process-wide tracker's cross-session totals are deliberately NOT what
+the wire reports — issue #10). Caveat: frames emitted while this session has
+NO running turn (e.g. an `/api/operate` job in the same process) pass
+through raw, carrying the emitter's process-global totals; `elapsed_ms` is
+0 unless the caller supplied a latency.
 
 | Field | Type | Notes |
 |---|---|---|
-| `tokens` | `integer` | Cumulative tokens for the session. |
-| `cost_usd` | `number` | Cumulative USD cost for the session. |
+| `input_tokens` | `integer` | Prompt tokens for this call. |
+| `output_tokens` | `integer` | Completion tokens for this call. |
+| `cached_tokens` | `integer` | Subset of input served from the prompt cache. |
+| `cost` | `number` | USD cost of this call (reference pricing). |
+| `total_cost_usd` | `number` | Session-scoped running cost. |
+| `total_tokens` | `number` | Session-scoped running token count. |
+| `model` | `string` | Model that served the call. |
+| `provider` | `string` | Provider name. |
+| `elapsed_ms` | `integer` | Wall-clock latency. |
 
 ```json
-{"type": "cost_update", "data": {"tokens": 18432, "cost_usd": 0.27}}
+{"type": "cost_update", "data": {"input_tokens": 23085, "output_tokens": 625,
+ "cached_tokens": 0, "cost": 0.0351, "total_cost_usd": 0.0702,
+ "total_tokens": 47420, "model": "glm-5.3", "provider": "openai",
+ "elapsed_ms": 3410}}
 ```
 
 ### `approval_needed`

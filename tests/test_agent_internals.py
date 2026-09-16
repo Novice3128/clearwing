@@ -1,6 +1,6 @@
 """Tests for the agent graph updates — flag detection, state expansion, guardrail integration."""
 
-from clearwing.agent.prompts import build_system_prompt
+from clearwing.agent.prompts import build_dynamic_context, build_system_prompt
 from clearwing.agent.runtime import FLAG_PATTERNS, detect_flags
 from clearwing.agent.state import AgentState
 from clearwing.agent.tools import get_all_tools
@@ -116,8 +116,11 @@ class TestBuildSystemPrompt:
             "flags_found": [{"flag": "flag{test}", "pattern": ".*"}],
             "loaded_skills": [],
         }
-        prompt = build_system_prompt(state)
-        assert "flag{test}" in prompt
+        # State-derived content rides the dynamic context note (#36), not
+        # the static system prompt.
+        note = build_dynamic_context(state)
+        assert "flag{test}" in note
+        assert "flag{test}" not in build_system_prompt(state)
 
     def test_prompt_includes_target(self):
         state = {
@@ -132,5 +135,6 @@ class TestBuildSystemPrompt:
             "flags_found": [],
             "loaded_skills": [],
         }
-        prompt = build_system_prompt(state)
-        assert "192.168.1.100" in prompt
+        note = build_dynamic_context(state)
+        assert "192.168.1.100" in note
+        assert "192.168.1.100" not in build_system_prompt(state)

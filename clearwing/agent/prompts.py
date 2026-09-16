@@ -41,9 +41,6 @@ Follow standard pentest methodology:
 - Report findings clearly with severity ratings
 - If a tool fails, explain why and suggest alternatives
 
-## Current Context
-{context}
-
 ## Available Capabilities
 - Port scanning (SYN, connect)
 - Service detection and banner grabbing
@@ -58,12 +55,6 @@ Follow standard pentest methodology:
 - Database queries for scan history
 - Runtime tool creation for custom workflows
 
-{loaded_skills}
-
-{episodic_context}
-
-{flags_context}
-
 ## Skills System
 You can load detailed knowledge about specific vulnerability types using the `load_skills` tool.
 Available skills: sql_injection, xss, ssrf, idor, xxe, auth_bypass, privesc_linux, privesc_windows, command_injection, file_upload, srp_attacks, kdf_analysis, padding_oracle, aead_misuse, key_hierarchy, tls_assessment, timing_attacks
@@ -71,6 +62,24 @@ Available skills: sql_injection, xss, ssrf, idor, xxe, auth_bypass, privesc_linu
 
 
 def build_system_prompt(state: dict) -> str:
+    """Static system prompt — byte-identical on every call.
+
+    The prompt cache (issue #36) keys on the request prefix: a system
+    prompt that embeds the growing scan state shifts every turn and forces
+    full-price re-processing of the whole prefix. All state-derived content
+    (current context, loaded skills, episodic recall, flags) is rendered
+    per-step by :func:`build_dynamic_context` and rides AFTER the cache
+    breakpoint as a trailing context note, so the model sees the same
+    information without invalidating the cache.
+
+    ``state`` is accepted for the SystemPromptFactory contract and ignored.
+    """
+    del state
+    return SYSTEM_PROMPT_TEMPLATE
+
+
+def _scan_state_lines(state: dict) -> list[str]:
+    """One-line summaries of the current scan state, in template order."""
     context_parts = []
 
     target = state.get("target")
@@ -113,16 +122,27 @@ def build_system_prompt(state: dict) -> str:
     if custom_tools:
         context_parts.append(f"Custom tools: {', '.join(custom_tools)}")
 
-    context = "\n".join(context_parts) if context_parts else "No scan data yet."
+    return context_parts
 
-    # Build loaded skills section
+
+def build_dynamic_context(state: dict) -> str:
+    """Per-step context note rendered from *state*.
+
+    Returned separately from the static system prompt so the runtime can
+    place it after the cache breakpoint (uncached tail) instead of inside
+    the cached prefix. Empty string when there is nothing to report.
+    """
+    sections: list[str] = []
+
+    target = state.get("target")
+    context_parts = _scan_state_lines(state)
+    if context_parts:
+        sections.append("## Current Context\n" + "\n".join(context_parts))
+
     loaded_skills = state.get("loaded_skills", [])
     if loaded_skills:
-        loaded_skills_section = "## Loaded Skills\n" + ", ".join(loaded_skills)
-    else:
-        loaded_skills_section = ""
+        sections.append("## Loaded Skills\n" + ", ".join(loaded_skills))
 
-    # Build episodic context section
     episodic_context = ""
     if target and EpisodicMemory:
         try:
@@ -133,18 +153,12 @@ def build_system_prompt(state: dict) -> str:
                 episodic_context = "## Previous Findings for This Target\n" + "\n".join(lines)
         except Exception:
             logger.debug("Failed to recall episodic memory for %s", target, exc_info=True)
+    if episodic_context:
+        sections.append(episodic_context)
 
-    # Build flags context section
     flags_found = state.get("flags_found", [])
     if flags_found:
         flag_lines = [f"- {f['flag']} (matched: {f['pattern']})" for f in flags_found]
-        flags_context = "## Flags Found\n" + "\n".join(flag_lines)
-    else:
-        flags_context = ""
+        sections.append("## Flags Found\n" + "\n".join(flag_lines))
 
-    return SYSTEM_PROMPT_TEMPLATE.format(
-        context=context,
-        loaded_skills=loaded_skills_section,
-        episodic_context=episodic_context,
-        flags_context=flags_context,
-    )
+    return "\n\n".join(sections)

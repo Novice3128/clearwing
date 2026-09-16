@@ -13,7 +13,7 @@ from clearwing.providers import ProviderManager, resolve_llm_endpoint
 from clearwing.providers.binding import AgentLimits
 from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
 
-from .prompts import build_system_prompt
+from .prompts import build_dynamic_context, build_system_prompt
 from .tools import get_all_tools, get_custom_tools
 
 
@@ -91,6 +91,7 @@ def build_react_graph(
     enable_event_bus: bool = True,
     enable_context_summarizer: bool = True,
     agent_limits=None,
+    dynamic_context_fn=None,
 ):
     del state_schema
     if state_updater_fn is None:
@@ -128,6 +129,7 @@ def build_react_graph(
         enable_event_bus=enable_event_bus,
         enable_context_summarizer=enable_context_summarizer,
         agent_limits=agent_limits,
+        dynamic_context_fn=dynamic_context_fn,
     )
 
 
@@ -215,6 +217,7 @@ def create_agent(
         llm_with_tools=llm,
         tools=all_tools,
         system_prompt_fn=build_system_prompt,
+        dynamic_context_fn=build_dynamic_context,
         state_schema=AgentState,
         model_name=model_name or DEFAULT_ANTHROPIC_MODEL,
         session_id=session_id,

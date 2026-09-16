@@ -26,6 +26,7 @@ from genai_pyo3 import (
     ChatResponse,
     Client,
     JsonSpec,
+    PromptTokensDetails,
     StreamEnd,
     Tool,
     Usage,
@@ -390,6 +391,20 @@ def _mark_cache_prefix(
         if msg.cache_control != want:
             msg.cache_control = want
     return list(messages)
+
+
+def _with_context_note(
+    messages: list[ChatMessage], context_note: str | None
+) -> list[ChatMessage]:
+    """Append the per-step dynamic context note AFTER the cache prefix is
+    marked, so the note — which changes every turn as scan state grows
+    (issue #36) — never enters the cached prefix. The breakpoint stays on
+    the last stable history message and the note rides as an uncached tail;
+    for OpenAI-style implicit prefix caching the request prefix up to the
+    note remains byte-stable across turns."""
+    if not context_note:
+        return messages
+    return messages + [ChatMessage("user", context_note)]
 
 
 def response_text(response: ChatResponse) -> str:
@@ -828,6 +843,7 @@ class AsyncLLMClient:
         response_schema_description: str | None = None,
         cache_prefix: bool = False,
         prompt_cache_key: str | None = None,
+        context_note: str | None = None,
     ) -> ChatResponse:
         request_tools = None
         if tools:
@@ -841,8 +857,11 @@ class AsyncLLMClient:
             ]
 
         system_prompt = system or self.default_system
+        request_messages = _with_context_note(
+            _mark_cache_prefix(messages, cache_prefix), context_note
+        )
         request = ChatRequest(
-            messages=_mark_cache_prefix(messages, cache_prefix),
+            messages=request_messages,
             system=system_prompt,
             tools=request_tools,
         )
@@ -856,7 +875,7 @@ class AsyncLLMClient:
         if self.provider_name == "openai_codex":
             top_p = None  # Codex gateway rejects sampling params
         reservation = self._reserve_spend_call(
-            messages=messages,
+            messages=request_messages,
             system=system_prompt,
             tools=tools,
             max_tokens=max_tokens,
@@ -975,6 +994,7 @@ class AsyncLLMClient:
         on_text_delta: Callable[[str], None] | None = None,
         cache_prefix: bool = False,
         prompt_cache_key: str | None = None,
+        context_note: str | None = None,
     ) -> ChatResponse:
         """Like ``achat`` but streams text deltas via *on_text_delta*.
 
@@ -991,6 +1011,7 @@ class AsyncLLMClient:
                 top_p=top_p,
                 cache_prefix=cache_prefix,
                 prompt_cache_key=prompt_cache_key,
+                context_note=context_note,
             )
 
         request_tools = None
@@ -999,8 +1020,11 @@ class AsyncLLMClient:
                 Tool(tool.name, tool.description, json.dumps(tool.schema)) for tool in tools
             ]
         system_prompt = system or self.default_system
+        request_messages = _with_context_note(
+            _mark_cache_prefix(messages, cache_prefix), context_note
+        )
         request = ChatRequest(
-            messages=_mark_cache_prefix(messages, cache_prefix),
+            messages=request_messages,
             system=system_prompt,
             tools=request_tools,
         )
@@ -1014,7 +1038,7 @@ class AsyncLLMClient:
         if self.provider_name == "openai_codex":
             top_p = None  # Codex gateway rejects sampling params
         reservation = self._reserve_spend_call(
-            messages=messages,
+            messages=request_messages,
             system=system_prompt,
             tools=tools,
             max_tokens=max_tokens,
@@ -1106,6 +1130,7 @@ class AsyncLLMClient:
                     max_tokens=max_tokens,
                     cache_prefix=cache_prefix,
                     prompt_cache_key=prompt_cache_key,
+                    context_note=context_note,
                 )
             raise
 
@@ -1798,10 +1823,15 @@ class AsyncLLMClient:
 
     def _usage_from_openai_payload(self, usage: dict[str, Any] | None) -> Usage:
         usage = usage or {}
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens")
         return Usage(
             prompt_tokens=usage.get("prompt_tokens"),
             completion_tokens=usage.get("completion_tokens"),
             total_tokens=usage.get("total_tokens"),
+            prompt_tokens_details=(
+                PromptTokensDetails(cached_tokens=cached) if cached is not None else None
+            ),
         )
 
     async def _with_retries(self, op) -> ChatResponse:

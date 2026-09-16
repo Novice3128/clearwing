@@ -407,7 +407,13 @@ def create_app():
         - Server sends: {"type": "tool_start", "tool": "scan_ports", "args": {...}}
         - Server sends: {"type": "tool_result", "tool": "scan_ports", "content": "..."}
         - Server sends: {"type": "flag_found", "flag": "...", "context": "..."}
-        - Server sends: {"type": "cost_update", "cost_usd": 0.05, "tokens": 1000}
+        - Server sends: {"type": "cost_update", "data": {"input_tokens": int,
+                       "output_tokens": int, "cached_tokens": int, "cost": float,
+                       "total_cost_usd": float, "total_tokens": int,
+                       "model": str, "provider": str, "elapsed_ms": int}} —
+                       cost/tokens are per call; total_* are session-scoped
+                       running totals for this connection while its turn is
+                       active (out-of-turn frames pass through raw)
         - Server sends: {"type": "approval_needed", "prompt": "..."}
         - Server sends: {"type": "error", "message": "..."}
         - Server sends: {"type": "stopped", "data": {"cancelled_turn": bool,
@@ -429,10 +435,44 @@ def create_app():
 
         message_queue: asyncio.Queue = asyncio.Queue()
         transcript: SessionTranscript | None = None
+        session_id: str | None = None
         # EventBus is a process-wide singleton whose payloads carry no session
         # id, so bus events can only be attributed while THIS session's turn
         # is running; record nothing outside the window.
         turn_state = {"active": False}
+
+        # Session-scoped cost totals (issue #10): CostTracker is a
+        # process-wide singleton whose running totals accumulate across
+        # webui sessions. While THIS session's turn is running, accumulate
+        # the per-call cost/tokens and rewrite a shallow copy for the wire
+        # and the transcript; the shared bus payload itself stays untouched
+        # (metrics gauges keep reading the process-global totals).
+        session_cost = {"cost_usd": 0.0, "tokens": 0}
+
+        def _session_scope_cost_update(data: dict) -> dict:
+            if not turn_state["active"]:
+                # Outside this session's turn the bus is unattributable
+                # (process-wide singleton): pass the frame through untouched.
+                return data
+            origin = data.get("session_id")
+            if origin is not None and origin != session_id:
+                # A concurrent session's call in the same process — keep
+                # the frame raw instead of polluting this connection's
+                # totals. Emissions without a session id (hunter, older
+                # callers) still accumulate while this turn runs.
+                return data
+            call_cost = data.get("cost")
+            if isinstance(call_cost, (int, float)):
+                session_cost["cost_usd"] += float(call_cost)
+            per_call_tokens = (data.get("input_tokens") or 0) + (
+                data.get("output_tokens") or 0
+            )
+            if isinstance(per_call_tokens, int) and per_call_tokens > 0:
+                session_cost["tokens"] += per_call_tokens
+            scoped = dict(data)
+            scoped["total_cost_usd"] = round(session_cost["cost_usd"], 10)
+            scoped["total_tokens"] = session_cost["tokens"]
+            return scoped
 
         def _record_in_transcript(event_name: str, data: Any) -> None:
             """Mirror bus events into the session report transcript."""
@@ -446,9 +486,19 @@ def create_app():
                 if transcript.tool_calls and transcript.tool_calls[-1].get("content_length") is None:
                     transcript.tool_calls[-1]["content_length"] = data.get("content_length")
             elif event_name == "cost_update":
-                # CostTracker emits total_cost_usd / input_tokens / output_tokens.
-                tokens = data.get("tokens")
-                if tokens is None:
+                # A concurrent session's frame passing through raw must not
+                # land in this session's report (last-write-wins would
+                # otherwise let a foreign total be the recorded one).
+                origin = data.get("session_id")
+                if origin is not None and origin != session_id:
+                    return
+                # The session-scoped copy carries running totals; fall back
+                # to the legacy flat keys, then per-call sums, for raw
+                # frames that skipped the adapter.
+                tokens = data.get("total_tokens")
+                if not isinstance(tokens, int):
+                    tokens = data.get("tokens")
+                if not isinstance(tokens, int):
                     tokens = (data.get("input_tokens") or 0) + (data.get("output_tokens") or 0)
                 transcript.set_cost(
                     data.get("total_cost_usd", data.get("cost_usd")), tokens
@@ -470,6 +520,11 @@ def create_app():
                             serializable = asdict(data)
                         else:
                             serializable = str(data)
+                        if (
+                            event_type_name == "cost_update"
+                            and isinstance(serializable, dict)
+                        ):
+                            serializable = _session_scope_cost_update(serializable)
                         message_queue.put_nowait(
                             {"type": event_type_name, "data": serializable}
                         )
@@ -734,6 +789,9 @@ def create_app():
                     target = data.get("target", "")
                     handler_target = target
                     session_id = uuid.uuid4().hex[:8]
+                    # A start frame begins a new session on this connection:
+                    # re-arm the session-scoped cost totals (issue #10).
+                    session_cost.update(cost_usd=0.0, tokens=0)
 
                     try:
                         graph = create_agent(

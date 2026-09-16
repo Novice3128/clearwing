@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from clearwing.agent.graph import create_agent
-from clearwing.agent.prompts import build_system_prompt
+from clearwing.agent.prompts import build_dynamic_context, build_system_prompt
 from clearwing.agent.state import AgentState
 from clearwing.agent.tooling import tool
 from clearwing.agent.tools import get_all_tools
@@ -61,8 +61,11 @@ class TestSystemPrompt:
             "custom_tool_names": [],
         }
         prompt = build_system_prompt(state)
-        assert "No scan data yet." in prompt
+        # Static prompt: byte-stable across steps for prefix caching (#36);
+        # state-derived content moved to the dynamic context note.
         assert "Clearwing Agent" in prompt
+        assert "{" not in prompt  # no unfilled template slots
+        assert build_dynamic_context(state) == ""
 
     def test_populated_state(self):
         state = {
@@ -76,12 +79,18 @@ class TestSystemPrompt:
             "custom_tool_names": ["my_scanner"],
         }
         prompt = build_system_prompt(state)
-        assert "10.0.0.1" in prompt
-        assert "80/tcp" in prompt
-        assert "CVE-2017-5638" in prompt
-        assert "Linux/Unix" in prompt
-        assert "abc123def456" in prompt
-        assert "my_scanner" in prompt
+        note = build_dynamic_context(state)
+        # The dynamic context note carries all state-derived content...
+        assert "## Current Context" in note
+        assert "10.0.0.1" in note
+        assert "80/tcp" in note
+        assert "CVE-2017-5638" in note
+        assert "Linux/Unix" in note
+        assert "abc123def456" in note
+        assert "my_scanner" in note
+        # ...while the static prompt stays byte-identical regardless of state.
+        empty_note_prompt = build_system_prompt({})
+        assert prompt == empty_note_prompt
 
 
 class TestToolList:
@@ -263,9 +272,27 @@ class _FakeNativeClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []  # each entry: (messages, system, tools)
+        self.calls_kwargs = []  # each entry: cache/prompt-cache kwargs
 
-    async def achat_stream(self, *, messages, system=None, tools=None, on_text_delta=None):
+    async def achat_stream(
+        self,
+        *,
+        messages,
+        system=None,
+        tools=None,
+        on_text_delta=None,
+        cache_prefix=False,
+        prompt_cache_key=None,
+        context_note=None,
+    ):
         self.calls.append((list(messages), system, tools))
+        self.calls_kwargs.append(
+            {
+                "cache_prefix": cache_prefix,
+                "prompt_cache_key": prompt_cache_key,
+                "context_note": context_note,
+            }
+        )
         resp = self._responses.pop(0)
         if on_text_delta and resp.first_text:
             on_text_delta(resp.first_text)
@@ -334,6 +361,11 @@ class TestNativeToolLoopRoundTrip:
         # Two LLM turns were made.
         assert len(client.calls) == 2
 
+        # Prompt-cache wiring (#36): every assistant step asks for a
+        # cacheable prefix routed by the session id.
+        for kwargs in client.calls_kwargs:
+            assert kwargs["cache_prefix"] is True
+
         # On the SECOND call, the history sent to the model must contain the
         # assistant tool-call turn and the paired tool-result turn.
         second_messages = client.calls[1][0]
@@ -355,3 +387,53 @@ class TestNativeToolLoopRoundTrip:
         assert last.type == "ai"
         assert last.text == "all done"
         assert final.get("total_tokens", 0) > 0
+
+    @pytest.mark.asyncio
+    async def test_cache_kwargs_and_context_note_flow_through_graph(self):
+        import json
+
+        from genai_pyo3 import ToolCall
+
+        from clearwing.agent.graph import build_react_graph
+        from clearwing.agent.prompts import build_dynamic_context
+
+        @tool
+        def noop_tool(value: str) -> str:
+            """Noop."""
+            return value
+
+        tc = ToolCall("call-1", "noop_tool", json.dumps({"value": "x"}))
+        client = _FakeNativeClient(
+            [
+                _FakeResponse(text="", tool_calls=[tc], usage=_FakeUsage(10, 5, 15)),
+                _FakeResponse(text="done", usage=_FakeUsage(3, 2, 5)),
+            ]
+        )
+        graph = build_react_graph(
+            llm_with_tools=client,
+            tools=[noop_tool],
+            system_prompt_fn=lambda state: "sys",
+            model_name="fake-model",
+            session_id="sess-cache-1",
+            dynamic_context_fn=build_dynamic_context,
+            enable_knowledge_graph=False,
+            enable_audit=False,
+            enable_episodic_memory=False,
+            enable_context_summarizer=False,
+        )
+        config = {"configurable": {"thread_id": "t1"}}
+        async for _ in graph.astream(
+            {"messages": [{"role": "user", "content": "go"}], "target": "10.9.9.9"},
+            config,
+        ):
+            pass
+
+        assert len(client.calls_kwargs) == 2
+        for kwargs in client.calls_kwargs:
+            assert kwargs["cache_prefix"] is True
+            assert kwargs["prompt_cache_key"] == "sess-cache-1"
+            # The dynamic context note carries the state-derived target...
+            assert "## Current Context" in (kwargs["context_note"] or "")
+            assert "10.9.9.9" in (kwargs["context_note"] or "")
+        # ...while the system prompt stays byte-static across steps.
+        assert client.calls[0][1] == client.calls[1][1]

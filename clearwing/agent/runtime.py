@@ -199,6 +199,7 @@ class NativeAgentGraph:
         enable_event_bus: bool,
         enable_context_summarizer: bool,
         agent_limits: AgentLimits | None = None,
+        dynamic_context_fn: Callable[[dict[str, Any]], str] | None = None,
     ) -> None:
         self.llm = llm
         self.agent_limits = agent_limits
@@ -206,6 +207,13 @@ class NativeAgentGraph:
         self.tools = {tool.name: tool for tool in tools}
         self.system_prompt_fn = system_prompt_fn
         self.model_name = model_name
+        # Stable per-graph label: prompt-cache routing key and session
+        # attribution (issue #10 live evidence: the graph never kept it).
+        self.session_id = session_id
+        # Renders the per-step dynamic context (scan state, loaded skills,
+        # episodic recall, flags) that rides AFTER the cache breakpoint —
+        # keeping the system prompt byte-stable for prefix caching (#36).
+        self.dynamic_context_fn = dynamic_context_fn
         self.state_updater_fn = state_updater_fn
         self.knowledge_graph_populator_fn = knowledge_graph_populator_fn
         self.input_guardrail_tool_names = set(input_guardrail_tool_names)
@@ -215,6 +223,13 @@ class NativeAgentGraph:
         self._pending: dict[str, _PendingToolResume | None] = {}
         # thread_id -> (streak_key, consecutive identical failure count)
         self._failure_runs: dict[str, tuple[str, int]] = {}
+        # thread_id -> {"steps": n, "tool_calls_total": m} for the logical
+        # turn's budget guards. Must survive approval resumes (_aresume
+        # restarts _arun_loop, which re-reads these) and reset only when a
+        # new user turn starts. Kept out of graph state on purpose:
+        # _merge_input copies arbitrary input keys into state, so a state
+        # key could be clobbered to re-grant the budget (issue #23).
+        self._loop_counters: dict[str, dict[str, int]] = {}
 
         self.cost_tracker = (
             CostTracker() if enable_cost_tracker and capabilities.has("telemetry") else None
@@ -281,6 +296,12 @@ class NativeAgentGraph:
                     thread_id,
                 )
                 self._stop_cleanup(thread_id)
+            # A new user turn starts a fresh logical turn: re-grant the
+            # budget guards. The Command(resume) path above must NOT reset —
+            # repeated approve would otherwise bypass max_steps/max_tool_calls
+            # (issue #23). Operator stop/cancel also deliberately preserve
+            # spent budget: only new input resets.
+            self._loop_counters.pop(thread_id, None)
             self._merge_input(state, input_data)
             async for event in self._arun_loop(thread_id):
                 yield event
@@ -389,21 +410,25 @@ class NativeAgentGraph:
         limits = self.agent_limits
         max_steps = limits.max_steps if limits else None
         max_tool_calls = limits.max_tool_calls if limits else None
-        steps = 0
-        tool_calls_total = 0
+        # Counters live per-thread on the instance (not locals): _aresume
+        # restarts this loop after an approval pause and must continue the
+        # logical turn's budget instead of re-granting it (issue #23).
+        counters = self._loop_counters.setdefault(
+            thread_id, {"steps": 0, "tool_calls_total": 0}
+        )
         while True:
-            if max_steps is not None and steps >= max_steps:
+            if max_steps is not None and counters["steps"] >= max_steps:
                 logger.info("agent loop stopped: reached max_steps=%d", max_steps)
                 break
             assistant_event = await self._aassistant_step(state)
-            steps += 1
+            counters["steps"] += 1
             yield assistant_event
             last = state["messages"][-1]
             tool_calls = getattr(last, "tool_calls", []) or []
             if not tool_calls:
                 break
             if max_tool_calls is not None:
-                budget_left = max_tool_calls - tool_calls_total
+                budget_left = max_tool_calls - counters["tool_calls_total"]
                 if budget_left <= 0:
                     logger.info(
                         "agent loop stopped: reached max_tool_calls=%d", max_tool_calls
@@ -439,7 +464,7 @@ class NativeAgentGraph:
                         )
                     )
                     tool_calls = tool_calls[:budget_left]
-            tool_calls_total += len(tool_calls)
+            counters["tool_calls_total"] += len(tool_calls)
             tool_events, paused, halted = await self._arun_tool_calls(
                 state, tool_calls, resume_decision=Ellipsis
             )
@@ -477,15 +502,30 @@ class NativeAgentGraph:
         system = "\n\n".join(part for part in (sys_prompt, system) if part) or sys_prompt
 
         provider_name = getattr(self.llm, "provider_name", None)
+        # Prompt-cache wiring (issue #36): the growing history is the
+        # cacheable prefix (single ephemeral breakpoint on the last stable
+        # message, applied by the client), routed per-session so
+        # OpenAI-style providers keep hitting the same prefix cache. The
+        # per-step context note is appended after the breakpoint and never
+        # cached. Both are inert on providers without caching.
+        context_note = self.dynamic_context_fn(state) if self.dynamic_context_fn else None
         response = await self.llm.achat_stream(
             messages=chat_messages,
             system=system,
             tools=self.native_tools or None,
             on_text_delta=self.on_text_delta,
+            cache_prefix=True,
+            prompt_cache_key=self.session_id or None,
+            context_note=context_note,
         )
         usage = response.usage
         input_tokens = (usage.prompt_tokens or 0) if usage else 0
         output_tokens = (usage.completion_tokens or 0) if usage else 0
+        # Prompt-cache hits: providers report them in prompt_tokens_details;
+        # older genai builds and test doubles may not expose the field at all
+        # (same getattr discipline as the hunter path).
+        details = getattr(usage, "prompt_tokens_details", None) if usage else None
+        cached_tokens = (getattr(details, "cached_tokens", None) or 0) if details else 0
         assistant_text = response_text(response)
         # tool_calls are raw genai ToolCall objects (.call_id/.fn_name/
         # .fn_arguments). Store them on the AIMessage so the next turn's
@@ -528,20 +568,26 @@ class NativeAgentGraph:
         state.setdefault("messages", []).append(ai_message)
 
         if self.cost_tracker and (input_tokens or output_tokens):
-            self.cost_tracker.record_llm_call(
+            call_cost = self.cost_tracker.record_llm_call(
                 input_tokens,
                 output_tokens,
                 pricing_model,
+                cached_tokens=cached_tokens,
                 provider=provider_name,
+                session_id=self.session_id,
             )
             state["total_cost_usd"] = self.cost_tracker.total_cost_usd
             state["total_tokens"] = self.cost_tracker.input_tokens + self.cost_tracker.output_tokens
             if self.audit_logger:
+                # Per-call cost, not the tracker's process-wide running total:
+                # the cumulative value double-counts when audit rows are
+                # summed per session (issue #10 live evidence).
                 self.audit_logger.log_llm_call(
                     model=effective_model,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
-                    cost_usd=self.cost_tracker.total_cost_usd,
+                    cost_usd=call_cost,
+                    cached_tokens=cached_tokens,
                 )
 
         if self.event_bus:

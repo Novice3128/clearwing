@@ -77,7 +77,12 @@ def test_openai_fallback_parses_reasoning_content_usage_and_tool_calls():
                 }
             }
         ],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 5,
+            "total_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 7},
+        },
     }
 
     response = client._chat_response_from_openai_payload(payload)
@@ -85,6 +90,10 @@ def test_openai_fallback_parses_reasoning_content_usage_and_tool_calls():
     assert response.first_text == "visible answer"
     assert response.reasoning_content == "private reasoning"
     assert response.usage.prompt_tokens == 3
+    # Cache hits must survive the fallback transport's usage rebuild
+    # (issue #36: dropping them billed cached input at full rate).
+    details = response.usage.prompt_tokens_details
+    assert details is not None and details.cached_tokens == 7
     [tool_call] = response.tool_calls
     assert tool_call.call_id == "call_1"
     assert tool_call.fn_name == "lookup"
