@@ -256,6 +256,13 @@ def resolve_llm_endpoint(
         3. config.yaml `provider:` section
         4. Default (Anthropic claude-sonnet-4-6 via ANTHROPIC_API_KEY)
 
+    One field is NOT purely per-field: the config api_key is scoped to the
+    config base_url. When the final base_url came from the CLI/env tier
+    (e.g. a webui start frame pointing at an arbitrary host), the
+    config-layer credential is excluded from the api_key merge — it must
+    never authenticate a different endpoint than the one the config block
+    named. `model` merging is unaffected.
+
     The returned `source` names the strongest tier that contributed any
     field ("cli" | "env" | "config" | "default"), which keeps mixed-source
     endpoints debuggable via `describe()`.
@@ -338,7 +345,17 @@ def resolve_llm_endpoint(
     # 1-3. Per-field merge: CLI > CLEARWING_* env > config.yaml.
     base_url = cli_base_url or env_base_url or cfg_base_url
     model = cli_model or env_model or cfg_model
-    api_key = cli_api_key or env_api_key or cfg_api_key
+    # Credential scoping: the config api_key authenticates the endpoint the
+    # config block itself named, so it may only ride along when the final
+    # base_url came from the config tier (same rule the adapter override
+    # follows below). A CLI/env-supplied base_url — e.g. a webui start frame
+    # pointing at an arbitrary host — must never receive the config-layer
+    # credential. The model merge above is deliberately unaffected (#16:
+    # a deferred model stays deferred).
+    if cli_base_url or env_base_url:
+        api_key = cli_api_key or env_api_key
+    else:
+        api_key = cli_api_key or env_api_key or cfg_api_key
     has_cfg = bool(cfg_base_url or cfg_model or cfg_api_key)
     source = (
         "cli" if has_cli else "env" if has_env else "config" if has_cfg else "default"

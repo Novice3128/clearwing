@@ -3,6 +3,7 @@
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -157,6 +158,68 @@ class TestSessionStore:
             session, SimpleNamespace(llm=SimpleNamespace(model_name="kimi-k2"))
         )
         assert session.model == "kimi-k2"
+
+
+class TestTuiSessionWriteBack:
+    """Three-lens review (F8): the TUI exit write-back (resolved model +
+    status) must survive `app.run()` raising — the graph only exists after
+    the TUI's on_mount, so a crash used to skip the write-back entirely."""
+
+    def _run(self, monkeypatch, run_outcome):
+        import clearwing.ui.commands.interactive as interactive
+
+        saved = {}
+
+        class _FakeStore:
+            def save(self, session):
+                saved["session"] = session
+
+        monkeypatch.setattr(interactive, "SessionStore", _FakeStore)
+
+        class _FakeApp:
+            def __init__(self, **kwargs):
+                self._agent_graph = SimpleNamespace(
+                    llm=SimpleNamespace(model_name="glm-5.3")
+                )
+
+            def run(self):
+                run_outcome()
+
+        monkeypatch.setattr(interactive, "ClearwingApp", _FakeApp)
+
+        session = SimpleNamespace(session_id="sec-tui", status="running", model="")
+        cli = SimpleNamespace(console=SimpleNamespace(print=lambda *a, **k: None))
+        args = SimpleNamespace(
+            target="t",
+            model=None,
+            model_explicit=False,
+            base_url=None,
+            api_key=None,
+        )
+        return interactive, saved, session, cli, args
+
+    def test_normal_exit_writes_back_completed_and_model(self, monkeypatch):
+        interactive, saved, session, cli, args = self._run(monkeypatch, lambda: None)
+
+        interactive._run_tui(cli, args, session)
+
+        assert session.model == "glm-5.3"
+        assert session.status == "completed"
+        assert saved["session"] is session
+
+    def test_crashing_tui_still_writes_back_model(self, monkeypatch):
+        def boom():
+            raise RuntimeError("tui exploded")
+
+        interactive, saved, session, cli, args = self._run(monkeypatch, boom)
+
+        with pytest.raises(RuntimeError):
+            interactive._run_tui(cli, args, session)
+
+        # The crash must not lose the write-back: model resolved, row saved.
+        assert session.model == "glm-5.3"
+        assert session.status == "error"
+        assert saved["session"] is session
 
 
 # =========================================================================

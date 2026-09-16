@@ -41,10 +41,18 @@ _LLM_PROGRESS_INTERVAL_SECONDS = 10
 _PUMP_SEND_RETRY_SECONDS = 0.5
 
 
-def _last_ai_content(values: dict[str, Any] | None) -> str:
-    """Last non-empty AI message text from a graph state snapshot."""
+def _ai_text_stats(values: dict[str, Any] | None) -> tuple[int, str]:
+    """(count of AI messages carrying text, last such text) for a snapshot.
+
+    The count matters as much as the text: a resume whose new reply is
+    byte-identical to the previous turn's last AI text (a terse "Done.")
+    still increments it, so a (count, last_text) fingerprint sees the new
+    message where a text-only fingerprint would not.
+    """
     messages = (values or {}).get("messages", [])
-    for message in reversed(messages):
+    count = 0
+    last_text = ""
+    for message in messages:
         if getattr(message, "type", "") != "ai":
             continue
         content = message.content
@@ -55,23 +63,29 @@ def _last_ai_content(values: dict[str, Any] | None) -> str:
                 if isinstance(part, dict) and part.get("type") == "text"
             )
         if content:
-            return content
-    return ""
+            count += 1
+            last_text = content
+    return count, last_text
 
 
-def _state_fingerprint(graph_ref: Any, config_ref: dict) -> str | None:
-    """Last-AI-content fingerprint of the graph state (issue #33).
+def _last_ai_content(values: dict[str, Any] | None) -> str:
+    """Last non-empty AI message text from a graph state snapshot."""
+    return _ai_text_stats(values)[1]
+
+
+def _state_fingerprint(graph_ref: Any, config_ref: dict) -> tuple[int, str] | None:
+    """(AI-text-count, last-AI-text) fingerprint of the graph state (#33).
 
     Used to tell a turn that surfaced new assistant text from one that
     left the previous turn's last AI message as-is (stale resume). None
-    when the state cannot be read (e.g. graphs without ``get_state``) —
-    callers treat that as "no before-sample available".
+    only when the state cannot be read (e.g. graphs without ``get_state``)
+    — callers treat that as unreadable and do not replay anything.
     """
     try:
         values = graph_ref.get_state(config_ref).values
     except Exception:
         return None
-    return _last_ai_content(values) or None
+    return _ai_text_stats(values)
 
 
 def _make_session_store():
@@ -94,15 +108,19 @@ def _state_dir_status() -> tuple[bool, str]:
     a read-only volume) breaks SessionStore and every state-writing
     endpoint; /api/health must surface that instead of reporting "ok"
     while /api/sessions 500s on every call.
+
+    The probe file name is unique per call: concurrent health polls used
+    to race on one fixed `.health_probe` path (one caller's unlink hit
+    another's write → FileNotFoundError → spurious 503s).
     """
     from clearwing.core.config import clearwing_home
 
     home = clearwing_home()
     try:
         home.mkdir(parents=True, exist_ok=True)
-        probe = home / ".health_probe"
+        probe = home / f".health_probe.{uuid.uuid4().hex}"
         probe.write_text("", encoding="utf-8")
-        probe.unlink()
+        probe.unlink(missing_ok=True)
     except OSError as exc:
         return False, f"state dir {home} is not writable: {exc}"
     return True, ""
@@ -185,12 +203,19 @@ def create_app():
     async def health():
         # Issue #7: the state directory's writability is part of health —
         # degraded answers 503 so orchestration stops trusting a container
-        # whose /api/sessions would 500 on every call.
+        # whose /api/sessions would 500 on every call. The detail stays
+        # generic on the wire (this endpoint is unauthenticated — no
+        # internal paths/errno); the full reason goes to the server log.
         ok, reason = _state_dir_status()
         if not ok:
+            logger.warning("Health degraded: %s", reason)
             return JSONResponse(
                 status_code=503,
-                content={"status": "degraded", "service": "clearwing", "detail": reason},
+                content={
+                    "status": "degraded",
+                    "service": "clearwing",
+                    "detail": "state directory unavailable",
+                },
             )
         return {"status": "ok", "service": "clearwing"}
 
@@ -199,7 +224,10 @@ def create_app():
         """List all known sessions."""
         store = _make_session_store()
         if not store.available:
-            raise HTTPException(status_code=503, detail=store.unavailable_reason)
+            # Unauthenticated endpoint: generic detail on the wire, full
+            # reason (paths, errno) in the server log only.
+            logger.warning("Session store unavailable: %s", store.unavailable_reason)
+            raise HTTPException(status_code=503, detail="session store unavailable")
         sessions = store.list_sessions()
         return [
             {
@@ -219,7 +247,8 @@ def create_app():
         """Get details for a specific session."""
         store = _make_session_store()
         if not store.available:
-            raise HTTPException(status_code=503, detail=store.unavailable_reason)
+            logger.warning("Session store unavailable: %s", store.unavailable_reason)
+            raise HTTPException(status_code=503, detail="session store unavailable")
         try:
             session = store.load(session_id)
         except FileNotFoundError as exc:
@@ -881,12 +910,15 @@ def create_app():
             sent_error = False
             produced_new = False
             try:
-                # Fingerprint the last AI text before the resume (issue #33):
-                # a resume that only appends tool output — or a stale approve
+                # Fingerprint the AI-text stats before the resume (#33): a
+                # resume that only appends tool output — or a stale approve
                 # with nothing pending — leaves it unchanged, and the
                 # previous turn's text must not be replayed as a fresh
-                # agent_message. The old message-count probe was permanently
-                # True whenever get_state failed and silently replayed.
+                # agent_message. The (count, last_text) pair still catches a
+                # new reply whose text is byte-identical to the last one.
+                # An unreadable before-state is conservative: nothing is
+                # replayed (the turn's own error path already covers real
+                # failures).
                 before = _state_fingerprint(graph_ref, config_ref)
                 turn_state["active"] = True
                 heartbeat = asyncio.create_task(_llm_progress_heartbeat())
@@ -902,11 +934,10 @@ def create_app():
                 if not await _safe_send(_error_payload(e)):
                     return
             else:
-                values = getattr(snapshot, "values", None)
-                after = _last_ai_content(values) or None
-                produced_new = after is not None and after != before
+                after = _ai_text_stats(getattr(snapshot, "values", None))
+                produced_new = before is not None and after != before
                 if produced_new:
-                    content = after
+                    content = after[1]
                     if transcript_ref:
                         transcript_ref.add_agent(content)
                     if not await _safe_send(

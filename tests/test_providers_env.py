@@ -57,7 +57,9 @@ class TestPerFieldMerge:
     def test_cli_base_url_plus_config_model(self, clean_env):
         # #8: `--base-url` alone used to guess the model from the hostname
         # and drop the configured api_key; per-field it only overrides its
-        # own field.
+        # own field. The config api_key itself must NOT follow the CLI
+        # base_url (credential scoping) — the frame-layer key falls back to
+        # the placeholder instead of leaking to another host.
         ep = resolve_llm_endpoint(
             cli_base_url="https://api.deepseek.com/v1",
             config_provider=self.CONFIG,
@@ -65,8 +67,22 @@ class TestPerFieldMerge:
         assert ep.provider == "openai_compat"
         assert ep.base_url == "https://api.deepseek.com/v1"
         assert ep.model == "anthropic/claude-opus-4"
-        assert ep.api_key == "sk-or-config"
+        assert ep.api_key != "sk-or-config"
+        assert ep.api_key == "not-needed"  # placeholder_for(cli base_url)
         assert ep.source == "cli"
+
+    def test_cli_base_url_excludes_config_api_key(self, clean_env):
+        """Regression (three-lens review): a CLI/frame base_url pointing at
+        an arbitrary host must never receive the config-layer credential —
+        while the config model still defers in per-field."""
+        ep = resolve_llm_endpoint(
+            cli_base_url="https://attacker.example/v1",
+            config_provider=self.CONFIG,
+        )
+        assert ep.base_url == "https://attacker.example/v1"
+        assert ep.model == "anthropic/claude-opus-4"  # model still defers
+        assert ep.api_key != "sk-or-config"
+        assert ep.api_key == "not-needed"
 
     def test_cli_api_key_plus_config_endpoint(self, clean_env):
         ep = resolve_llm_endpoint(
@@ -97,6 +113,10 @@ class TestPerFieldMerge:
         ep = resolve_llm_endpoint(config_provider=self.CONFIG)
         assert ep.base_url == "https://api.deepseek.com/v1"
         assert ep.model == "anthropic/claude-opus-4"
+        # Credential scoping: the env-tier base_url does not receive the
+        # config-layer api_key either.
+        assert ep.api_key != "sk-or-config"
+        assert ep.api_key == "not-needed"
         assert ep.source == "env"
 
     def test_env_model_plus_config_credentials(self, clean_env, monkeypatch):
@@ -125,6 +145,18 @@ class TestPerFieldMerge:
             config_provider={**self.CONFIG, "adapter": "openai_resp"},
         )
         assert ep.adapter is None
+
+    def test_env_api_key_still_applies_to_cli_base_url(self, clean_env, monkeypatch):
+        """Pre-existing main behavior (kept): CLEARWING_API_KEY rides along
+        with a CLI base_url via the endpoint-construction fallbacks — only
+        the config-layer key is scoped to the config base_url."""
+        monkeypatch.setenv(ENV_API_KEY, "sk-env")
+        ep = resolve_llm_endpoint(
+            cli_base_url="https://api.deepseek.com/v1",
+            config_provider=self.CONFIG,
+        )
+        assert ep.base_url == "https://api.deepseek.com/v1"
+        assert ep.api_key == "sk-env"
 
     def test_config_adapter_survives_when_base_url_unmatched(self, clean_env):
         ep = resolve_llm_endpoint(config_provider={**self.CONFIG, "adapter": "openai_resp"})

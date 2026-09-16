@@ -31,7 +31,12 @@ def add_parser(subparsers):
         "config.yaml / env, falling back to claude-sonnet-4-6",
     )
     parser.add_argument("--target", help="Initial target IP address")
-    parser.add_argument("--resume", metavar="SESSION_ID", help="Resume a previous session by ID")
+    parser.add_argument(
+        "--resume",
+        metavar="SESSION_ID",
+        help="Resume a previous session by ID; the stored model is pinned "
+        "for the resumed run (pass --model to override it)",
+    )
     parser.add_argument(
         "--no-tui", action="store_true", help="Use legacy Rich-based loop instead of Textual TUI"
     )
@@ -171,7 +176,14 @@ def _sync_session_model(session, graph) -> None:
 
 
 def _run_tui(cli, args, session=None):
-    """Launch the Textual TUI."""
+    """Launch the Textual TUI.
+
+    The session row write-back (resolved model + final status) lives in a
+    finally: a crashing `app.run()` must still persist what actually ran —
+    the graph is created inside the TUI's on_mount, so skipping the
+    write-back on crash would leave a deferred-model session row as ""
+    forever. A crash re-raises after the save (the CLI still exits loud).
+    """
     session_id = session.session_id if session else None
     app = ClearwingApp(
         target=args.target,
@@ -181,17 +193,23 @@ def _run_tui(cli, args, session=None):
         api_key=getattr(args, "api_key", None),
         model_explicit=getattr(args, "model_explicit", args.model is not None),
     )
-    app.run()
-
-    if session:
-        try:
-            session.status = "completed"
-            # The graph is created inside the TUI's on_mount; mirror its
-            # resolved model into the session row before the final save.
-            _sync_session_model(session, getattr(app, "_agent_graph", None))
-            SessionStore().save(session)
-        except Exception:
-            logger.debug("Failed to save session on TUI exit", exc_info=True)
+    exit_status = "completed"
+    try:
+        app.run()
+    except Exception:
+        exit_status = "error"
+        logger.exception("TUI crashed")
+        raise
+    finally:
+        if session:
+            try:
+                session.status = exit_status
+                # The graph is created inside the TUI's on_mount; mirror its
+                # resolved model into the session row before the final save.
+                _sync_session_model(session, getattr(app, "_agent_graph", None))
+                SessionStore().save(session)
+            except Exception:
+                logger.debug("Failed to save session on TUI exit", exc_info=True)
 
 
 def _run_interactive_legacy(cli, args, session=None):

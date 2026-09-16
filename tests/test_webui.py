@@ -64,18 +64,41 @@ class TestStateDirDegradation:
         data = resp.json()
         assert data["status"] == "degraded"
         assert data["service"] == "clearwing"
-        assert "not writable" in data["detail"]
+        # Unauthenticated endpoint: the wire detail is generic; the internal
+        # path/errno never crosses the wire (they go to the server log).
+        assert data["detail"] == "state directory unavailable"
+        assert "blocked-home" not in data["detail"]
 
     def test_sessions_returns_503_not_500(self, client, monkeypatch, tmp_path):
         self._block_home(monkeypatch, tmp_path)
         resp = client.get("/api/sessions")
         assert resp.status_code == 503
-        assert "not writable" in resp.json()["detail"]
+        assert resp.json()["detail"] == "session store unavailable"
+        assert "blocked-home" not in resp.json()["detail"]
 
     def test_session_detail_returns_503_not_500(self, client, monkeypatch, tmp_path):
         self._block_home(monkeypatch, tmp_path)
         resp = client.get("/api/sessions/abc123")
         assert resp.status_code == 503
+        assert resp.json()["detail"] == "session store unavailable"
+
+
+class TestHealthProbeConcurrency:
+    """Three-lens review (F3): concurrent /api/health polls used to race on
+    one fixed probe path (unlink vs. write → spurious 503s)."""
+
+    def test_concurrent_probes_all_report_ok(self, monkeypatch, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+
+        import clearwing.core.config as config_mod
+        import clearwing.ui.web.app as app_module
+
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: tmp_path / "home")
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(
+                pool.map(lambda _: app_module._state_dir_status(), range(300))
+            )
+        assert all(ok for ok, _ in results)
 
 
 class TestSessionEndpoints:
@@ -340,6 +363,11 @@ class _FakeGraph:
     def __init__(self, events=None, resume_messages=None):
         self.events = events or []
         self.resume_messages = resume_messages or []
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values={"messages": []}, next=(), tasks=[])
 
     async def astream(self, input_msg, config, stream_mode="values"):
         for ev in self.events:
@@ -825,6 +853,53 @@ class TestSessionReportHardening:
         assert "forged list item" in content
         assert "fake ordered step" in content
 
+    def test_table_cell_injection_is_neutralized(self, monkeypatch, tmp_path):
+        """Three-lens review (F2): table cells (Target/Model/tool args) are
+        attacker-controllable too — HTML and link syntax must not survive
+        them, at the same neutralization level as the prose path."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00006", target='<img src=x onerror=alert(1)>', model="m"
+        )
+        transcript.add_tool("download", args="[Download](http://evil.example)")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Raw HTML in the Target cell must be entity-escaped (inert).
+        assert "<img" not in content
+        assert "&lt;img src=x onerror=alert(1)&gt;" in content
+        # Bindable link syntax in the tool-args cell must be broken.
+        assert "[Download](http://evil.example)" not in content
+        # The words survive (escaped, still readable).
+        assert "Download" in content
+
+    def test_tilde_fence_and_forged_table_rows_are_escaped(self, monkeypatch, tmp_path):
+        """Three-lens review (F4): an unclosed ~~~ fence used to swallow the
+        rest of the report, and `| a | b |` lines could forge GFM tables
+        (their leading char is `|`, which the block-marker rules miss)."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00007", model="m")
+        transcript.add_user("~~~\ninside a fence\n| a | b |\n|---|---|\nstill fenced")
+        transcript.add_agent("real answer after the fence attempt")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert not re_module.search(r"^~~~", content, re_module.MULTILINE)
+        assert not re_module.search(r"^\| a \| b \|", content, re_module.MULTILINE)
+        assert not re_module.search(r"^\|---\|---\|", content, re_module.MULTILINE)
+        # Everything after the pseudo-fence is still rendered as prose.
+        assert "real answer after the fence attempt" in content
+
     def test_ws_message_with_null_content_still_writes_report(
         self, client, monkeypatch, results_dir
     ):
@@ -1170,6 +1245,39 @@ class _StaleResumeGraph(_FakeGraph):
         return GraphStateSnapshot(values=self.values)
 
 
+class _RepeatedReplyGraph(_FakeGraph):
+    """Approve-resume appends a NEW AI message whose text is byte-identical
+    to the previous turn's last AI text (a terse "Done.") — the count part
+    of the fingerprint must still flag it as new."""
+
+    def __init__(self):
+        self.values: dict = {"messages": [_FakeAI("Done.")]}
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values=self.values, next=(), tasks=[])
+
+    async def ainvoke(self, command, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        self.values = {"messages": [_FakeAI("Done."), _FakeAI("Done.")]}
+        return GraphStateSnapshot(values=self.values)
+
+
+class _UnreadableStateGraph(_FakeGraph):
+    """get_state always raises — the before-fingerprint is unreadable, so
+    the approve turn must conservatively replay nothing."""
+
+    def get_state(self, config):
+        raise RuntimeError("state unreadable")
+
+    async def ainvoke(self, command, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values={"messages": [_FakeAI("fresh reply text")]})
+
+
 class TestCompleteFrameTruth:
     """#33: complete frames must tell the truth about how the turn ended —
     approval pending is not "Agent completed."."""
@@ -1237,6 +1345,51 @@ class TestCompleteFrameTruth:
         assert not any(
             f["type"] == "agent_message" for f in frames
         ), "resume without new AI text must not replay the previous turn's answer"
+        assert frames[-1]["data"]["status"] == "ok"
+        assert frames[-1]["data"]["produced_new"] is False
+
+    def test_repeated_identical_reply_is_still_new(self, client, monkeypatch):
+        """F5: a resume whose new reply text equals the previous turn's
+        last AI text (a terse "Done.") is REAL new output — the count part
+        of the fingerprint must flag it, not swallow it."""
+        fake = _RepeatedReplyGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        assert any(
+            f["type"] == "agent_message" and f["data"]["content"] == "Done."
+            for f in frames
+        ), "an identical-but-new reply must still be delivered"
+        assert frames[-1]["data"]["status"] == "ok"
+        assert frames[-1]["data"]["produced_new"] is True
+
+    def test_unreadable_before_state_does_not_replay(self, client, monkeypatch):
+        """F5: when the before-fingerprint cannot be read (get_state
+        raises), the approve turn replays nothing — conservative
+        produced_new=false instead of a guaranteed-fresh replay."""
+        fake = _UnreadableStateGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        assert not any(f["type"] == "agent_message" for f in frames)
         assert frames[-1]["data"]["status"] == "ok"
         assert frames[-1]["data"]["produced_new"] is False
 
