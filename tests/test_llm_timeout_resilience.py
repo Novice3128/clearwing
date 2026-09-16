@@ -115,22 +115,25 @@ class TestFallbackTimeoutExclusion:
                 asyncio.run(client._achat_provider_dispatch(_TimingOutClient(), None, None))
         assert rerouted == []
 
-    def test_dispatch_reroutes_preresponse_timeouts(self):
+    def test_dispatch_does_not_reroute_send_marker_timeout_combo(self):
+        # "error sending request ... timed out" pairs the generic send-phase
+        # marker with a timeout: the upload may have completed, so it is
+        # billable-ambiguous and must NOT reroute per retry (r2 semantics).
         client = _client()
         rerouted = []
 
-        async def _fallback(*_a, **_k):
+        async def _record_fallback(*_a, **_k):
             rerouted.append(1)
-            raise RuntimeError("OpenAI-compatible fallback failed with HTTP 500")
+            raise AssertionError("should not be reached")
 
-        class _RefusedClient:
+        class _AmbiguousClient:
             async def achat(self, *_a, **_k):
                 raise RuntimeError("Web call failed: error sending request ... timed out")
 
-        with patch.object(client, "_openai_chat_http_fallback", _fallback):
-            with pytest.raises(RuntimeError, match="fallback failed"):
-                asyncio.run(client._achat_provider_dispatch(_RefusedClient(), None, None))
-        assert rerouted == [1]
+        with patch.object(client, "_openai_chat_http_fallback", _record_fallback):
+            with pytest.raises(RuntimeError, match="timed out"):
+                asyncio.run(client._achat_provider_dispatch(_AmbiguousClient(), None, None))
+        assert rerouted == []
 
 
 class TestAttemptsAttribute:
@@ -263,3 +266,55 @@ class TestExceptionChainClassification:
                     client._achat_provider_dispatch(_NestedRefusedClient(), None, None)
                 )
         assert rerouted == [1]
+
+
+class TestRoundTwoAmbiguityGuards:
+    """Codex PR-40 r2: send-phase-marker + timeout combos are billable
+    ambiguous, and an enforcing spend ledger refuses ambiguous resends."""
+
+    def test_send_marker_with_timeout_is_not_definitely_unbilled(self):
+        exc = _nested_exc(
+            "Web call failed for model test-model",
+            "error sending request: operation timed out",
+        )
+        assert not _client()._is_definitely_unbilled_transport_error(exc)
+
+    def test_pure_preresponse_stays_definitely_unbilled(self):
+        exc = _nested_exc(
+            "Web call failed for model test-model",
+            "error sending request: connection refused",
+        )
+        assert _client()._is_definitely_unbilled_transport_error(exc)
+
+    def test_enforcing_ledger_refuses_ambiguous_disconnect_retries(self):
+        from types import SimpleNamespace
+
+        client = _client(rate_limit_max_retries=6, timeout_max_retries=2)
+        client._spend_ledger = SimpleNamespace(enforcing=True)
+        calls = 0
+
+        async def always_disconnected():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("Server disconnected")
+
+        with pytest.raises(RuntimeError, match="Server disconnected"):
+            asyncio.run(client._with_retries(always_disconnected))
+        assert calls == 1
+
+    def test_non_enforcing_caller_keeps_disconnect_retries(self):
+        from types import SimpleNamespace
+
+        client = _client(rate_limit_max_retries=6, timeout_max_retries=2)
+        client._spend_ledger = SimpleNamespace(enforcing=False)
+        calls = 0
+
+        async def always_disconnected():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("Server disconnected")
+
+        with patch("clearwing.llm.native.asyncio.sleep", new=_no_sleep):
+            with pytest.raises(RuntimeError, match="Server disconnected"):
+                asyncio.run(client._with_retries(always_disconnected))
+        assert calls == 3

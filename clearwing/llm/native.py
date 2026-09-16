@@ -1923,6 +1923,25 @@ class AsyncLLMClient:
                         except Exception:
                             pass
                     raise
+                if (
+                    "server disconnected" in _exception_chain_text(exc)
+                    and self._spend_ledger is not None
+                    and self._spend_ledger.enforcing
+                ):
+                    # Close-after-accept is billed with the same ambiguity
+                    # as a read timeout, but unlike timeouts there is no
+                    # dedicated small cap semantics to lean on when a
+                    # budget is actively enforcing: refuse the resends
+                    # rather than risk unaccounted billable generations
+                    # (Codex PR-40 r2). Non-enforcing callers (the webui
+                    # default) keep the retry — chaos-P1 showed a single
+                    # such disconnect killing the whole task otherwise.
+                    if attempt > 0:
+                        try:
+                            exc._clearwing_attempts = attempt  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    raise
 
                 delay = self._retry_delay_seconds(exc, attempt)
                 attempt += 1
@@ -2044,7 +2063,14 @@ class AsyncLLMClient:
 
     def _is_definitely_unbilled_transport_error(self, exc: Exception) -> bool:
         text = _exception_chain_text(exc)
-        return any(marker in text for marker in self._PRE_RESPONSE_TRANSPORT_MARKERS)
+        if not any(marker in text for marker in self._PRE_RESPONSE_TRANSPORT_MARKERS):
+            return False
+        # reqwest pairs the generic send-phase marker with a timeout in
+        # "error sending request ... timed out": the upload may have
+        # completed, so the combination is NOT provably pre-response
+        # (Codex PR-40 r2 P1) — treat any timeout in the chain as
+        # billable-ambiguous.
+        return not self._is_timeout_error(exc)
 
     @staticmethod
     def _format_exc_chain(exc: BaseException) -> str:
