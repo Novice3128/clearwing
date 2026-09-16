@@ -263,13 +263,11 @@ class TestContextSummarizer:
 
         result = await self.summarizer.summarize(messages, mock_llm)
 
-        # The flag message should be preserved
-        flag_found = False
-        for msg in result:
-            content = msg.content if hasattr(msg, "content") else ""
-            if "flag{test_flag_123}" in content:
-                flag_found = True
-                break
+        # The flag-bearing message must stay verbatim in the compacted view
+        flag_found = any(
+            "flag{test_flag_123}" in getattr(m, "content", "")
+            for m in result["view"]
+        )
         assert flag_found, "Flag-bearing message was not preserved"
 
     @pytest.mark.asyncio
@@ -282,11 +280,65 @@ class TestContextSummarizer:
         result = await self.summarizer.summarize(messages, mock_llm)
 
         # Recent 30% (3 messages) should be preserved as-is
-        assert any("Msg 9" in m.content for m in result if hasattr(m, "content"))
-        assert any("Msg 8" in m.content for m in result if hasattr(m, "content"))
+        assert any("Msg 9" in getattr(m, "content", "") for m in result["view"])
+        assert any("Msg 8" in getattr(m, "content", "") for m in result["view"])
+        # The compacted old coverable messages leave the view
+        assert not any("Msg 0" in getattr(m, "content", "") for m in result["view"])
 
     @pytest.mark.asyncio
     async def test_summarize_empty_returns_empty(self):
         mock_llm = AsyncMock()
         result = await self.summarizer.summarize([], mock_llm)
-        assert result == []
+        assert result["view"] == []
+        mock_llm.aask_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_summarize_reuses_prior_when_nothing_newly_coverable(self):
+        # Issue #38: when the old segment holds nothing newly coverable
+        # (here: all tool traffic), the LLM must NOT be re-called and the
+        # prior summary is returned verbatim.
+        from clearwing.llm import ToolMessage
+
+        messages = [
+            AIMessage(content="", tool_calls=[{"id": "c1", "name": "t", "args": {}}]),
+            ToolMessage(content="result", tool_call_id="c1"),
+        ] * 10
+
+        mock_llm = AsyncMock()
+        prior = {"text": "previous summary", "covered_count": 5}
+
+        result = await self.summarizer.summarize(messages, mock_llm, prior=prior)
+
+        mock_llm.aask_text.assert_not_called()
+        assert result["text"] == "previous summary"
+        assert result["covered_count"] == 5
+        assert len(result["view"]) == len(messages)
+
+    @pytest.mark.asyncio
+    async def test_summarize_accumulates_prior_text(self):
+        messages = [HumanMessage(content=f"Msg {i}") for i in range(10)]
+        mock_llm = AsyncMock()
+        mock_llm.aask_text.return_value = MagicMock(first_text="new summary")
+
+        prior = {"text": "previous summary", "covered_count": 3}
+        result = await self.summarizer.summarize(messages, mock_llm, prior=prior)
+
+        user_payload = mock_llm.aask_text.call_args.kwargs["user"]
+        assert "previous summary" in user_payload
+        assert result["covered_count"] == 3 + 7  # prior + newly covered (10 * 0.7)
+
+    @pytest.mark.asyncio
+    async def test_summarize_passes_prompt_cache_params(self):
+        # Issue #38: the summarization call itself must carry the cache
+        # hint, mirroring the main agent loop.
+        messages = [HumanMessage(content=f"Msg {i}") for i in range(10)]
+        mock_llm = AsyncMock()
+        mock_llm.aask_text.return_value = MagicMock(first_text="summary")
+
+        await self.summarizer.summarize(
+            messages, mock_llm, prompt_cache_key="sess-1:wi-1"
+        )
+
+        kwargs = mock_llm.aask_text.call_args.kwargs
+        assert kwargs["cache_prefix"] is True
+        assert kwargs["prompt_cache_key"] == "sess-1:wi-1"

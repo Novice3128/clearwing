@@ -1548,6 +1548,10 @@ class NativeHunter:
     max_repeated_skips: int = 15  # hard cap on total skipped degenerate-loop calls before giving up
     lead_checkpoint_calls: int = 4
     summarizer: ContextSummarizer | None = field(default=None)
+    # Running summary state (issue #38): {"text": str, "covered_count": int}.
+    # The text is re-injected after the cache breakpoint (context-note tail)
+    # instead of riding inside the message history.
+    context_summary: dict[str, object] | None = field(default=None)
 
     def _should_stop(self, step: int, cost_usd: float) -> str | None:
         """Return a stop reason string, or None to continue."""
@@ -1733,10 +1737,31 @@ class NativeHunter:
             with spend_metadata(model_call_id=model_call_id):
                 if self.summarizer and self.summarizer.should_summarize(messages):
                     pre = len(messages)
-                    messages = await self.summarizer.summarize(messages, self.llm)
+                    # Compaction is committed to the local history and the
+                    # summary text persists (issue #38): the note rides after
+                    # the cache breakpoint, so the surviving prefix stays a
+                    # cache hit between re-summarizations.
+                    result = await self.summarizer.summarize(
+                        messages,
+                        self.llm,
+                        prior=self.context_summary,
+                        prompt_cache_key=(
+                            f"{self.ctx.session_id or ''}:{self.ctx.work_item_id or ''}"
+                        ),
+                    )
+                    messages = result["view"]
+                    self.context_summary = {
+                        "text": result["text"],
+                        "covered_count": result["covered_count"],
+                    }
                     visible_read_ranges.clear()
                     overlapping_refreshes.clear()
                     logger.info("Hunter context summarized: %d → %d messages", pre, len(messages))
+                summary_note = None
+                if self.summarizer and self.context_summary and self.context_summary.get("text"):
+                    summary_note = self.summarizer.summary_note(
+                        str(self.context_summary["text"])
+                    )
 
                 provider_name = getattr(self.llm, "provider_name", None)
                 active_tools = [] if final_synthesis_turn else self.tools
@@ -1766,6 +1791,9 @@ class NativeHunter:
                     prompt_cache_key=(
                         f"{self.ctx.session_id or ''}:{self.ctx.work_item_id or ''}"
                     ),
+                    # Post-breakpoint tail (issue #38): the session summary
+                    # must never ride inside the cacheable prefix.
+                    context_note=summary_note,
                 )
                 input_tokens = response.usage.prompt_tokens or 0
                 output_tokens = response.usage.completion_tokens or 0

@@ -437,3 +437,137 @@ class TestNativeToolLoopRoundTrip:
             assert "10.9.9.9" in (kwargs["context_note"] or "")
         # ...while the system prompt stays byte-static across steps.
         assert client.calls[0][1] == client.calls[1][1]
+
+
+class _SummarizingFakeClient(_FakeNativeClient):
+    """Fake client that also answers the summarizer's aask_text calls."""
+
+    # 0.8 * 1000 = 800 tokens ≈ 3200 chars crosses the threshold.
+    context_budget_tokens = 1000
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.summarize_calls = []
+
+    async def aask_text(
+        self, *, system, user, cache_prefix=False, prompt_cache_key=None, **kwargs
+    ):
+        self.summarize_calls.append(
+            {
+                "system": system,
+                "user": user,
+                "cache_prefix": cache_prefix,
+                "prompt_cache_key": prompt_cache_key,
+            }
+        )
+        return _FakeResponse(text="compacted session summary", usage=_FakeUsage(1, 1, 2))
+
+
+class TestContextSummarizerCachePrefix:
+    """Issue #38: the summarizer must not destroy the prompt-cache prefix.
+
+    Past the 80% threshold the old runtime re-ran the LLM summary on every
+    step and put a different summary at the front of the request (and into
+    the system prompt), so every step re-paid full input price plus one
+    extra summarization call.
+    """
+
+    def _build(self, client):
+        from clearwing.agent.graph import build_react_graph
+
+        @tool
+        def noop_tool(value: str) -> str:
+            """Noop."""
+            return value
+
+        return build_react_graph(
+            llm_with_tools=client,
+            tools=[noop_tool],
+            system_prompt_fn=lambda state: "sys",
+            model_name="fake-model",
+            session_id="sess-sum-1",
+            enable_knowledge_graph=False,
+            enable_audit=False,
+            enable_episodic_memory=False,
+            enable_cost_tracker=False,
+            enable_event_bus=False,
+            enable_context_summarizer=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_summary_reused_and_prefix_byte_identical(self):
+        import json
+
+        from genai_pyo3 import ToolCall
+
+        tc1 = ToolCall("call-1", "noop_tool", json.dumps({"value": "x"}))
+        tc2 = ToolCall("call-2", "noop_tool", json.dumps({"value": "y"}))
+        tc3 = ToolCall("call-3", "noop_tool", json.dumps({"value": "z"}))
+        # 0.8 * 1000 tokens ≈ 3200 chars: one 2000-char message stays under,
+        # two of them cross the threshold so the oldest coverable ones get
+        # compacted and the surviving view drops back under the threshold.
+        m1 = "A" * 2000
+        m2 = "C" * 2000
+        client = _SummarizingFakeClient(
+            [
+                # Turn 1 (under threshold): tool call then text.
+                _FakeResponse(text="", tool_calls=[tc1], usage=_FakeUsage(10, 5, 15)),
+                _FakeResponse(text="done", usage=_FakeUsage(3, 2, 5)),
+                # Turn 2 (still under threshold after compaction math).
+                _FakeResponse(text="", tool_calls=[tc2], usage=_FakeUsage(10, 5, 15)),
+                _FakeResponse(text="done2", usage=_FakeUsage(3, 2, 5)),
+                # Turn 3: m2 crosses the threshold → compaction fires once;
+                # then two steps inside the new epoch.
+                _FakeResponse(text="", tool_calls=[tc3], usage=_FakeUsage(10, 5, 15)),
+                _FakeResponse(text="done3", usage=_FakeUsage(3, 2, 5)),
+                # Turn 4: small follow-up — must reuse the summary, not
+                # regenerate it.
+                _FakeResponse(text="done4", usage=_FakeUsage(3, 2, 5)),
+            ]
+        )
+        graph = self._build(client)
+        config = {"configurable": {"thread_id": "t1"}}
+
+        async for _ in graph.astream({"messages": [{"role": "user", "content": "go"}]}, config):
+            pass
+        async for _ in graph.astream({"messages": [{"role": "user", "content": m1}]}, config):
+            pass
+        # steps 5 and 6 (indices 4, 5) are within the post-compaction epoch
+        async for _ in graph.astream({"messages": [{"role": "user", "content": m2}]}, config):
+            pass
+        async for _ in graph.astream(
+            {"messages": [{"role": "user", "content": "and then?"}]}, config
+        ):
+            pass
+
+        # The summary LLM ran exactly once — not once per step past the
+        # threshold, and not again on the follow-up turn.
+        assert len(client.summarize_calls) == 1
+        assert client.summarize_calls[0]["cache_prefix"] is True
+        assert client.summarize_calls[0]["prompt_cache_key"] == "sess-sum-1"
+
+        # Steps within the same epoch send a byte-identical prefix: step 6's
+        # message list starts with exactly step 5's list (role + content).
+        step5 = [(m.role, m.content) for m in client.calls[4][0]]
+        step6 = [(m.role, m.content) for m in client.calls[5][0]]
+        assert step6[: len(step5)] == step5
+
+        # The summary rides after the cache breakpoint in the context note —
+        # never inside the message history and never in the system prompt.
+        for index in (4, 5, 6):
+            assert "Session Summary" in (client.calls_kwargs[index]["context_note"] or "")
+            for m in client.calls[index][0]:
+                assert "compacted session summary" not in (m.content or "")
+            assert client.calls[index][1] == "sys"
+
+        # The compacted view is committed to state: the first coverable
+        # messages are gone and the summary state persists with its
+        # coverage count.
+        final = graph.get_state(config).values
+        assert final["context_summary"]["covered_count"] >= 1
+        assert not any(
+            "go" == str(getattr(m, "content", "") or "") for m in final["messages"]
+        )
+        assert not any(
+            m1 in str(getattr(m, "content", "") or "") for m in final["messages"]
+        )

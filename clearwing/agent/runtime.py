@@ -488,7 +488,32 @@ class NativeAgentGraph:
             )
             if should:
                 try:
-                    messages = await self.context_summarizer.summarize(messages, self.llm)
+                    # Compaction is committed to state (issue #38): the
+                    # covered messages leave the history and the summary
+                    # text/coverage persist, so the next step lands under
+                    # the threshold again instead of re-running (and
+                    # re-billing) a fresh LLM summary on every step.
+                    result = await self.context_summarizer.summarize(
+                        messages,
+                        self.llm,
+                        prior=state.get("context_summary"),
+                        prompt_cache_key=self.session_id or None,
+                    )
+                    if result["view"] is not messages:
+                        state["messages"] = result["view"]
+                        messages = list(result["view"])
+                    state["context_summary"] = {
+                        "text": result["text"],
+                        "covered_count": result["covered_count"],
+                    }
+                    if self.event_bus:
+                        self.event_bus.emit_message(
+                            (
+                                f"context summarized: history compacted "
+                                f"({result['covered_count']} messages covered by summary)"
+                            ),
+                            "system",
+                        )
                 except Exception:
                     logger.debug("Context summarization failed", exc_info=True)
 
@@ -509,6 +534,20 @@ class NativeAgentGraph:
         # per-step context note is appended after the breakpoint and never
         # cached. Both are inert on providers without caching.
         context_note = self.dynamic_context_fn(state) if self.dynamic_context_fn else None
+        # The session summary rides in the same post-breakpoint tail
+        # (issue #38): injecting it into the message history — or worse,
+        # the system prompt — would mutate the cacheable prefix on every
+        # re-summarization. As a tail note it is byte-stable between
+        # re-summarizations, so the prefix stays a cache hit.
+        if self.context_summarizer:
+            summary_state = state.get("context_summary") or {}
+            summary_text = summary_state.get("text") or ""
+            if summary_text:
+                summary_block = self.context_summarizer.summary_note(summary_text)
+                context_note = (
+                    "\n\n".join(part for part in (summary_block, context_note) if part)
+                    or None
+                )
         response = await self.llm.achat_stream(
             messages=chat_messages,
             system=system,
