@@ -38,6 +38,29 @@ unless the underlying payload type is genuinely `T | None`.
 4. **Disconnect.** Either side closes. On disconnect the server
    unsubscribes every bus handler it registered for this connection.
 
+## REST endpoints
+
+Alongside the WebSocket, the FastAPI app serves a few REST endpoints.
+The two unauthenticated ones relevant to orchestration:
+
+### `GET /api/health`
+
+- `200` — `{"status": "ok", "service": "clearwing"}`.
+- `503` — `{"status": "degraded", "service": "clearwing",
+  "detail": "state directory unavailable"}` when the Clearwing state
+  directory (`CLEARWING_HOME`) is not writable. The wire `detail` is
+  deliberately generic (the endpoint is unauthenticated); the full
+  reason — path and errno — goes to the server log only.
+
+### `GET /api/sessions`
+
+- `200` — JSON array of session summaries (requires the state
+  directory/`SessionStore` to be healthy).
+- `503` — `{"detail": "session store unavailable"}` when the session
+  store is not usable (e.g. the same unwritable state directory).
+  Same rule as health: generic detail on the wire, full reason in the
+  server log. `GET /api/sessions/{id}` answers the same 503.
+
 ## Client → server messages
 
 Every client frame is a JSON object with a `type` discriminator.
@@ -504,10 +527,10 @@ with `"completed"` or `"error"` when the run settles. Payload is
 ## Inline server frames
 
 These frames originate in the WebSocket handler itself rather than
-the `EventBus`. They share the top-level `type` discriminator but
-their fields sit alongside `type`, not nested under `data` (with three
-exceptions — the inline streaming `agent_message`, inline `error`, and
-`llm_progress` frames **do** nest under `data`).
+the `EventBus`. They share the top-level `type` discriminator, but only
+`started` keeps its fields alongside `type`; the other inline frames —
+the streaming `agent_message`, inline `error`, `llm_progress`,
+`stopped`, and `complete` — nest their payload under `data`.
 
 ### `llm_progress`
 
@@ -582,6 +605,55 @@ Sent in response to a client `stop` frame (see [`stop`](#stop)).
 
 A `complete` frame follows every `stopped` frame, same as after
 `message` / `approve` turns.
+
+### `complete`
+
+Emitted after every `message` / `approve` / `stop` turn, regardless of
+how the turn ended — the client must never be left waiting on a turn
+that died mid-stream. The `data.status` field says how it ended:
+
+| `status`              | Meaning                                                                 |
+| --------------------- | ---------------------------------------------------------------------- |
+| `"ok"`                | The turn ran to completion; nothing is pending.                         |
+| `"awaiting_approval"` | The graph is suspended at an approval gate. The session is **not** finished — answer the pending `approval_needed` frame with `approve`, or discard it with `stop`. |
+| `"stopped"`           | The turn ended because the operator sent `stop`.                        |
+| `"error"`             | The turn already emitted an `error` frame this turn.                    |
+
+Priority: `awaiting_approval` outranks `error` — a turn can fail *and*
+leave the graph parked at a gate; the `error` frame has already been
+sent separately, but the client must still answer the gate (`approve`
+or `stop`) before the session is usable again.
+
+`status` is backward compatible: clients written before the field
+existed treat its absence as `"ok"`.
+
+`produced_new` (boolean, present on `message` / `approve` turns) reports
+whether the turn surfaced new assistant text (a fresh `agent_message`
+frame was sent for it). `false` means no new assistant content arrived
+and no previous turn's text was replayed — for example a stale
+`approve` with nothing pending, a resume that only appended tool
+output, or an unreadable graph state (the server then replays nothing
+rather than risk echoing stale text). A new reply whose text is
+byte-identical to the previous turn's last reply still counts as new:
+the underlying fingerprint compares an (AI-message count, last text)
+pair, not the text alone.
+
+`session_id` / `report_path` / `report_url` appear once the agent
+session has been started (they ride along on every subsequent
+`complete`).
+
+```json
+{
+  "type": "complete",
+  "data": {
+    "status": "awaiting_approval",
+    "produced_new": true,
+    "session_id": "a1b2c3d4",
+    "report_path": "results/sessions/a1b2c3d4/report.md",
+    "report_url": "/api/reports/a1b2c3d4"
+  }
+}
+```
 
 ## Events that are emitted but not forwarded
 

@@ -36,11 +36,24 @@ logger = logging.getLogger(__name__)
 # (issue #4). Module-level so tests can shorten it.
 _LLM_PROGRESS_INTERVAL_SECONDS = 10
 
+# Backoff before the event pump retries a failed frame send (issue #11): a
+# transient send error must not kill the pump for the rest of the session.
+# Module-level so tests can shorten it.
+_PUMP_SEND_RETRY_SECONDS = 0.5
 
-def _last_ai_content(values: dict[str, Any] | None) -> str:
-    """Last non-empty AI message text from a graph state snapshot."""
+
+def _ai_text_stats(values: dict[str, Any] | None) -> tuple[int, str]:
+    """(count of AI messages carrying text, last such text) for a snapshot.
+
+    The count matters as much as the text: a resume whose new reply is
+    byte-identical to the previous turn's last AI text (a terse "Done.")
+    still increments it, so a (count, last_text) fingerprint sees the new
+    message where a text-only fingerprint would not.
+    """
     messages = (values or {}).get("messages", [])
-    for message in reversed(messages):
+    count = 0
+    last_text = ""
+    for message in messages:
         if getattr(message, "type", "") != "ai":
             continue
         content = message.content
@@ -51,8 +64,29 @@ def _last_ai_content(values: dict[str, Any] | None) -> str:
                 if isinstance(part, dict) and part.get("type") == "text"
             )
         if content:
-            return content
-    return ""
+            count += 1
+            last_text = content
+    return count, last_text
+
+
+def _last_ai_content(values: dict[str, Any] | None) -> str:
+    """Last non-empty AI message text from a graph state snapshot."""
+    return _ai_text_stats(values)[1]
+
+
+def _state_fingerprint(graph_ref: Any, config_ref: dict) -> tuple[int, str] | None:
+    """(AI-text-count, last-AI-text) fingerprint of the graph state (#33).
+
+    Used to tell a turn that surfaced new assistant text from one that
+    left the previous turn's last AI message as-is (stale resume). None
+    only when the state cannot be read (e.g. graphs without ``get_state``)
+    — callers treat that as unreadable and do not replay anything.
+    """
+    try:
+        values = graph_ref.get_state(config_ref).values
+    except Exception:
+        return None
+    return _ai_text_stats(values)
 
 
 def _make_session_store():
@@ -66,6 +100,31 @@ def _make_cost_tracker():
 def _cors_origins() -> list[str]:
     raw = os.environ.get("CLEARWING_WEB_CORS_ORIGINS", "")
     return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _state_dir_status() -> tuple[bool, str]:
+    """Probe the clearwing state directory for writability (issue #7).
+
+    An unwritable CLEARWING_HOME (a container whose HOME is /nonexistent,
+    a read-only volume) breaks SessionStore and every state-writing
+    endpoint; /api/health must surface that instead of reporting "ok"
+    while /api/sessions 500s on every call.
+
+    The probe file name is unique per call: concurrent health polls used
+    to race on one fixed `.health_probe` path (one caller's unlink hit
+    another's write → FileNotFoundError → spurious 503s).
+    """
+    from clearwing.core.config import clearwing_home
+
+    home = clearwing_home()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        probe = home / f".health_probe.{uuid.uuid4().hex}"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        return False, f"state dir {home} is not writable: {exc}"
+    return True, ""
 
 
 def create_app():
@@ -143,12 +202,33 @@ def create_app():
 
     @app.get("/api/health")
     async def health():
+        # Issue #7: the state directory's writability is part of health —
+        # degraded answers 503 so orchestration stops trusting a container
+        # whose /api/sessions would 500 on every call. The detail stays
+        # generic on the wire (this endpoint is unauthenticated — no
+        # internal paths/errno); the full reason goes to the server log.
+        ok, reason = _state_dir_status()
+        if not ok:
+            logger.warning("Health degraded: %s", reason)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "service": "clearwing",
+                    "detail": "state directory unavailable",
+                },
+            )
         return {"status": "ok", "service": "clearwing"}
 
     @app.get("/api/sessions")
     async def list_sessions():
         """List all known sessions."""
         store = _make_session_store()
+        if not store.available:
+            # Unauthenticated endpoint: generic detail on the wire, full
+            # reason (paths, errno) in the server log only.
+            logger.warning("Session store unavailable: %s", store.unavailable_reason)
+            raise HTTPException(status_code=503, detail="session store unavailable")
         sessions = store.list_sessions()
         return [
             {
@@ -167,6 +247,9 @@ def create_app():
     async def get_session(session_id: str):
         """Get details for a specific session."""
         store = _make_session_store()
+        if not store.available:
+            logger.warning("Session store unavailable: %s", store.unavailable_reason)
+            raise HTTPException(status_code=503, detail="session store unavailable")
         try:
             session = store.load(session_id)
         except FileNotFoundError as exc:
@@ -432,10 +515,13 @@ def create_app():
                        fast-fail and handler-rejection frames)
         - Server sends: {"type": "stopped", "data": {"cancelled_turn": bool,
                        "discarded_approval": bool}} after a stop frame
-        - Server sends: {"type": "complete", "data": {"session_id": "...",
+        - Server sends: {"type": "complete", "data": {"status": "ok" |
+                       "awaiting_approval" | "stopped" | "error",
+                       "produced_new": bool, "session_id": "...",
                        "report_path": "...", "report_url": "/api/reports/<id>"}}
           (emitted after each message/approve/stop turn; report_path/report_url
-          appear once the agent session has been started)
+          appear once the agent session has been started; status "ok" is
+          assumed by clients when the field is absent — see docs/web-api.md)
 
         Turns run as background tasks so the receive loop stays responsive;
         a `message`/`approve` sent while a turn is still running is rejected
@@ -447,6 +533,12 @@ def create_app():
             return
         await websocket.accept()
 
+        # Sync tools emit bus events from worker threads (asyncio.to_thread);
+        # asyncio.Queue is not thread-safe, so frames must hop onto this
+        # loop via call_soon_threadsafe instead of a raw cross-thread
+        # put_nowait (issue #11: such frames could be stranded until the
+        # next loop wakeup, or lost to the queue's internals).
+        ws_loop = asyncio.get_running_loop()
         message_queue: asyncio.Queue = asyncio.Queue()
         transcript: SessionTranscript | None = None
         session_id: str | None = None
@@ -552,9 +644,16 @@ def create_app():
                                 # A concurrent session's frame — never
                                 # reaches this socket or its transcript.
                                 return
-                        message_queue.put_nowait(
-                            {"type": event_type_name, "data": serializable}
-                        )
+                        item = {"type": event_type_name, "data": serializable}
+                        try:
+                            ws_loop.call_soon_threadsafe(
+                                message_queue.put_nowait, item
+                            )
+                        except RuntimeError:
+                            # The loop is already closed — the socket is
+                            # tearing down; there is nothing left to
+                            # deliver to.
+                            return
                         _record_in_transcript(event_type_name, serializable)
                     except Exception:
                         logger.debug("Failed to enqueue event", exc_info=True)
@@ -646,10 +745,16 @@ def create_app():
             # Forward queued bus events while the agent loop is running —
             # the receive loop below cannot drain the queue mid-turn, so
             # without this pump, tool progress and approvals arrive late.
+            # A failed send must not kill the pump for the rest of the
+            # session (issue #11): retry the same frame after a short
+            # backoff. A genuinely dead connection is reaped by the
+            # receive loop's disconnect path, which cancels this task.
             while True:
                 msg = await message_queue.get()
-                if not await _safe_send(msg):
-                    return
+                # Retry the SAME frame until it goes out (or the task is
+                # cancelled by the disconnect path).
+                while not await _safe_send(msg):
+                    await asyncio.sleep(_PUMP_SEND_RETRY_SECONDS)
 
         async def _drain_events() -> None:
             while True:
@@ -696,20 +801,41 @@ def create_app():
                 message += f" (gave up after {attempts} retr{'y' if attempts == 1 else 'ies'})"
             return {"type": "error", "data": {"message": message, "retries": attempts}}
 
-        def _complete_payload() -> dict:
-            data: dict[str, Any] = {}
+        def _complete_payload(
+            status: str = "ok", produced_new: bool | None = None
+        ) -> dict:
+            # `status` tells the client how the turn actually ended (issue
+            # #33): "ok" (turn finished), "awaiting_approval" (graph is
+            # suspended at an approval gate — the session is NOT finished),
+            # "stopped" (operator stop), "error" (an error frame was already
+            # sent this turn). Clients written before the field existed
+            # treat its absence as "ok".
+            data: dict[str, Any] = {"status": status}
+            if produced_new is not None:
+                data["produced_new"] = produced_new
             if transcript is not None:
                 try:
                     report_path = transcript.write()
                 except Exception:
                     logger.debug("Failed to write session report", exc_info=True)
                 else:
-                    data = {
-                        "session_id": transcript.session_id,
-                        "report_path": str(report_path),
-                        "report_url": f"/api/reports/{transcript.session_id}",
-                    }
+                    data.update(
+                        {
+                            "session_id": transcript.session_id,
+                            "report_path": str(report_path),
+                            "report_url": f"/api/reports/{transcript.session_id}",
+                        }
+                    )
             return {"type": "complete", "data": data}
+
+        def _turn_end_status(
+            graph_ref: Any, config_ref: dict, sent_error: bool
+        ) -> str:
+            if _graph_has_pending(graph_ref, config_ref):
+                return "awaiting_approval"
+            if sent_error:
+                return "error"
+            return "ok"
 
         async def _run_message_turn(
             graph_ref: Any,
@@ -720,6 +846,8 @@ def create_app():
             # Parameters bind the session objects at task creation: a `start`
             # frame arriving mid-turn rebinds the handler variables but must
             # not swap the graph under a running turn.
+            sent_error = False
+            produced_new = False
             try:
                 turn_state["active"] = True
                 last_content = ""
@@ -743,7 +871,11 @@ def create_app():
                                     last_content = c
                 finally:
                     _cancel_heartbeat(heartbeat)
-                if last_content:
+                # Stream events are produced by this turn, so non-empty
+                # last_content is by construction fresh (issue #33:
+                # produced_new reports it instead of a message count).
+                produced_new = bool(last_content)
+                if produced_new:
                     if transcript_ref:
                         transcript_ref.add_agent(last_content)
                     if not await _safe_send(
@@ -754,6 +886,7 @@ def create_app():
                     ):
                         return
             except Exception as e:
+                sent_error = True
                 logger.exception("Agent turn failed")
                 if transcript_ref:
                     transcript_ref.add_error(str(e))
@@ -762,9 +895,14 @@ def create_app():
             finally:
                 turn_state["active"] = False
             # Complete follows both success and failure, so the client never
-            # waits on a turn that died mid-stream.
+            # waits on a turn that died mid-stream. A turn parked at an
+            # approval gate completes with status "awaiting_approval", not
+            # "ok" (issue #33).
+            status = _turn_end_status(graph_ref, config_ref, sent_error)
             await _drain_events()
-            await _safe_send(_complete_payload())
+            await _safe_send(
+                _complete_payload(status=status, produced_new=produced_new)
+            )
 
         async def _run_approve_turn(
             graph_ref: Any,
@@ -772,15 +910,19 @@ def create_app():
             approved: bool,
             transcript_ref: SessionTranscript | None,
         ) -> None:
+            sent_error = False
+            produced_new = False
             try:
-                # Detect no-op resumes (stale approve with nothing pending):
-                # the graph reports the same message count.
-                try:
-                    before = len(
-                        (graph_ref.get_state(config_ref).values or {}).get("messages", [])
-                    )
-                except Exception:
-                    before = None
+                # Fingerprint the AI-text stats before the resume (#33): a
+                # resume that only appends tool output — or a stale approve
+                # with nothing pending — leaves it unchanged, and the
+                # previous turn's text must not be replayed as a fresh
+                # agent_message. The (count, last_text) pair still catches a
+                # new reply whose text is byte-identical to the last one.
+                # An unreadable before-state is conservative: nothing is
+                # replayed (the turn's own error path already covers real
+                # failures).
+                before = _state_fingerprint(graph_ref, config_ref)
                 turn_state["active"] = True
                 heartbeat = asyncio.create_task(_llm_progress_heartbeat())
                 try:
@@ -788,33 +930,37 @@ def create_app():
                 finally:
                     _cancel_heartbeat(heartbeat)
             except Exception as e:
+                sent_error = True
                 logger.exception("Agent resume failed")
                 if transcript_ref:
                     transcript_ref.add_error(str(e))
                 if not await _safe_send(_error_payload(e)):
                     return
             else:
-                values = getattr(snapshot, "values", None)
-                messages_after = (values or {}).get("messages", [])
-                produced_new = before is None or len(messages_after) > before
+                after = _ai_text_stats(getattr(snapshot, "values", None))
+                produced_new = before is not None and after != before
                 if produced_new:
-                    content = _last_ai_content(values)
-                    if content:
-                        if transcript_ref:
-                            transcript_ref.add_agent(content)
-                        if not await _safe_send(
-                            {
-                                "type": "agent_message",
-                                "data": {"content": content},
-                            }
-                        ):
-                            return
+                    content = after[1]
+                    if transcript_ref:
+                        transcript_ref.add_agent(content)
+                    if not await _safe_send(
+                        {
+                            "type": "agent_message",
+                            "data": {"content": content},
+                        }
+                    ):
+                        return
             finally:
                 turn_state["active"] = False
             # Complete follows both success and failure, so the client never
-            # waits on a resume that died mid-stream.
+            # waits on a resume that died mid-stream. A resume that parks the
+            # graph at the next approval gate completes with
+            # "awaiting_approval", not "ok" (issue #33).
+            status = _turn_end_status(graph_ref, config_ref, sent_error)
             await _drain_events()
-            await _safe_send(_complete_payload())
+            await _safe_send(
+                _complete_payload(status=status, produced_new=produced_new)
+            )
 
         async def _run_turn_scoped(
             bound_session_id: str | None, turn_fn, *turn_args
@@ -988,7 +1134,7 @@ def create_app():
                         }
                     ):
                         break
-                    if not await _safe_send(_complete_payload()):
+                    if not await _safe_send(_complete_payload(status="stopped")):
                         break
 
                 elif msg_type in ("message", "approve"):

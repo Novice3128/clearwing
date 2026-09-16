@@ -86,7 +86,32 @@ class TestCreateLLMConfigFallback:
         graph_mod._create_llm("glm-5.3")
         assert captured["endpoint"].model == "glm-5.3"
 
-    def test_explicit_credentials_skip_config_discovery(self, monkeypatch):
+    def test_explicit_credentials_no_longer_skip_config_discovery(self, monkeypatch):
+        """Issue #16: the credential branch used to pass config_provider={}
+        so a partial start frame (credentials but no model) never saw the
+        configured model. Per-field merge: config fills what the frame left
+        blank, and a placeholder model defers."""
         captured = _patch(monkeypatch)
-        graph_mod._create_llm("m", base_url="https://x", api_key="k")
-        assert captured["resolve_kwargs"].get("config_provider") == {}
+        graph_mod._create_llm(
+            "claude-sonnet-4-6", base_url="https://x", api_key="k"
+        )
+        # config discovery is NOT disabled anymore...
+        assert captured["resolve_kwargs"].get("config_provider") is None
+        # ...and the placeholder model defers to config/env resolution.
+        assert captured["resolve_kwargs"].get("cli_model") is None
+        assert captured["resolve_kwargs"].get("cli_base_url") == "https://x"
+        assert captured["resolve_kwargs"].get("cli_api_key") == "k"
+
+    def test_credential_branch_explicit_model_still_wins(self, monkeypatch):
+        captured = _patch(monkeypatch)
+        graph_mod._create_llm(
+            "kimi-k2", base_url="https://x", api_key="k", model_explicit=True
+        )
+        assert captured["resolve_kwargs"].get("cli_model") == "kimi-k2"
+
+    def test_credential_branch_distinct_model_still_wins(self, monkeypatch):
+        """A non-placeholder model that was not flagged explicit (legacy
+        callers) keeps overriding, mirroring the no-credential branch."""
+        captured = _patch(monkeypatch)
+        graph_mod._create_llm("glm-4.7", base_url="https://x", api_key="k")
+        assert captured["resolve_kwargs"].get("cli_model") == "glm-4.7"

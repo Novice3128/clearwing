@@ -46,6 +46,61 @@ class TestHealthEndpoint:
         assert data["service"] == "clearwing"
 
 
+class TestStateDirDegradation:
+    """#7: an unwritable CLEARWING_HOME (container HOME=/nonexistent) must
+    degrade loudly, not leave health "ok" while /api/sessions 500s."""
+
+    def _block_home(self, monkeypatch, tmp_path):
+        import clearwing.core.config as config_mod
+
+        blocked = tmp_path / "blocked-home"
+        blocked.write_text("")  # a file where a directory is needed
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: blocked)
+
+    def test_health_reports_degraded(self, client, monkeypatch, tmp_path):
+        self._block_home(monkeypatch, tmp_path)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["service"] == "clearwing"
+        # Unauthenticated endpoint: the wire detail is generic; the internal
+        # path/errno never crosses the wire (they go to the server log).
+        assert data["detail"] == "state directory unavailable"
+        assert "blocked-home" not in data["detail"]
+
+    def test_sessions_returns_503_not_500(self, client, monkeypatch, tmp_path):
+        self._block_home(monkeypatch, tmp_path)
+        resp = client.get("/api/sessions")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "session store unavailable"
+        assert "blocked-home" not in resp.json()["detail"]
+
+    def test_session_detail_returns_503_not_500(self, client, monkeypatch, tmp_path):
+        self._block_home(monkeypatch, tmp_path)
+        resp = client.get("/api/sessions/abc123")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "session store unavailable"
+
+
+class TestHealthProbeConcurrency:
+    """Three-lens review (F3): concurrent /api/health polls used to race on
+    one fixed probe path (unlink vs. write → spurious 503s)."""
+
+    def test_concurrent_probes_all_report_ok(self, monkeypatch, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+
+        import clearwing.core.config as config_mod
+        import clearwing.ui.web.app as app_module
+
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: tmp_path / "home")
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(
+                pool.map(lambda _: app_module._state_dir_status(), range(300))
+            )
+        assert all(ok for ok, _ in results)
+
+
 class TestSessionEndpoints:
     def test_list_sessions_empty(self, client):
         with patch("clearwing.data.memory.SessionStore") as mock_store:
@@ -309,6 +364,11 @@ class _FakeGraph:
         self.events = events or []
         self.resume_messages = resume_messages or []
 
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values={"messages": []}, next=(), tasks=[])
+
     async def astream(self, input_msg, config, stream_mode="values"):
         for ev in self.events:
             yield ev
@@ -456,7 +516,9 @@ class TestAgentSessionFlow:
 
         report = results_dir / "sessions" / sid / "report.md"
         content = report.read_text(encoding="utf-8")
-        assert "[approval approved by operator]" in content
+        # The approval marker is transcript text; since #24 its brackets are
+        # markdown-escaped, so assert on the words rather than the raw form.
+        assert "approval approved by operator" in content
         assert "post approval answer" in content
 
     def test_message_turn_carries_target_into_graph_state(
@@ -509,6 +571,34 @@ class TestAgentSessionFlow:
             assert started["model"] == "glm-5.3"
             assert captured["model_name"] is None
             assert captured["model_explicit"] is False
+
+    def test_start_frame_partial_credentials_defer_model(self, client, monkeypatch):
+        """#16: credentials without a model must defer the model to
+        config/env resolution (per-field merge) instead of letting the
+        credential branch guess one from the base_url hostname."""
+        captured: dict = {}
+
+        def make_agent(**kwargs):
+            captured.update(kwargs)
+            return _FakeGraph()
+
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", make_agent)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json(
+                {
+                    "type": "start",
+                    "target": "t",
+                    "model": "",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "api_key": "sk-frame",
+                }
+            )
+            started = ws.receive_json()
+            assert started["type"] == "started"
+        assert captured["model_name"] is None
+        assert captured["model_explicit"] is False
+        assert captured["base_url"] == "https://api.deepseek.com/v1"
+        assert captured["api_key"] == "sk-frame"
 
     def test_start_frame_with_non_string_model_is_treated_as_unset(
         self, client, monkeypatch
@@ -609,7 +699,8 @@ class TestStopFrame:
             }
             complete = ws.receive_json()
             assert complete["type"] == "complete"
-            assert complete["data"] == {}
+            # Issue #33: the stop-path complete reports why it fired.
+            assert complete["data"]["status"] == "stopped"
 
     def test_approve_failure_still_sends_complete(self, client, monkeypatch, results_dir):
         """Review P1: a failed resume used to die on an unbound `snapshot`,
@@ -725,6 +816,89 @@ class TestSessionReportHardening:
         content = path.read_text(encoding="utf-8")
         assert "abcdef1234567890" not in content
         assert "xyzvalue9876" not in content
+
+    def test_markdown_injection_is_neutralized(self, monkeypatch, tmp_path):
+        """#24: user/agent/error text is untrusted prose; rendered raw it
+        could forge report structure, phishing links, and raw HTML."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00005", model="m")
+        transcript.add_user(
+            "# 標題\n[點我](https://evil.example)\n<img src=x onerror=alert(1)>\n"
+            "- forged list item"
+        )
+        transcript.add_agent("![report](https://evil.example/fake.png)\n<pre>x</pre>")
+        transcript.add_error("1. fake ordered step\n<script>alert(2)</script>")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Structural spoofing: no injected heading/list starts a line.
+        assert not re_module.search(r"^# 標題", content, re_module.MULTILINE)
+        assert not re_module.search(r"^- forged list item", content, re_module.MULTILINE)
+        assert not re_module.search(r"^1\. fake ordered step", content, re_module.MULTILINE)
+        # Link/image syntax must not survive in bindable form.
+        assert "[點我](https://evil.example)" not in content
+        assert "![report](https://evil.example/fake.png)" not in content
+        # Raw HTML must be entity-escaped, not passed through.
+        assert "<img" not in content
+        assert "<script>" not in content
+        assert "<pre>" not in content
+        # The text itself is still readable (escaped forms keep the words).
+        assert "點我" in content
+        assert "forged list item" in content
+        assert "fake ordered step" in content
+
+    def test_table_cell_injection_is_neutralized(self, monkeypatch, tmp_path):
+        """Three-lens review (F2): table cells (Target/Model/tool args) are
+        attacker-controllable too — HTML and link syntax must not survive
+        them, at the same neutralization level as the prose path."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00006", target='<img src=x onerror=alert(1)>', model="m"
+        )
+        transcript.add_tool("download", args="[Download](http://evil.example)")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Raw HTML in the Target cell must be entity-escaped (inert).
+        assert "<img" not in content
+        assert "&lt;img src=x onerror=alert(1)&gt;" in content
+        # Bindable link syntax in the tool-args cell must be broken.
+        assert "[Download](http://evil.example)" not in content
+        # The words survive (escaped, still readable).
+        assert "Download" in content
+
+    def test_tilde_fence_and_forged_table_rows_are_escaped(self, monkeypatch, tmp_path):
+        """Three-lens review (F4): an unclosed ~~~ fence used to swallow the
+        rest of the report, and `| a | b |` lines could forge GFM tables
+        (their leading char is `|`, which the block-marker rules miss)."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00007", model="m")
+        transcript.add_user("~~~\ninside a fence\n| a | b |\n|---|---|\nstill fenced")
+        transcript.add_agent("real answer after the fence attempt")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert not re_module.search(r"^~~~", content, re_module.MULTILINE)
+        assert not re_module.search(r"^\| a \| b \|", content, re_module.MULTILINE)
+        assert not re_module.search(r"^\|---\|---\|", content, re_module.MULTILINE)
+        # Everything after the pseudo-fence is still rendered as prose.
+        assert "real answer after the fence attempt" in content
 
     def test_ws_message_with_null_content_still_writes_report(
         self, client, monkeypatch, results_dir
@@ -1062,6 +1236,316 @@ class TestLlmProgressEdgeCases:
                     if msg["type"] == "complete":
                         break
         assert "llm_progress" not in types
+
+
+class _AwaitingApprovalGraph(_FakeGraph):
+    """astream finishes but leaves the graph suspended at an approval gate
+    (get_state reports pending work only once the turn has run)."""
+
+    def __init__(self):
+        super().__init__(events=[{"messages": [_FakeAI("I will run nmap")]}])
+        self.pending = False
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(
+            values={"messages": []},
+            next=("tools",) if self.pending else (),
+            tasks=[],
+        )
+
+    async def astream(self, input_msg, config, stream_mode="values"):
+        self.pending = True
+        for ev in self.events:
+            yield ev
+
+
+class _ToolMessage:
+    def __init__(self, content="tool ok"):
+        self.type = "tool"
+        self.content = content
+
+
+class _StaleResumeGraph(_FakeGraph):
+    """Approve-resume appends a tool message but no new AI text (the graph
+    parks again right after the approved tool). The previous turn's AI
+    text must not be replayed as a fresh agent_message."""
+
+    def __init__(self):
+        self.values: dict = {"messages": [_FakeAI("previous answer")]}
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values=self.values, next=(), tasks=[])
+
+    async def ainvoke(self, command, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        self.values = {"messages": [self.values["messages"][0], _ToolMessage()]}
+        return GraphStateSnapshot(values=self.values)
+
+
+class _RepeatedReplyGraph(_FakeGraph):
+    """Approve-resume appends a NEW AI message whose text is byte-identical
+    to the previous turn's last AI text (a terse "Done.") — the count part
+    of the fingerprint must still flag it as new."""
+
+    def __init__(self):
+        self.values: dict = {"messages": [_FakeAI("Done.")]}
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values=self.values, next=(), tasks=[])
+
+    async def ainvoke(self, command, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        self.values = {"messages": [_FakeAI("Done."), _FakeAI("Done.")]}
+        return GraphStateSnapshot(values=self.values)
+
+
+class _UnreadableStateGraph(_FakeGraph):
+    """get_state always raises — the before-fingerprint is unreadable, so
+    the approve turn must conservatively replay nothing."""
+
+    def get_state(self, config):
+        raise RuntimeError("state unreadable")
+
+    async def ainvoke(self, command, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(values={"messages": [_FakeAI("fresh reply text")]})
+
+
+class TestCompleteFrameTruth:
+    """#33: complete frames must tell the truth about how the turn ended —
+    approval pending is not "Agent completed."."""
+
+    def test_approval_pending_completes_as_awaiting_approval(
+        self, client, monkeypatch
+    ):
+        fake = _AwaitingApprovalGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "message", "content": "go"})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        complete = frames[-1]
+        assert complete["data"]["status"] == "awaiting_approval"
+        assert complete["data"]["produced_new"] is True
+
+    def test_error_turn_completes_as_error_status(self, client):
+        with patch("clearwing.ui.web.app.create_agent", _FailingGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "boom"})
+                while True:
+                    frame = ws.receive_json()
+                    if frame["type"] == "complete":
+                        break
+        assert frame["data"]["status"] == "error"
+        assert frame["data"]["produced_new"] is False
+
+    def test_plain_message_turn_completes_as_ok(self, client, monkeypatch):
+        fake = _FakeGraph(events=[{"messages": [_FakeAI()]}])
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+            ws.send_json({"type": "message", "content": "hi"})
+            while True:
+                frame = ws.receive_json()
+                if frame["type"] == "complete":
+                    break
+        assert frame["data"]["status"] == "ok"
+        assert frame["data"]["produced_new"] is True
+
+    def test_stale_resume_does_not_replay_previous_answer(self, client, monkeypatch):
+        fake = _StaleResumeGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        assert not any(
+            f["type"] == "agent_message" for f in frames
+        ), "resume without new AI text must not replay the previous turn's answer"
+        assert frames[-1]["data"]["status"] == "ok"
+        assert frames[-1]["data"]["produced_new"] is False
+
+    def test_repeated_identical_reply_is_still_new(self, client, monkeypatch):
+        """F5: a resume whose new reply text equals the previous turn's
+        last AI text (a terse "Done.") is REAL new output — the count part
+        of the fingerprint must flag it, not swallow it."""
+        fake = _RepeatedReplyGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        assert any(
+            f["type"] == "agent_message" and f["data"]["content"] == "Done."
+            for f in frames
+        ), "an identical-but-new reply must still be delivered"
+        assert frames[-1]["data"]["status"] == "ok"
+        assert frames[-1]["data"]["produced_new"] is True
+
+    def test_unreadable_before_state_does_not_replay(self, client, monkeypatch):
+        """F5: when the before-fingerprint cannot be read (get_state
+        raises), the approve turn replays nothing — conservative
+        produced_new=false instead of a guaranteed-fresh replay."""
+        fake = _UnreadableStateGraph()
+        monkeypatch.setattr("clearwing.ui.web.app.create_agent", lambda **kwargs: fake)
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "t", "model": "m"})
+            assert ws.receive_json()["type"] == "started"
+
+            ws.send_json({"type": "approve", "approved": True})
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] == "complete":
+                    break
+        assert not any(f["type"] == "agent_message" for f in frames)
+        assert frames[-1]["data"]["status"] == "ok"
+        assert frames[-1]["data"]["produced_new"] is False
+
+
+class TestPumpResilience:
+    """#11: a transient send failure must not kill the event pump for the
+    rest of the session."""
+
+    def test_pump_survives_transient_send_failure(self, client, monkeypatch):
+        import asyncio
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
+
+        real_send_json = FastAPIWebSocket.send_json
+        calls = {"n": 0}
+
+        async def flaky_send_json(self_ws, data, mode="text"):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("transient send failure")
+            return await real_send_json(self_ws, data, mode=mode)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_json", flaky_send_json)
+
+        class _EmittingSlowGraph:
+            def __init__(self, **kwargs):
+                del kwargs
+
+            async def astream(self, input_data, config, stream_mode="values"):
+                from clearwing.core.events import EventBus, EventType
+
+                del input_data, config, stream_mode
+                EventBus().emit(
+                    EventType.MESSAGE, {"content": "mid-turn frame", "type": "info"}
+                )
+                await asyncio.sleep(0.3)
+                yield {"messages": [SimpleNamespace(type="ai", content="done")]}
+
+        with patch("clearwing.ui.web.app.create_agent", _EmittingSlowGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "t"})
+                assert ws.receive_json()["type"] == "started"
+                ws.send_json({"type": "message", "content": "run"})
+                frames = []
+                while True:
+                    frame = ws.receive_json()
+                    frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+        # The pump's first forward attempt failed once; the retried frame
+        # still reached the client (pre-fix the pump died and the frame was
+        # silently dropped).
+        assert any(
+            f["type"] == "agent_message" and f["data"].get("content") == "mid-turn frame"
+            for f in frames
+        )
+        assert frames[-1]["data"]["status"] == "ok"
+
+
+class TestWorkerThreadEvents:
+    """#11: bus events emitted from non-loop threads (sync tools run in
+    asyncio.to_thread workers) must reach the client while the turn is
+    still running."""
+
+    def test_worker_thread_event_arrives_during_turn(self, client, monkeypatch):
+        import threading
+        import time
+
+        class _ThreadEmitGraph:
+            def __init__(self, **kwargs):
+                del kwargs
+
+            async def astream(self, input_data, config, stream_mode="values"):
+                import asyncio
+
+                del input_data, config, stream_mode
+
+                def worker():
+                    from clearwing.core.events import EventBus, EventType
+
+                    time.sleep(0.05)
+                    EventBus().emit(
+                        EventType.MESSAGE, {"content": "from worker", "type": "info"}
+                    )
+
+                threading.Thread(target=worker, daemon=True).start()
+                await asyncio.sleep(1.0)
+                yield {"messages": [SimpleNamespace(type="ai", content="done")]}
+
+        with patch("clearwing.ui.web.app.create_agent", _ThreadEmitGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "t"})
+                assert ws.receive_json()["type"] == "started"
+                ws.send_json({"type": "message", "content": "run"})
+
+                frame = ws.receive_json()
+                assert frame["type"] == "agent_message"
+                assert frame["data"]["content"] == "from worker"
+
+                # The worker frame arrived while the turn was still
+                # running (pre-fix it stayed stranded on the queue until
+                # the turn's own sleep ended the loop's blockade).
+                ws.send_json({"type": "message", "content": "probe"})
+                reply = ws.receive_json()
+                assert reply["type"] == "error"
+                assert "already running" in reply["data"]["message"]
+
+                ws.send_json({"type": "stop"})
+                while True:
+                    if ws.receive_json()["type"] == "complete":
+                        break
 
 
 class TestSessionCostTeardown:

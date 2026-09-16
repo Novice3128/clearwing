@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -64,13 +67,33 @@ def _datetime_decoder(dct: dict) -> dict:
 
 
 class SessionStore:
-    """Persists Clearwing sessions as JSON files on disk."""
+    """Persists Clearwing sessions as JSON files on disk.
+
+    Issue #7: an unwritable CLEARWING_HOME (a container whose HOME points
+    at /nonexistent, a read-only volume) used to make ``__init__`` raise,
+    turning every API touch into a 500. Construction now degrades
+    gracefully instead: ``available`` is False, mutations become no-ops,
+    reads behave like an empty store, and ``unavailable_reason`` carries
+    the cause so callers can answer 503/degraded rather than 500.
+    """
 
     def __init__(self) -> None:
         from clearwing.core.config import clearwing_home
 
+        self.available = True
+        self.unavailable_reason: str | None = None
         self.BASE_DIR = clearwing_home() / "sessions"
-        self.BASE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            self.BASE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.available = False
+            self.unavailable_reason = (
+                f"session dir {self.BASE_DIR} is not writable: {exc}"
+            )
+            logger.error(
+                "SessionStore degraded, sessions will not persist: %s",
+                self.unavailable_reason,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -92,6 +115,8 @@ class SessionStore:
 
     def save(self, session: SessionInfo) -> None:
         """Serialize *session* to JSON and write to BASE_DIR/{session_id}.json."""
+        if not self.available:
+            return
         path = self.BASE_DIR / f"{session.session_id}.json"
         data = asdict(session)
         path.write_text(
@@ -112,6 +137,8 @@ class SessionStore:
 
     def list_sessions(self, target: str | None = None) -> list[SessionInfo]:
         """Return all persisted sessions, optionally filtered by *target*."""
+        if not self.available:
+            return []
         sessions: list[SessionInfo] = []
         for path in sorted(self.BASE_DIR.glob("*.json")):
             try:
@@ -135,6 +162,8 @@ class SessionStore:
 
     def delete(self, session_id: str) -> None:
         """Remove the session file for *session_id*."""
+        if not self.available:
+            return
         path = self.BASE_DIR / f"{session_id}.json"
         if path.exists():
             path.unlink()
