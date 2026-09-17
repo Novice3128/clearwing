@@ -1904,6 +1904,9 @@ class TestStartFrameRetiresPriorSessionCost:
                 assert len(started_ids) == 2
                 assert started_ids[0] != started_ids[1]
                 assert tracker.session_total(started_ids[0]) == 0.0
+                # Assert only about THIS test's ids: CostTracker is a
+                # process-wide singleton other tests also book into, so
+                # whole-map equality would be order-dependent.
                 with tracker._lock:
-                    assert set(tracker._session_totals) == {started_ids[1]}
+                    assert started_ids[0] not in tracker._session_totals
                 assert tracker.session_total(started_ids[1]) > 0.0

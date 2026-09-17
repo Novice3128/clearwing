@@ -555,6 +555,12 @@ def create_app():
         message_queue: asyncio.Queue = asyncio.Queue()
         transcript: SessionTranscript | None = None
         session_id: str | None = None
+        # Every session id this connection has minted. A re-`start` retires
+        # the previous one immediately, but a tool running in an
+        # asyncio.to_thread worker cannot be cancelled and may book under the
+        # retired id afterwards — teardown must reclaim all of them, not just
+        # the newest (Codex PR-55 r4 / review lens).
+        connection_session_ids: list[str] = []
         # EventBus is a process-wide singleton whose payloads carry no session
         # id, so bus events can only be attributed while THIS session's turn
         # is running; record nothing outside the window.
@@ -1096,15 +1102,17 @@ def create_app():
                     # collision later in the process lifetime would inherit
                     # the stale spend. The busy-frame guard above ensures no
                     # turn of the old session is still running.
-                    if session_id is not None:
+                    for prior_id in connection_session_ids:
                         try:
-                            telemetry.CostTracker().forget_session(session_id)
+                            telemetry.CostTracker().forget_session(prior_id)
                         except Exception:
                             logger.debug(
                                 "Failed to retire prior session cost entry",
                                 exc_info=True,
                             )
+                    connection_session_ids.clear()
                     session_id = uuid.uuid4().hex[:8]
+                    connection_session_ids.append(session_id)
                     # A start frame begins a new session on this connection:
                     # re-arm the session-scoped cost totals (issue #10).
                     session_cost.update(cost_usd=0.0, tokens=0)
@@ -1286,7 +1294,10 @@ def create_app():
                     bus.unsubscribe(et, h)
             # PR #44 review P2: retire this session's cost/token entry —
             # 8-hex ids collide in a long-lived webui, and a stale entry
-            # would hand the colliding session this session's spend.
-            telemetry.CostTracker().forget_session(session_id)
+            # would hand the colliding session this session's spend. Every id
+            # this connection minted is reclaimed: a worker-thread booking
+            # that landed after a re-start retire would otherwise survive.
+            for used_id in [*connection_session_ids, session_id]:
+                telemetry.CostTracker().forget_session(used_id)
 
     return app

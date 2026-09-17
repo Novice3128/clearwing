@@ -1424,8 +1424,9 @@ class AsyncLLMClient:
                 # provider may already be generating, so rerouting every
                 # retry through a second transport doubles the billed
                 # round-trips. Only reroute timeouts that provably never
-                # left the client. (The one-shot post-retry fallback on the
-                # streaming path is not per-retry and keeps rerouting.)
+                # left the client. (The streaming path's fallback now runs
+                # under _with_retries too, so it reroutes per attempt as
+                # well — issue #47.)
                 raise
             if (
                 self._spend_ledger is not None
@@ -2052,9 +2053,11 @@ class AsyncLLMClient:
         """Run ONE dispatch under its own spend reservation (issue #42).
 
         Companion to ``_with_retries(reserve=...)`` for the one-shot retry
-        paths (reasoning-effort retry, OpenAI HTTP stream fallback): the
-        attempt settles on success and closes its reservation on failure,
-        so no dispatch ever rides on an already-consumed reservation.
+        path (the reasoning-effort retry): the attempt settles on success
+        and closes its reservation on failure, so no dispatch ever rides on
+        an already-consumed reservation. The OpenAI HTTP stream fallback
+        moved to ``_with_retries`` in issue #47 so it gets a full per-attempt
+        retry budget instead of a single shot.
         """
         reservation = reserve()
         try:

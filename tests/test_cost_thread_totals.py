@@ -124,3 +124,47 @@ class TestCostTotalsPerThread:
 
         assert graph._cost_totals["default"]["input_tokens"] == 1000
         assert state["total_tokens"] == 1500
+
+
+class TestThreadLookupMechanics:
+    """Codex PR-55 r4: the thread is derived from the state dict in hand —
+    no ContextVar, so interleaved loops and direct calls cannot cross-book."""
+
+    def test_thread_lookup_is_identity_based_not_ambient(self):
+        """Attribution must come from the state dict in hand (identity), not
+        from ambient task state: an ambient ContextVar leaks out of async
+        generators and cross-books interleaved loops on one graph."""
+        graph = _build_graph("sess-identity")
+        state_a = graph._get_or_create_state("ws-A")
+        state_b = graph._get_or_create_state("ws-B")
+
+        assert graph._thread_for_state(state_a) == "ws-A"
+        assert graph._thread_for_state(state_b) == "ws-B"
+        # Equal CONTENT but different identity is not a thread's state.
+        assert graph._thread_for_state({"messages": []}) == "default"
+
+        # And the implementation carries no ambient thread id at all.
+        import clearwing.agent.runtime as runtime_module
+
+        assert not hasattr(runtime_module, "_current_thread_id")
+
+    def test_assistant_step_keeps_its_tracer_span(self):
+        """The cost-bucket helper must not steal the @tracer.chain
+        decorator from _aassistant_step (Codex PR-55 r4)."""
+        import inspect
+
+        from clearwing.agent.runtime import NativeAgentGraph
+
+        step = NativeAgentGraph._aassistant_step
+        # Decorated functions are wrapped; the helper is not.
+        assert hasattr(step, "__wrapped__") or "BoundFunctionWrapper" in type(
+            step
+        ).__name__
+        assert NativeAgentGraph._cost_totals_for.__name__ == "_cost_totals_for"
+
+    def test_unregistered_state_uses_the_default_bucket(self):
+        graph = _build_graph("sess-unregistered")
+        totals = graph._cost_totals_for(
+            graph._thread_for_state({"messages": []})
+        )
+        assert graph._cost_totals["default"] is totals

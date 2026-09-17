@@ -966,3 +966,33 @@ def test_unsettled_reservation_on_resume_is_charged_in_every_mode(tmp_path):
     assert recovered, "the unsettled reservation must be replayed"
     assert recovered[0]["cost_usd"] == pytest.approx(4.0)
     assert resumed.spent_usd == pytest.approx(4.0)
+
+
+def test_missing_usage_response_charges_reservation_in_every_mode(tmp_path):
+    """Issue #47: a response WITHOUT usage cannot prove a lower cost, so the
+    reservation estimate is charged in non-enforcing mode too — the same
+    doctrine as fail_call (Codex PR-55 r4)."""
+    ledger = SpendLedger(
+        limit_usd=0.0,  # non-enforcing / observability
+        session_id="usage-missing",
+        repo_url="/tmp/repo",
+        output_dir=tmp_path,
+        input_price_per_million=0.0,
+        output_price_per_million=1_000_000.0,
+    )
+    client = AsyncLLMClient(
+        model_name="private-priced-model",
+        provider_name="anthropic",
+        api_key="test",
+    ).with_spend_ledger(ledger, stage="hunt")
+
+    reservation = client._reserve_spend_call(
+        messages=[ChatMessage("user", "x")], system="", tools=None, max_tokens=4
+    )
+    assert reservation is not None
+
+    charged = ledger.settle_call(
+        reservation, input_tokens=None, output_tokens=None
+    )
+    assert charged == pytest.approx(4.0)
+    assert ledger.spent_usd == pytest.approx(4.0)

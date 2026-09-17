@@ -547,9 +547,11 @@ class SpendLedger:
             if provider_cost is not None and math.isfinite(provider_cost) and provider_cost >= 0:
                 actual_cost = provider_cost
                 cost_source = "provider"
-            elif usage_missing and self.enforcing:
-                # A provider response without usage cannot prove a lower cost.
-                # Charge the full reservation so later calls remain safe.
+            elif usage_missing:
+                # A provider response without usage cannot prove a lower cost,
+                # so the reservation estimate is charged in EVERY mode — same
+                # doctrine as fail_call (issue #47): the enforcing flag
+                # governs retry refusal, not accounting.
                 actual_cost = reservation.reserved_usd
                 cost_source = "reservation"
             else:
@@ -606,22 +608,12 @@ class SpendLedger:
                 error=error,
             )
 
-    def release_call(self, reservation: BudgetReservation, *, reason: str) -> None:
-        """Release a reservation that failed before any provider dispatch."""
-
-        with self._lock:
-            if not reservation.active:
-                return
-            self._finish_reservation_locked(
-                reservation,
-                charged_usd=0.0,
-                input_tokens=0,
-                output_tokens=0,
-                cached_input_tokens=0,
-                status="not_dispatched",
-                cost_source="none",
-                error=reason,
-            )
+    # NOTE (issue #47): the former release_call() pre-dispatch path was
+    # removed. Every reservation now exists only after the dispatch was
+    # attempted, and provably-unbilled failures close through fail_call
+    # (status "rejected", $0) — a reservation that never reached the
+    # provider cannot be created because reserve_call() either succeeds
+    # and is immediately dispatched, or raises before a reservation exists.
 
     def spent_by(self, field_name: str, **filters: Any) -> dict[str, float]:
         """Aggregate settled spend by a metadata field, optionally filtering."""

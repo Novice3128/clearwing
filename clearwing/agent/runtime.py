@@ -7,7 +7,6 @@ import logging
 import os
 import re
 from collections.abc import Callable
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
@@ -49,15 +48,6 @@ _FAILURE_MARKERS = (
     "unauthorized",
     "permission denied",
     "operation not permitted",
-)
-
-# The thread_id of the agent loop currently executing in this task/thread
-# (issue #52). _arun_loop sets it so downstream bookkeeping (_aassistant_step
-# cost attribution) can key per-thread without threading the id through
-# every signature; None outside a running loop (callers fall back to a
-# shared "default" bucket, matching the pre-#52 single-bucket behavior).
-_current_thread_id: ContextVar[str | None] = ContextVar(
-    "clearwing_agent_thread_id", default=None
 )
 
 
@@ -289,7 +279,7 @@ class NativeAgentGraph:
         # the instance instead (like _loop_counters, deliberately NOT state:
         # _merge_input copies arbitrary input keys into state). #52: one
         # graph CAN serve several thread_ids, so the totals key by the
-        # running loop's thread (see _current_thread_id) — thread A's spend
+        # owning thread (see _thread_for_state) — thread A's spend
         # must never write into thread B's state, in either direction. The
         # global tracker stays for process-level observation only.
         self._cost_totals: dict[str, dict[str, float]] = {}
@@ -490,11 +480,6 @@ class NativeAgentGraph:
             yield event
 
     async def _arun_loop(self, thread_id: str):
-        # Key the loop's thread for per-thread cost bookkeeping (issue #52).
-        # Set (not set+reset): sequential loops on the same task each stamp
-        # their own id before any booking can happen, and the value is only
-        # ever read while this loop is awaiting.
-        _current_thread_id.set(thread_id)
         state = self._get_or_create_state(thread_id)
         limits = self.agent_limits
         max_steps = limits.max_steps if limits else None
@@ -562,20 +547,31 @@ class NativeAgentGraph:
             if paused or halted:
                 break
 
-    @tracer.chain(name="agent.assistant_step")
-    def _cost_totals_for(self, thread_id: str | None) -> dict[str, float]:
-        """Per-thread cost/token bucket (issues #37/#52).
+    def _thread_for_state(self, state: dict[str, Any]) -> str:
+        """The thread_id owning *state* (issues #37/#52).
 
-        One graph can serve several thread_ids; booking into a shared bucket
-        made thread A's spend land in thread B's state (and vice versa).
-        Calls outside a running loop (None) share the legacy "default"
-        bucket so direct step invocations keep pre-#52 behavior.
+        Identity lookup against the per-thread state registry: one graph can
+        serve several thread_ids, so a shared bucket made thread A's spend
+        land in thread B's state (and vice versa). Deriving the thread from
+        the state dict in hand is immune to the context leaks and
+        interleavings a ContextVar would introduce (a `set()` inside an
+        async generator leaks into the driving task, and interleaved
+        `astream`s on one graph would cross-book). States not registered
+        here (direct step invocations) share the legacy "default" bucket.
         """
+        for thread_id, known in self._state.items():
+            if known is state:
+                return thread_id
+        return "default"
+
+    def _cost_totals_for(self, thread_id: str | None) -> dict[str, float]:
+        """Per-thread cost/token bucket (issues #37/#52)."""
         return self._cost_totals.setdefault(
             thread_id or "default",
             {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
         )
 
+    @tracer.chain(name="agent.assistant_step")
     async def _aassistant_step(self, state: dict[str, Any]) -> dict[str, Any]:
         messages = list(state.get("messages", []))
         if self.context_summarizer:
@@ -640,7 +636,7 @@ class NativeAgentGraph:
                                 or getattr(self.llm, "provider_name", None),
                                 session_id=self.session_id,
                             )
-                        totals = self._cost_totals_for(_current_thread_id.get())
+                        totals = self._cost_totals_for(self._thread_for_state(state))
                         totals["cost_usd"] += summary_cost
                         totals["input_tokens"] += s_input
                         totals["output_tokens"] += s_output
@@ -782,7 +778,7 @@ class NativeAgentGraph:
             # Instance totals (issues #37/#52): state must report THIS
             # thread's spend on this graph — not the tracker's cross-session
             # running total, and not the other threads sharing the graph.
-            totals = self._cost_totals_for(_current_thread_id.get())
+            totals = self._cost_totals_for(self._thread_for_state(state))
             totals["cost_usd"] += call_cost
             totals["input_tokens"] += input_tokens
             totals["output_tokens"] += output_tokens
