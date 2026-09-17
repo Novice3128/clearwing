@@ -782,7 +782,9 @@ def test_billable_ambiguous_retry_settles_each_attempt(tmp_path, monkeypatch):
     )
 
     with patch("clearwing.llm.native.asyncio.sleep", new=_no_sleep):
-        asyncio.run(client.achat(messages=[ChatMessage("user", "x")]))
+        asyncio.run(
+            client.achat(messages=[ChatMessage("user", "x")], max_tokens=4)
+        )
 
     assert get_calls() == 2
 
@@ -794,13 +796,15 @@ def test_billable_ambiguous_retry_settles_each_attempt(tmp_path, monkeypatch):
     closures = [event for event in events if event["event"] == "call_settled"]
     assert len(reservations) == 2  # one per attempt
     assert [event["status"] for event in closures] == [
-        "ambiguous_failure",  # attempt 1: closed, zero charge (non-enforcing)
+        "ambiguous_failure",  # attempt 1: closed, charged its reservation
         "succeeded",  # attempt 2: settled with real usage
     ]
-    # Non-enforcing: only the successful attempt's 2 generated tokens
-    # ($1/token) are charged; the pre-fix code hid the ambiguous attempt
-    # from the ledger entirely (one reservation, one closure).
-    assert ledger.spent_usd == pytest.approx(2.0)
+    # Issue #47: ambiguous failures charge their reservation in EVERY mode
+    # (the enforcing flag governs retry refusal, not accounting) — the
+    # failed attempt may have been billed, so a $0 booking underreported
+    # the real bill. Attempt 1: $4 reservation; attempt 2: 2 tokens ($1
+    # each, output price) — total $6.
+    assert ledger.spent_usd == pytest.approx(6.0)
 
 
 def test_definitely_unbilled_retry_releases_each_attempt(tmp_path, monkeypatch):
@@ -914,4 +918,81 @@ def test_settle_failure_in_attempt_with_reservation_closes_it(tmp_path):
     ]
     closures = [event for event in events if event["event"] == "call_settled"]
     assert [event["status"] for event in closures] == ["ambiguous_failure"]
+    assert ledger.spent_usd == pytest.approx(4.0)
+
+
+def test_unsettled_reservation_on_resume_is_charged_in_every_mode(tmp_path):
+    """Issue #47: an unsettled reservation (process died mid-flight) is an
+    ambiguous failure — the provider may have billed it — so the estimate
+    is charged even for a NON-enforcing ledger. The pre-fix replay gate
+    honored `budget_enforcing` and booked $0, underreporting the bill."""
+    ledger = SpendLedger(
+        limit_usd=0.0,  # non-enforcing / observability
+        session_id="resume-test",
+        repo_url="/tmp/repo",
+        output_dir=tmp_path,
+        input_price_per_million=0.0,
+        output_price_per_million=1_000_000.0,
+    )
+    client = AsyncLLMClient(
+        model_name="private-priced-model",
+        provider_name="anthropic",
+        api_key="test",
+    ).with_spend_ledger(ledger, stage="hunt")
+
+    reservation = client._reserve_spend_call(
+        messages=[ChatMessage("user", "x")], system="", tools=None, max_tokens=4
+    )
+    assert reservation is not None and reservation.active
+    # Simulate a crash: never settled, then a fresh ledger resumes the run.
+    del reservation
+
+    resumed = SpendLedger(
+        limit_usd=0.0,
+        session_id="resume-test",
+        repo_url="/tmp/repo",
+        output_dir=tmp_path,
+        input_price_per_million=0.0,
+        output_price_per_million=1_000_000.0,
+        resume=True,
+    )
+    events = [
+        json.loads(line)
+        for line in resumed.ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    recovered = [
+        e for e in events if e.get("status") == "recovered_ambiguous_failure"
+    ]
+    assert recovered, "the unsettled reservation must be replayed"
+    assert recovered[0]["cost_usd"] == pytest.approx(4.0)
+    assert resumed.spent_usd == pytest.approx(4.0)
+
+
+def test_missing_usage_response_charges_reservation_in_every_mode(tmp_path):
+    """Issue #47: a response WITHOUT usage cannot prove a lower cost, so the
+    reservation estimate is charged in non-enforcing mode too — the same
+    doctrine as fail_call (Codex PR-55 r4)."""
+    ledger = SpendLedger(
+        limit_usd=0.0,  # non-enforcing / observability
+        session_id="usage-missing",
+        repo_url="/tmp/repo",
+        output_dir=tmp_path,
+        input_price_per_million=0.0,
+        output_price_per_million=1_000_000.0,
+    )
+    client = AsyncLLMClient(
+        model_name="private-priced-model",
+        provider_name="anthropic",
+        api_key="test",
+    ).with_spend_ledger(ledger, stage="hunt")
+
+    reservation = client._reserve_spend_call(
+        messages=[ChatMessage("user", "x")], system="", tools=None, max_tokens=4
+    )
+    assert reservation is not None
+
+    charged = ledger.settle_call(
+        reservation, input_tokens=None, output_tokens=None
+    )
+    assert charged == pytest.approx(4.0)
     assert ledger.spent_usd == pytest.approx(4.0)

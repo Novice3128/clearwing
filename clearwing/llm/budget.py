@@ -317,7 +317,11 @@ class SpendLedger:
             raise BudgetConfigurationError(
                 f"Cannot resume session {self.session_id!r}: spend ledger is corrupt"
             )
-        charged = reserved_usd if reservation.get("budget_enforcing", reserved_usd > 0) else 0.0
+        # An unsettled reservation is an AMBIGUOUS failure: the request was
+        # dispatched and the provider may have billed it, so the estimate is
+        # charged in every mode (issue #47 — the enforcing flag governs
+        # retry refusal, not accounting).
+        charged = reserved_usd
         event = {
             "event": "call_settled",
             "call_id": call_id,
@@ -420,7 +424,7 @@ class SpendLedger:
                 raise RuntimeError("cannot reserve an LLM call on a finalized spend ledger")
 
             effective_max_tokens = requested_max_output_tokens
-            reserved_usd = 0.0
+            input_cost = input_token_upper_bound * pricing.input_per_million / 1_000_000
             if self.enforcing:
                 requested = (
                     self.default_max_output_tokens
@@ -431,7 +435,6 @@ class SpendLedger:
                     0.0,
                     self.limit_usd - self._spent_usd - self._reserved_usd,
                 )
-                input_cost = input_token_upper_bound * pricing.input_per_million / 1_000_000
                 if input_cost > available + self._EPSILON:
                     self._mark_exhausted_locked(
                         stage=stage,
@@ -474,6 +477,22 @@ class SpendLedger:
                         f"LLM budget exhausted before {stage}: call reservation "
                         f"${reserved_usd:.6f} exceeds remaining ${available:.6f}"
                     )
+            else:
+                # Non-enforcing (observability) runs still reserve a
+                # worst-case ESTIMATE (issue #47): without it every
+                # reservation booked $0, so ambiguous failures closed at
+                # $0 and spent_usd underreported the real provider bill.
+                # No affordability clamps or BudgetExceeded — there is no
+                # cap to enforce — just the estimate.
+                requested = (
+                    self.default_max_output_tokens
+                    if requested_max_output_tokens is None
+                    else max(1, int(requested_max_output_tokens))
+                )
+                effective_max_tokens = requested
+                reserved_usd = input_cost + (
+                    requested * pricing.output_per_million / 1_000_000
+                )
 
             reservation = BudgetReservation(
                 call_id=uuid.uuid4().hex,
@@ -528,9 +547,11 @@ class SpendLedger:
             if provider_cost is not None and math.isfinite(provider_cost) and provider_cost >= 0:
                 actual_cost = provider_cost
                 cost_source = "provider"
-            elif usage_missing and self.enforcing:
-                # A provider response without usage cannot prove a lower cost.
-                # Charge the full reservation so later calls remain safe.
+            elif usage_missing:
+                # A provider response without usage cannot prove a lower cost,
+                # so the reservation estimate is charged in EVERY mode — same
+                # doctrine as fail_call (issue #47): the enforcing flag
+                # governs retry refusal, not accounting.
                 actual_cost = reservation.reserved_usd
                 cost_source = "reservation"
             else:
@@ -561,12 +582,20 @@ class SpendLedger:
         error: str,
         definitely_unbilled: bool = False,
     ) -> None:
-        """Close a failed call, conservatively charging ambiguous failures."""
+        """Close a failed call, conservatively charging ambiguous failures.
+
+        The charge is mode-independent (issue #47): the ``enforcing`` flag
+        governs whether billable-ambiguous attempts may be RETRIED at
+        dispatch time, not whether they are accounted — a non-enforcing
+        (observability) ledger that booked ambiguous failures at $0
+        underreported the real provider bill, since the provider may have
+        billed the failed generation.
+        """
 
         with self._lock:
             if not reservation.active:
                 return
-            charged = 0.0 if definitely_unbilled or not self.enforcing else reservation.reserved_usd
+            charged = 0.0 if definitely_unbilled else reservation.reserved_usd
             status = "rejected" if definitely_unbilled else "ambiguous_failure"
             self._finish_reservation_locked(
                 reservation,
@@ -579,22 +608,12 @@ class SpendLedger:
                 error=error,
             )
 
-    def release_call(self, reservation: BudgetReservation, *, reason: str) -> None:
-        """Release a reservation that failed before any provider dispatch."""
-
-        with self._lock:
-            if not reservation.active:
-                return
-            self._finish_reservation_locked(
-                reservation,
-                charged_usd=0.0,
-                input_tokens=0,
-                output_tokens=0,
-                cached_input_tokens=0,
-                status="not_dispatched",
-                cost_source="none",
-                error=reason,
-            )
+    # NOTE (issue #47): the former release_call() pre-dispatch path was
+    # removed. Every reservation now exists only after the dispatch was
+    # attempted, and provably-unbilled failures close through fail_call
+    # (status "rejected", $0) — a reservation that never reached the
+    # provider cannot be created because reserve_call() either succeeds
+    # and is immediately dispatched, or raises before a reservation exists.
 
     def spent_by(self, field_name: str, **filters: Any) -> dict[str, float]:
         """Aggregate settled spend by a metadata field, optionally filtering."""

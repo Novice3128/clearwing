@@ -846,16 +846,13 @@ class AsyncLLMClient:
         self,
         reservation: BudgetReservation | None,
         exc: BaseException,
-        *,
-        dispatched: bool,
     ) -> None:
+        # Every caller books this AFTER a dispatch was attempted, so there
+        # is no pre-dispatch release path left on this helper (issue #47
+        # removed the constant-true `dispatched` flag); pre-dispatch
+        # failures surface as reserve() raising before any reservation
+        # exists.
         if reservation is None or self._spend_ledger is None:
-            return
-        if not dispatched:
-            self._spend_ledger.release_call(
-                reservation,
-                reason=type(exc).__name__,
-            )
             return
         self._spend_ledger.fail_call(
             reservation,
@@ -1167,14 +1164,69 @@ class AsyncLLMClient:
                             self.base_url,
                             exc,
                         )
-                        response = await self._attempt_with_reservation(
-                            lambda: self._openai_chat_http_fallback(
+                        # Issue #47: the transport fallback used to be a
+                        # ONE-SHOT attempt with zero retries of its own —
+                        # after the native stream exhausted its retry
+                        # budget, the HTTP path got exactly one chance.
+                        # Route it through _with_retries so the fallback
+                        # transport gets its own fresh per-attempt budget
+                        # (and per-attempt reservations).
+                        #
+                        # Delta policy (Codex PR-56 r2): fallback deltas are
+                        # BUFFERED per attempt and flushed only when that
+                        # attempt succeeds — a failed attempt's partial
+                        # text never reaches append-only consumers, so a
+                        # retry can never concatenate two generations. The
+                        # healthy path pays one flush instead of live
+                        # streaming, acceptable for the exceptional route.
+                        fallback_buffer: list[str] = []
+
+                        async def _fallback_attempt():
+                            fallback_buffer.clear()
+                            return await self._openai_chat_http_fallback(
                                 request,
                                 options,
-                                on_text_delta=on_text_delta,
-                            ),
-                            _reserve,
-                        )
+                                on_text_delta=fallback_buffer.append,
+                            )
+
+                        # Carry the native stream's consumed retries into the
+                        # fallback phase: the fallback's _with_retries starts
+                        # a fresh counter, and the final exception's attempts
+                        # count must reflect BOTH transports (Codex PR-56
+                        # r2) or the websocket error payload misstates them.
+                        native_attempts = getattr(exc, "_clearwing_attempts", 0) or 0
+                        try:
+                            response = await self._with_retries(
+                                _fallback_attempt, reserve=_reserve
+                            )
+                        except Exception as fallback_exc:
+                            fallback_attempts = (
+                                getattr(fallback_exc, "_clearwing_attempts", 0) or 0
+                            )
+                            if native_attempts and fallback_attempts:
+                                try:
+                                    fallback_exc._clearwing_attempts = (  # type: ignore[attr-defined]
+                                        native_attempts + fallback_attempts
+                                    )
+                                except Exception:
+                                    pass
+                            raise
+                        if on_text_delta is not None:
+                            # Flush the winning attempt's buffered deltas
+                            # chunk-for-chunk (original granularity); a
+                            # fallback that never streamed gets its complete
+                            # response text instead — delta-only consumers
+                            # see exactly one generation either way.
+                            if fallback_buffer:
+                                for chunk in list(fallback_buffer):
+                                    on_text_delta(chunk)
+                            elif response is not None:
+                                try:
+                                    complete_text = response_text(response)
+                                except Exception:
+                                    complete_text = ""
+                                if complete_text:
+                                    on_text_delta(complete_text)
                     else:
                         raise
                 if response is None:
@@ -1420,8 +1472,9 @@ class AsyncLLMClient:
                 # provider may already be generating, so rerouting every
                 # retry through a second transport doubles the billed
                 # round-trips. Only reroute timeouts that provably never
-                # left the client. (The one-shot post-retry fallback on the
-                # streaming path is not per-retry and keeps rerouting.)
+                # left the client. (The streaming path's fallback now runs
+                # under _with_retries too, so it reroutes per attempt as
+                # well — issue #47.)
                 raise
             if (
                 self._spend_ledger is not None
@@ -1948,7 +2001,7 @@ class AsyncLLMClient:
                 response = await op()
             except BaseException as exc:
                 if reservation is not None:
-                    self._fail_spend_call(reservation, exc, dispatched=True)
+                    self._fail_spend_call(reservation, exc)
                 if not isinstance(exc, Exception):
                     raise
                 is_rate_limit = self._is_rate_limit_error(exc)
@@ -2028,7 +2081,6 @@ class AsyncLLMClient:
                     self._fail_spend_call(
                         reservation,
                         RuntimeError("LLM stream ended without a terminal usage event"),
-                        dispatched=True,
                     )
                 else:
                     try:
@@ -2041,7 +2093,7 @@ class AsyncLLMClient:
                         # their remaining budget. Close it as an ambiguous
                         # failure — the generation may have been billed —
                         # then surface the original error.
-                        self._fail_spend_call(reservation, exc, dispatched=True)
+                        self._fail_spend_call(reservation, exc)
                         raise
             return response
 
@@ -2049,21 +2101,22 @@ class AsyncLLMClient:
         """Run ONE dispatch under its own spend reservation (issue #42).
 
         Companion to ``_with_retries(reserve=...)`` for the one-shot retry
-        paths (reasoning-effort retry, OpenAI HTTP stream fallback): the
-        attempt settles on success and closes its reservation on failure,
-        so no dispatch ever rides on an already-consumed reservation.
+        path (the reasoning-effort retry): the attempt settles on success
+        and closes its reservation on failure, so no dispatch ever rides on
+        an already-consumed reservation. The OpenAI HTTP stream fallback
+        moved to ``_with_retries`` in issue #47 so it gets a full per-attempt
+        retry budget instead of a single shot.
         """
         reservation = reserve()
         try:
             response = await op()
         except BaseException as exc:
-            self._fail_spend_call(reservation, exc, dispatched=True)
+            self._fail_spend_call(reservation, exc)
             raise
         if response is None:
             self._fail_spend_call(
                 reservation,
                 RuntimeError("LLM stream ended without a terminal usage event"),
-                dispatched=True,
             )
         else:
             try:
@@ -2071,7 +2124,7 @@ class AsyncLLMClient:
             except Exception as exc:
                 # Same dangling-reservation guard as _with_retries: close
                 # the attempt as an ambiguous failure, then re-raise.
-                self._fail_spend_call(reservation, exc, dispatched=True)
+                self._fail_spend_call(reservation, exc)
                 raise
         return response
 

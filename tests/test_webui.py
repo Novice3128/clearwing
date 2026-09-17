@@ -1852,3 +1852,61 @@ class TestForeignSessionMessageFilter:
         # Legacy emitters and session-less subsystem notes carry no id.
         assert not _is_foreign_session_message({"content": "context summarized"}, "aa11")
         assert not _is_foreign_session_message({"content": "note"}, None)
+
+
+class TestStartFrameRetiresPriorSessionCost:
+    """Issue #51: a second `start` on one connection retires the previous
+    session's tracker entry immediately — the singleton map must not grow
+    unbounded, and a later 8-hex id collision must not inherit stale
+    spend."""
+
+    def test_second_start_forgets_first_session_entry(self, client):
+        import json
+
+        from clearwing.agent.tooling import current_session_id
+        from clearwing.ui.web.app import _make_cost_tracker
+
+        tracker = _make_cost_tracker()
+        started_ids = []
+
+        class _TrackerGraph(_FakeGraph):
+            async def astream(self, input_msg, config, stream_mode="values"):
+                # Book spend under the socket's real session attribution:
+                # the turn runs inside session_scope(bound_session_id), so
+                # current_session_id() is the id the tracker entry lands on.
+                sid = current_session_id()
+                tracker.record_llm_call(100, 50, "fake-model", session_id=sid)
+                yield {"messages": [_FakeAI("ok")]}
+
+        with patch(
+            "clearwing.ui.web.app.create_agent", lambda **kwargs: _TrackerGraph()
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                for round_no in range(2):
+                    ws.send_json({"type": "start", "target": "10.0.0.7"})
+                    ws.send_json({"type": "message", "content": "hi"})
+                    while True:
+                        frame = json.loads(ws.receive_text())
+                        if frame["type"] == "started":
+                            started_ids.append(frame["session_id"])
+                        if frame["type"] == "complete":
+                            break
+                    if round_no == 0:
+                        # Between the two starts: session 1 booked real spend
+                        # under its own id (the turn ran in its scope)...
+                        with tracker._lock:
+                            assert started_ids[0] in tracker._session_totals
+                        assert tracker.session_total(started_ids[0]) > 0.0
+
+                # After the second start (socket STILL OPEN — teardown has
+                # not run): session 1's entry is retired immediately, and
+                # only the current session's entry remains.
+                assert len(started_ids) == 2
+                assert started_ids[0] != started_ids[1]
+                assert tracker.session_total(started_ids[0]) == 0.0
+                # Assert only about THIS test's ids: CostTracker is a
+                # process-wide singleton other tests also book into, so
+                # whole-map equality would be order-dependent.
+                with tracker._lock:
+                    assert started_ids[0] not in tracker._session_totals
+                assert tracker.session_total(started_ids[1]) > 0.0

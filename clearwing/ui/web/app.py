@@ -555,6 +555,15 @@ def create_app():
         message_queue: asyncio.Queue = asyncio.Queue()
         transcript: SessionTranscript | None = None
         session_id: str | None = None
+        # Every session id this connection has minted, plus the spend each
+        # retired id had at retire time. A re-`start` retires previous ids
+        # immediately; teardown reclaims a retired id ONLY when its tracker
+        # entry still matches the recorded spend — an id re-minted by
+        # another connection (8-hex collision) is that owner's entry now,
+        # and unconditionally popping it would reset their accounting
+        # (Codex PR-56 r2).
+        connection_session_ids: list[str] = []
+        retired_session_totals: dict[str, float] = {}
         # EventBus is a process-wide singleton whose payloads carry no session
         # id, so bus events can only be attributed while THIS session's turn
         # is running; record nothing outside the window.
@@ -1087,7 +1096,34 @@ def create_app():
                     )
                     target = data.get("target", "")
                     handler_target = target
+                    # Issue #51: a start frame begins a NEW session on this
+                    # connection — retire the previous session's tracker
+                    # entry immediately instead of waiting for socket
+                    # teardown (which only forgets the final id). Without
+                    # this, every re-start left the earlier entry in the
+                    # process-global tracker forever, and an 8-hex id
+                    # collision later in the process lifetime would inherit
+                    # the stale spend. The busy-frame guard above ensures no
+                    # turn of the old session is still running.
+                    tracker = telemetry.CostTracker()
+                    for prior_id in connection_session_ids:
+                        try:
+                            # Record the spend at retire time so teardown can
+                            # re-forget ONLY entries that are still ours (an
+                            # id re-minted by another connection after a
+                            # collision is that owner's entry now — Codex
+                            # PR-56 r2).
+                            retired_session_totals[prior_id] = (
+                                tracker.session_total(prior_id)
+                            )
+                            tracker.forget_session(prior_id)
+                        except Exception:
+                            logger.debug(
+                                "Failed to retire prior session cost entry",
+                                exc_info=True,
+                            )
                     session_id = uuid.uuid4().hex[:8]
+                    connection_session_ids.append(session_id)
                     # A start frame begins a new session on this connection:
                     # re-arm the session-scoped cost totals (issue #10).
                     session_cost.update(cost_usd=0.0, tokens=0)
@@ -1269,7 +1305,20 @@ def create_app():
                     bus.unsubscribe(et, h)
             # PR #44 review P2: retire this session's cost/token entry —
             # 8-hex ids collide in a long-lived webui, and a stale entry
-            # would hand the colliding session this session's spend.
-            telemetry.CostTracker().forget_session(session_id)
+            # would hand the colliding session this session's spend. Retired
+            # ids are reclaimed only when their entry still matches the
+            # spend recorded at retire time: an entry that grew (a late
+            # worker-thread booking) is skipped as residue, and an id since
+            # re-minted by ANOTHER connection is that owner's entry now —
+            # unconditionally popping it would reset their accounting.
+            tracker = telemetry.CostTracker()
+            for used_id in connection_session_ids:
+                if used_id == session_id:
+                    continue  # handled below
+                recorded = retired_session_totals.get(used_id)
+                if recorded is not None and tracker.session_total(used_id) == recorded:
+                    tracker.forget_session(used_id)
+            if session_id is not None:
+                tracker.forget_session(session_id)
 
     return app

@@ -633,15 +633,17 @@ class TestSummaryUsageAccounting:
 
         # The summary call's tokens landed in the instance totals on top of
         # the graph's own assistant steps, and in the session-scoped tracker
-        # record (fake-model bills at the Sonnet fallback tier).
+        # record (fake-model bills at the Sonnet fallback tier). Totals are
+        # keyed by the running loop's thread (issue #52).
         expected_in = 10 + 3 + 3 + 1  # assistant steps + summary
         expected_out = 5 + 2 + 2 + 1
-        assert graph._cost_totals["input_tokens"] == expected_in
-        assert graph._cost_totals["output_tokens"] == expected_out
+        totals = graph._cost_totals_for("t1")
+        assert totals["input_tokens"] == expected_in
+        assert totals["output_tokens"] == expected_out
         expected_cost = CostTracker.estimate_cost(
             expected_in, expected_out, "fake-model"
         )
-        assert graph._cost_totals["cost_usd"] == pytest.approx(expected_cost)
+        assert totals["cost_usd"] == pytest.approx(expected_cost)
 
         final = graph.get_state(config).values
         assert final["total_tokens"] == expected_in + expected_out
