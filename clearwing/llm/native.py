@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import urljoin
+from urllib.parse import urlparse
 
 import aiohttp
 import jsonschema
@@ -149,6 +149,31 @@ _LAST_FINISH_REASON: ContextVar[str | None] = ContextVar("last_finish_reason", d
 def last_finish_reason() -> str | None:
     """Provider finish/stop reason for the last completion in this Task."""
     return _LAST_FINISH_REASON.get()
+
+
+# Advice appended to pathless-base_url warnings and 404 errors (issue #60).
+# Deliberately actionable, not fail-fast: root-mounted gateways are legal,
+# so we never rewrite the URL or refuse to construct — we tell the operator
+# what to change when the endpoint 404s.
+_PATHLESS_BASE_URL_ADVICE = (
+    "has no path component; requests will hit /chat/completions at the host "
+    "root. Most OpenAI-compatible gateways serve /v1 — set the full path "
+    "(e.g. http://host:8787/v1) if a 404 occurs."
+)
+
+
+def _url_for_path(base: str, path: str) -> str:
+    """Join *base* and *path* with exactly one ``/`` (codex-rs parity).
+
+    Right-trims slashes off *base*, left-trims them off *path*, and joins
+    with a single separator — unlike ``urljoin`` this never re-interprets
+    the base (``http://h/v1`` and ``http://h/v1/`` both yield
+    ``http://h/v1/chat/completions``). An empty *path* returns *base*
+    unchanged, so callers passing a fully-resolved URL are inert.
+    """
+    if not path:
+        return base
+    return f"{base.rstrip('/')}/{path.lstrip('/')}"
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -588,6 +613,28 @@ class AsyncLLMClient:
         self.base_url = base_url
         self.pricing = pricing
         self._default_headers: dict[str, str] | None = None
+
+        # Issue #60: an openai chat-completions base_url with no path
+        # component (http://host:8787) makes every request hit
+        # /chat/completions at the host root, which most OpenAI-compatible
+        # gateways 404 (they serve /v1). Detection lives HERE — every
+        # endpoint source (CLI flags, CLEARWING_* env, config.yaml, the
+        # manager's default branch) funnels through this constructor — and
+        # it is a warning only: a gateway genuinely mounted at the root
+        # keeps working exactly as before. Other adapter families
+        # (openai_resp/openai_codex/ollama/gemini/anthropic*) resolve their
+        # own paths and are exempt (the ollama preset is pathless by
+        # design).
+        if (
+            provider_name == "openai"
+            and self.base_url
+            and urlparse(self.base_url).path in ("", "/")
+        ):
+            logger.warning(
+                "base_url %r %s",
+                self.base_url,
+                _PATHLESS_BASE_URL_ADVICE,
+            )
 
         # `openai_codex` is clearwing's label for the OAuth-authenticated
         # Responses API (the ChatGPT "Codex CLI" flow). It's not a distinct
@@ -1537,10 +1584,7 @@ class AsyncLLMClient:
         if self._default_headers:
             headers.update(self._default_headers)
 
-        url = urljoin(
-            self.base_url if self.base_url.endswith("/") else f"{self.base_url}/",
-            "chat/completions",
-        )
+        url = _url_for_path(self.base_url or "", "chat/completions")
         timeout = aiohttp.ClientTimeout(
             total=_LLM_TOTAL_TIMEOUT_SECONDS,
             sock_connect=min(30.0, _LLM_CONNECT_TIMEOUT_SECONDS),
@@ -2025,6 +2069,11 @@ class AsyncLLMClient:
                             exc._clearwing_attempts = attempt  # type: ignore[attr-defined]
                         except Exception:
                             pass
+                    # Single choke point for every transport's terminal
+                    # raise (native genai and the aiohttp fallback alike,
+                    # issue #60): a 404 from a pathless base_url gets the
+                    # actionable advice appended to its message.
+                    self._annotate_pathless_404(exc)
                     raise
                 if is_billable_ambiguous and (
                     self._spend_ledger is not None and self._spend_ledger.enforcing
@@ -2226,6 +2275,56 @@ class AsyncLLMClient:
         if self._SERVER_STATUS_ANCHOR.search(text):
             return True
         return any(phrase in text for phrase in self._SERVER_ERROR_PHRASES)
+
+    # Issue #60: same anchored-marker discipline as the 5xx classifier, but
+    # for the terminal (never retried) 404 that a pathless base_url usually
+    # produces. The anchor keeps a bare "404" inside a response body from
+    # classifying — the STATUS must match, not the digits.
+    _NOT_FOUND_STATUS_ANCHOR = re.compile(
+        r"(?:status(?:\s*code)?|http|error(?:\s*code)?)\s*[:=]?\s*['\"]?404\b",
+        re.IGNORECASE,
+    )
+
+    def _is_not_found_error(self, exc: Exception) -> bool:
+        """True for HTTP 404 failures — structured attrs, then anchored text."""
+        cur: BaseException | None = exc
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            for attr in ("status", "status_code", "http_status"):
+                value = getattr(cur, attr, None)
+                if isinstance(value, bool):
+                    continue
+                if value == 404 or value == "404":
+                    return True
+            cur = cur.__cause__ or cur.__context__
+        return bool(self._NOT_FOUND_STATUS_ANCHOR.search(_exception_chain_text(exc)))
+
+    def _annotate_pathless_404(self, exc: Exception) -> None:
+        """Append the pathless-base_url advice to a 404 error (issue #60).
+
+        Only fires for the openai chat-completions adapter whose base_url
+        has no path component, and only on the final (non-retried) raise —
+        404 semantics stay exactly as they were. Best-effort: a message
+        mutation must never break the raise path.
+        """
+        if self.provider_name != "openai" or not self.base_url:
+            return
+        if urlparse(self.base_url).path not in ("", "/"):
+            return
+        if not self._is_not_found_error(exc):
+            return
+        try:
+            text = str(exc)
+            if _PATHLESS_BASE_URL_ADVICE in text:
+                return
+            exc.args = (
+                f"{text} (base_url {self.base_url!r} {_PATHLESS_BASE_URL_ADVICE})",
+            )
+        except Exception:
+            logger.debug(
+                "Failed to annotate 404 with pathless base_url advice", exc_info=True
+            )
 
 # Transport failures where the request never completed a round-trip, so the
 # provider never generated (and never billed) — safe to retry. These come

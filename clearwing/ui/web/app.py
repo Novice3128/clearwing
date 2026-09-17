@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -36,8 +37,8 @@ logger = logging.getLogger(__name__)
 # (issue #4). Module-level so tests can shorten it.
 _LLM_PROGRESS_INTERVAL_SECONDS = 10
 
-# Backoff before the event pump retries a failed frame send (issue #11): a
-# transient send error must not kill the pump for the rest of the session.
+# Backoff before the outbound writer retries a failed frame send (issue #11):
+# a transient send error must not kill the writer for the rest of the session.
 # Module-level so tests can shorten it.
 _PUMP_SEND_RETRY_SECONDS = 0.5
 
@@ -514,10 +515,10 @@ def create_app():
                        "total_cost_usd": float, "total_tokens": int,
                        "model": str, "provider": str, "elapsed_ms": int}} —
                        cost/tokens are per call; total_* are session-scoped
-                       running totals for this connection while its turn is
-                       active (frames attributed to other sessions are not
-                       forwarded here; out-of-turn unscoped frames pass
-                       through raw)
+                       running totals (in-turn frames accumulate per call;
+                       out-of-turn frames carry the tracker's totals for this
+                       session — never the process-global ones). Frames
+                       attributed to other sessions are not forwarded here.
         - Server sends: {"type": "approval_needed", "prompt": "..."}
         - Server sends: {"type": "llm_progress", "data": {"elapsed_seconds": int}}
           every ~10s while a turn runs (first at +10s), so slow LLM calls
@@ -540,6 +541,11 @@ def create_app():
         a `message`/`approve` sent while a turn is still running is rejected
         with an error frame. On stop or client disconnect the running turn is
         cancelled and any pending approval is discarded.
+
+        Every outbound frame — bus events, llm_progress heartbeats, and
+        terminal frames alike — leaves through ONE writer coroutine consuming
+        a single FIFO queue (issue #45), so no frame can reach the client
+        after a terminal frame that was enqueued before it.
         """
         if not _ws_authorized(websocket):
             await websocket.close(code=1008)
@@ -552,7 +558,33 @@ def create_app():
         # put_nowait (issue #11: such frames could be stranded until the
         # next loop wakeup, or lost to the queue's internals).
         ws_loop = asyncio.get_running_loop()
-        message_queue: asyncio.Queue = asyncio.Queue()
+        # Single outbound queue (issue #45): every frame this connection
+        # sends — bus events, llm_progress heartbeats, and terminal frames
+        # (started/error/agent_message/complete/stopped, busy-rejections)
+        # alike — is pre-serialized to wire text at enqueue time and
+        # delivered by exactly one writer coroutine (`_writer_loop`) for the
+        # whole connection lifetime. Entries are `(text, payload, fut)`:
+        # - `text` is the exact JSON wire form; pre-serialization means a
+        #   send can now only fail for transport reasons — the
+        #   deterministic TypeError class (an unserializable payload
+        #   poisoning send_json on every retry) is dropped at enqueue
+        #   instead of stalling the queue forever;
+        # - `payload` is the original frame dict (None for flush-only
+        #   sentinels), kept so the #53 dedup gate can observe frames that
+        #   were actually DELIVERED, never merely enqueued;
+        # - `fut` (optional) is the enqueue-side flush handshake: it
+        #   resolves True once the writer has sent the entry (or, for a
+        #   sentinel, everything before it), and False as soon as a send
+        #   attempt fails — the same single-strike signal the old inline
+        #   `_safe_send` callers used to detect a gone client.
+        outbound_queue: asyncio.Queue = asyncio.Queue()
+        # Flush futures currently pending in the queue. The writer resolves
+        # them all False the moment a send attempt fails: they provably
+        # cannot be delivered until the stuck frame goes out, and without
+        # this an enqueue-side `await fut` could hang forever on a dead
+        # socket (the receive loop would never return to receive_text to
+        # notice the disconnect).
+        flush_futures: set[asyncio.Future] = set()
         transcript: SessionTranscript | None = None
         session_id: str | None = None
         # Every session id this connection has minted, plus the spend each
@@ -575,7 +607,12 @@ def create_app():
         # the per-call cost/tokens and rewrite a shallow copy for the wire
         # and the transcript; the shared bus payload itself stays untouched
         # (metrics gauges keep reading the process-global totals).
+        # The accumulator is written from worker threads (on_event handlers
+        # run in the emitting thread) and reset from the event loop (start
+        # frames), so every access takes the lock (issue #48: the unlocked
+        # read-modify-write could drop concurrent bookings).
         session_cost = {"cost_usd": 0.0, "tokens": 0}
+        session_cost_lock = threading.Lock()
 
         def _session_scope_cost_update(data: dict) -> dict | None:
             """Returns the frame to enqueue, or None to drop it.
@@ -587,28 +624,33 @@ def create_app():
             sessions never swallow each other's spend. Emissions without a
             session id (older callers) keep the transitional behaviour and
             still accumulate while this turn runs. Outside this session's
-            turn the bus is unattributable: matching/unscoped frames pass
-            through raw, foreign frames are dropped.
+            turn the bus is unattributable: matching/unscoped frames are
+            still forwarded, but with the tracker's totals for THIS session
+            (issue #48: they used to carry the emitter's process-global
+            running totals), foreign frames are dropped.
             """
-            if not turn_state["active"]:
-                origin = data.get("session_id")
-                if origin is not None and origin != session_id:
-                    return None
-                return data
             origin = data.get("session_id")
             if origin is not None and origin != session_id:
                 return None
+            if not turn_state["active"]:
+                tracker = telemetry.CostTracker()
+                scoped = dict(data)
+                scoped["total_cost_usd"] = round(tracker.session_total(session_id), 10)
+                in_tokens, out_tokens = tracker.session_tokens(session_id)
+                scoped["total_tokens"] = in_tokens + out_tokens
+                return scoped
             call_cost = data.get("cost")
-            if isinstance(call_cost, (int, float)):
-                session_cost["cost_usd"] += float(call_cost)
             per_call_tokens = (data.get("input_tokens") or 0) + (
                 data.get("output_tokens") or 0
             )
-            if isinstance(per_call_tokens, int) and per_call_tokens > 0:
-                session_cost["tokens"] += per_call_tokens
-            scoped = dict(data)
-            scoped["total_cost_usd"] = round(session_cost["cost_usd"], 10)
-            scoped["total_tokens"] = session_cost["tokens"]
+            with session_cost_lock:
+                if isinstance(call_cost, (int, float)):
+                    session_cost["cost_usd"] += float(call_cost)
+                if isinstance(per_call_tokens, int) and per_call_tokens > 0:
+                    session_cost["tokens"] += per_call_tokens
+                scoped = dict(data)
+                scoped["total_cost_usd"] = round(session_cost["cost_usd"], 10)
+                scoped["total_tokens"] = session_cost["tokens"]
             return scoped
 
         def _record_in_transcript(event_name: str, data: Any) -> None:
@@ -675,9 +717,28 @@ def create_app():
                             if _is_foreign_session_message(serializable, session_id):
                                 return
                         item = {"type": event_type_name, "data": serializable}
+                        # Pre-serialize BEFORE enqueue (issue #45): an
+                        # unserializable payload used to reach the writer
+                        # and fail send_json with the same TypeError on
+                        # every retry — an immortal frame blocking every
+                        # later one. Dropping it here keeps the queue
+                        # moving; the shallow type check above cannot
+                        # catch nested non-JSON values (e.g. a set inside
+                        # a dict), which is exactly what this dumps call
+                        # proves out.
+                        try:
+                            text = json.dumps(item)
+                        except (TypeError, ValueError):
+                            logger.error(
+                                "Dropping unserializable %s frame — it would "
+                                "stall the outbound writer; later frames still go out",
+                                event_type_name,
+                                exc_info=True,
+                            )
+                            return
                         try:
                             ws_loop.call_soon_threadsafe(
-                                message_queue.put_nowait, item
+                                outbound_queue.put_nowait, (text, item, None)
                             )
                         except RuntimeError:
                             # The loop is already closed — the socket is
@@ -736,7 +797,7 @@ def create_app():
 
         async def _reject_busy_frame() -> bool:
             """True when the handler may keep serving; False when the client is gone."""
-            return await _safe_send(
+            return await _send_frame(
                 {
                     "type": "error",
                     "data": {
@@ -749,7 +810,7 @@ def create_app():
             )
 
         async def _reject_pending_approval_frame() -> bool:
-            return await _safe_send(
+            return await _send_frame(
                 {
                     "type": "error",
                     "data": {
@@ -762,22 +823,79 @@ def create_app():
                 }
             )
 
-        async def _safe_send(payload: dict) -> bool:
+        def _enqueue_frame(
+            payload: dict, fut: asyncio.Future | None = None
+        ) -> bool:
+            # Pre-serialize at enqueue (issue #45): the writer only ever
+            # sends text that already proved serializable, so a send
+            # failure can only be a transport failure. A terminal frame
+            # that fails here reports the same False an inline send_json
+            # TypeError used to (the handler tears down instead of
+            # queueing an immortal frame).
             try:
-                await websocket.send_json(payload)
-                return True
-            except Exception:
-                # Client went away mid-send; the receive loop will observe the
-                # disconnect. Never let a send failure kill the handler.
+                text = json.dumps(payload)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Dropping unserializable outbound frame %r — it would "
+                    "stall the outbound writer",
+                    payload.get("type"),
+                    exc_info=True,
+                )
+                if fut is not None and not fut.done():
+                    fut.set_result(False)
                 return False
+            outbound_queue.put_nowait((text, payload, fut))
+            return True
+
+        async def _send_frame(payload: dict) -> bool:
+            """Enqueue a terminal frame and wait for the writer to deliver it.
+
+            Returns True when the writer sent it (every frame enqueued
+            earlier went out first — FIFO, single writer, so a `complete`
+            can never overtake queued bus frames again, issue #45). Returns
+            False on the frame's first failed send attempt — the same
+            single-strike "client is gone" signal the old inline
+            `_safe_send` gave its callers. The writer keeps retrying the
+            frame in the background, but a False here means teardown is
+            imminent.
+            """
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            flush_futures.add(fut)
+            try:
+                if not _enqueue_frame(payload, fut):
+                    return False
+                return await fut
+            finally:
+                flush_futures.discard(fut)
+
+        async def _flush_writer() -> None:
+            """Wait until the writer has delivered every frame enqueued so far.
+
+            Replaces the old `_drain_events` tail flushes (#53): a sentinel
+            sits in the same FIFO queue, so the writer only reaches it after
+            every earlier frame was actually sent (and noted for the dedup
+            gate). If a send is failing, the writer resolves the sentinel
+            False on its next failed attempt rather than parking here
+            forever.
+            """
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            flush_futures.add(fut)
+            try:
+                # Flush-only sentinel: empty text, no payload.
+                outbound_queue.put_nowait(("", None, fut))
+                await fut
+            finally:
+                flush_futures.discard(fut)
 
         def _note_delivered_frame(msg: dict) -> None:
             # Issue #53: remember the last bus-delivered assistant echo so
             # a turn's closing inline agent_message can skip re-sending
             # text the client already received verbatim (approval-pause
-            # turns let the pump win the race against the inline send).
-            # Only frames actually DELIVERED count — a queued-but-lost echo
-            # must not suppress the authoritative full-text send.
+            # turns let the writer win the race against the inline send).
+            # Only frames actually DELIVERED count (issue #45: the writer
+            # notes after its send succeeds, never at enqueue) — a
+            # queued-but-lost echo must not suppress the authoritative
+            # full-text send.
             # Assistant echoes carry type:"agent" (runtime emit_message);
             # warning/system notes map to the same frame type but are not
             # assistant text and must not participate in the dedup. The
@@ -792,46 +910,64 @@ def create_app():
             if data.get("type") == "agent" and content:
                 turn_state["last_bus_agent_text"] = content
 
-        async def _pump_events() -> None:
-            # Forward queued bus events while the agent loop is running —
-            # the receive loop below cannot drain the queue mid-turn, so
-            # without this pump, tool progress and approvals arrive late.
-            # A failed send must not kill the pump for the rest of the
-            # session (issue #11): retry the same frame after a short
-            # backoff. A genuinely dead connection is reaped by the
-            # receive loop's disconnect path, which cancels this task.
-            while True:
-                msg = await message_queue.get()
-                # Retry the SAME frame until it goes out (or the task is
-                # cancelled by the disconnect path).
-                while not await _safe_send(msg):
-                    await asyncio.sleep(_PUMP_SEND_RETRY_SECONDS)
-                _note_delivered_frame(msg)
+        async def _safe_send_text(text: str) -> bool:
+            try:
+                await websocket.send_text(text)
+            except Exception:
+                # Client went away mid-send; the receive loop will observe the
+                # disconnect. Never let a send failure kill the writer.
+                return False
+            return True
 
-        async def _drain_events() -> None:
+        async def _writer_loop() -> None:
+            # The single outbound writer (issue #45): one coroutine owns
+            # websocket.send for the whole connection, so frames leave in
+            # FIFO order — a terminal frame enqueued last can never be
+            # overtaken by an older queued frame the way the old inline
+            # one-shot sends could deliver after `complete`. A failed send
+            # is retried after a short backoff (issue #11): pre-serialization
+            # at enqueue removed the deterministic failure class, so only
+            # transient/disconnect failures remain, and a genuinely dead
+            # connection is reaped by the receive loop's disconnect path,
+            # which cancels this task.
             while True:
-                try:
-                    msg = message_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if not await _safe_send(msg):
-                    return
-                _note_delivered_frame(msg)
+                text, payload, fut = await outbound_queue.get()
+                if payload is None:
+                    # Flush sentinel: everything enqueued before it has been
+                    # delivered (the writer is strictly sequential — a
+                    # still-retrying frame would be holding us here).
+                    if not fut.done():
+                        fut.set_result(True)
+                    continue
+                while not await _safe_send_text(text):
+                    # A send failure — this frame's own flush handshake (if
+                    # any) and every handshake queued behind it cannot be
+                    # delivered until this frame goes out, so report the
+                    # single-strike False the old inline sends gave their
+                    # callers instead of parking the enqueue side forever
+                    # on a dead socket.
+                    for pending in flush_futures:
+                        if not pending.done():
+                            pending.set_result(False)
+                    await asyncio.sleep(_PUMP_SEND_RETRY_SECONDS)
+                _note_delivered_frame(payload)
+                if fut is not None and not fut.done():
+                    fut.set_result(True)
 
         async def _llm_progress_heartbeat() -> None:
             # Issue #4: a turn against a slow or flaky endpoint used to be a
             # multi-minute silent stall. First frame at +interval (never at
             # t=0 — the busy-rejection frame must stay the first frame a
-            # racing second message sees), then on the same cadence; exit
-            # silently once the socket is gone.
+            # racing second message sees), then on the same cadence. Frames
+            # ride the same outbound queue as everything else (issue #45);
+            # the task itself is cancelled at turn end / teardown.
             start = time.monotonic()
             while True:
                 await asyncio.sleep(_LLM_PROGRESS_INTERVAL_SECONDS)
                 elapsed = int(time.monotonic() - start)
-                if not await _safe_send(
+                _enqueue_frame(
                     {"type": "llm_progress", "data": {"elapsed_seconds": elapsed}}
-                ):
-                    return
+                )
 
         def _cancel_heartbeat(heartbeat: asyncio.Task) -> None:
             # Fire-and-forget: awaiting the cancel inside the turn's cleanup
@@ -932,13 +1068,13 @@ def create_app():
                 # final step's bus echo is emitted with NO await boundary
                 # before this point, so the dedup gate cannot have seen it
                 # (the inline frame would go out first and the echo would
-                # follow via the tail drain — a verbatim duplicate for
-                # texts ≤200 chars). Yield one loop turn so the scheduled
-                # enqueue lands, flush the queue, THEN decide. On pause
-                # turns the pump has already delivered the echo and this
-                # is a no-op.
+                # follow via the queue — a verbatim duplicate for texts
+                # ≤200 chars). Yield one loop turn so the scheduled
+                # enqueue lands, flush the writer (delivery, not just
+                # dequeue), THEN decide. On pause turns the writer has
+                # already delivered the echo and this is a no-op.
                 await asyncio.sleep(0)
-                await _drain_events()
+                await _flush_writer()
                 # Stream events are produced by this turn, so non-empty
                 # last_content is by construction fresh (issue #33:
                 # produced_new reports it instead of a message count).
@@ -946,7 +1082,7 @@ def create_app():
                 if produced_new:
                     if transcript_ref:
                         transcript_ref.add_agent(last_content)
-                    # Issue #53: approval-pause turns let the pump deliver
+                    # Issue #53: approval-pause turns let the writer deliver
                     # the bus echo of this very text before the turn ends;
                     # re-sending it inline duplicated short messages
                     # verbatim. Skip only the redundant FRAME — the
@@ -954,7 +1090,7 @@ def create_app():
                     # text (echo is a 200-char preview, never the full
                     # text) still gets its authoritative full send.
                     if turn_state.get("last_bus_agent_text") != last_content:
-                        if not await _safe_send(
+                        if not await _send_frame(
                             {
                                 "type": "agent_message",
                                 "data": {"content": last_content},
@@ -966,17 +1102,17 @@ def create_app():
                 logger.exception("Agent turn failed")
                 if transcript_ref:
                     transcript_ref.add_error(str(e))
-                if not await _safe_send(_error_payload(e)):
+                if not await _send_frame(_error_payload(e)):
                     return
             finally:
                 turn_state["active"] = False
             # Complete follows both success and failure, so the client never
             # waits on a turn that died mid-stream. A turn parked at an
             # approval gate completes with status "awaiting_approval", not
-            # "ok" (issue #33).
+            # "ok" (issue #33). Enqueueing it behind everything already
+            # queued (issue #45) means no earlier frame can follow it out.
             status = _turn_end_status(graph_ref, config_ref, sent_error)
-            await _drain_events()
-            await _safe_send(
+            await _send_frame(
                 _complete_payload(status=status, produced_new=produced_new)
             )
 
@@ -1013,15 +1149,16 @@ def create_app():
                 logger.exception("Agent resume failed")
                 if transcript_ref:
                     transcript_ref.add_error(str(e))
-                if not await _safe_send(_error_payload(e)):
+                if not await _send_frame(_error_payload(e)):
                     return
             else:
                 # Issue #53, mirror order (see _run_message_turn): the
                 # resumed step's echo may still be sitting in the
                 # call_soon_threadsafe queue with no await boundary since
-                # the emit — flush before the dedup gate decides.
+                # the emit — flush the writer before the dedup gate
+                # decides.
                 await asyncio.sleep(0)
-                await _drain_events()
+                await _flush_writer()
                 after = _ai_text_stats(getattr(snapshot, "values", None))
                 produced_new = before is not None and after != before
                 if produced_new:
@@ -1032,7 +1169,7 @@ def create_app():
                     # bus echo of this text was already delivered verbatim
                     # during this resume (same gate as message turns).
                     if turn_state.get("last_bus_agent_text") != content:
-                        if not await _safe_send(
+                        if not await _send_frame(
                             {
                                 "type": "agent_message",
                                 "data": {"content": content},
@@ -1044,10 +1181,11 @@ def create_app():
             # Complete follows both success and failure, so the client never
             # waits on a resume that died mid-stream. A resume that parks the
             # graph at the next approval gate completes with
-            # "awaiting_approval", not "ok" (issue #33).
+            # "awaiting_approval", not "ok" (issue #33). Enqueueing it behind
+            # everything already queued (issue #45) means no earlier frame
+            # can follow it out.
             status = _turn_end_status(graph_ref, config_ref, sent_error)
-            await _drain_events()
-            await _safe_send(
+            await _send_frame(
                 _complete_payload(status=status, produced_new=produced_new)
             )
 
@@ -1063,7 +1201,7 @@ def create_app():
             with session_scope(bound_session_id):
                 await turn_fn(*turn_args)
 
-        pump = asyncio.create_task(_pump_events())
+        writer_task = asyncio.create_task(_writer_loop())
 
         try:
             while True:
@@ -1126,7 +1264,8 @@ def create_app():
                     connection_session_ids.append(session_id)
                     # A start frame begins a new session on this connection:
                     # re-arm the session-scoped cost totals (issue #10).
-                    session_cost.update(cost_usd=0.0, tokens=0)
+                    with session_cost_lock:
+                        session_cost.update(cost_usd=0.0, tokens=0)
 
                     try:
                         graph = create_agent(
@@ -1140,7 +1279,7 @@ def create_app():
                         logger.exception("Failed to create agent for ws session")
                         graph = None
                         config = None
-                        if not await _safe_send(
+                        if not await _send_frame(
                             {
                                 "type": "error",
                                 "data": {"message": f"Failed to start agent: {e}"},
@@ -1160,7 +1299,7 @@ def create_app():
                         session_id, target=target, model=resolved_model
                     )
 
-                    if not await _safe_send(
+                    if not await _send_frame(
                         {
                             "type": "started",
                             "session_id": session_id,
@@ -1239,8 +1378,11 @@ def create_app():
                             logger.debug("Failed to discard pending interrupt", exc_info=True)
                     if transcript and (cancelled_turn or discarded):
                         transcript.add_error("[session stopped by operator]")
-                    await _drain_events()
-                    if not await _safe_send(
+                    # `stopped`/`complete` ride the same FIFO queue as the
+                    # cancelled turn's pending bus frames (issue #45): they
+                    # go out only after every earlier frame, without the old
+                    # explicit tail drain.
+                    if not await _send_frame(
                         {
                             "type": "stopped",
                             "data": {
@@ -1250,13 +1392,13 @@ def create_app():
                         }
                     ):
                         break
-                    if not await _safe_send(_complete_payload(status="stopped")):
+                    if not await _send_frame(_complete_payload(status="stopped")):
                         break
 
                 elif msg_type in ("message", "approve"):
                     # The frame needs an agent, but no start succeeded yet —
                     # never leave the client waiting in silence.
-                    if not await _safe_send(
+                    if not await _send_frame(
                         {
                             "type": "error",
                             "data": {
@@ -1287,13 +1429,13 @@ def create_app():
                     graph.discard_interrupt(config)
                 except Exception:
                     logger.debug("Failed to discard pending interrupt", exc_info=True)
-            pump.cancel()
+            writer_task.cancel()
             try:
-                await pump
+                await writer_task
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.debug("Event pump shutdown error", exc_info=True)
+                logger.debug("Outbound writer shutdown error", exc_info=True)
             if transcript is not None:
                 try:
                     transcript.write()

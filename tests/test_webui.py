@@ -1437,8 +1437,8 @@ class TestCompleteFrameTruth:
 
 
 class TestPumpResilience:
-    """#11: a transient send failure must not kill the event pump for the
-    rest of the session."""
+    """#11: a transient send failure must not kill the outbound writer for
+    the rest of the session."""
 
     def test_pump_survives_transient_send_failure(self, client, monkeypatch):
         import asyncio
@@ -1447,16 +1447,18 @@ class TestPumpResilience:
 
         monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
 
-        real_send_json = FastAPIWebSocket.send_json
+        # Since #45 every frame leaves via the single writer's send_text
+        # (pre-serialized JSON), so the flaky transport is injected there.
+        real_send_text = FastAPIWebSocket.send_text
         calls = {"n": 0}
 
-        async def flaky_send_json(self_ws, data, mode="text"):
+        async def flaky_send_text(self_ws, data):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("transient send failure")
-            return await real_send_json(self_ws, data, mode=mode)
+            return await real_send_text(self_ws, data)
 
-        monkeypatch.setattr(FastAPIWebSocket, "send_json", flaky_send_json)
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", flaky_send_text)
 
         class _EmittingSlowGraph:
             def __init__(self, **kwargs):
