@@ -95,6 +95,46 @@ class _EchoThenFinishGraph:
         yield {"messages": [_AI(self.text)]}
 
 
+class _LateThreadEmitGraph:
+    """Cross-thread flavor of the #45 ordering race.
+
+    The message turn's final stretch is: flush the writer, maybe send the
+    inline agent_message, then — in a NO-AWAIT window — ask
+    ``_graph_has_pending`` (``graph.get_state``) and enqueue the terminal
+    ``complete``. This graph emits a bus event from a WORKER thread on the
+    first get_state call after astream ran (i.e. from inside that window,
+    by way of ``_turn_end_status``) and blocks the loop until the emit is
+    scheduled: the call_soon_threadsafe enqueue sits in the ready queue,
+    unrun, while the turn coroutine proceeds toward ``complete``. The
+    single writer must still deliver that frame BEFORE ``complete`` —
+    which is exactly what ``_send_frame``'s leading ``sleep(0)``
+    guarantees."""
+
+    def __init__(self):
+        self._state = SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+        self._astream_done = False
+        self._emitted = False
+
+    def get_state(self, config):
+        del config
+        if self._astream_done and not self._emitted:
+            self._emitted = True
+            done = threading.Event()
+
+            def _emit():
+                _emit_tool_start("late_probe", {})
+                done.set()
+
+            threading.Thread(target=_emit, daemon=True).start()
+            done.wait(timeout=5)
+        return self._state
+
+    async def astream(self, input_msg, config, stream_mode="values"):
+        del input_msg, config, stream_mode
+        yield {"messages": [_AI("done")]}
+        self._astream_done = True
+
+
 class TestFrameOrdering:
     def test_echo_precedes_complete_and_nothing_follows_it(self, client):
         """#45: the echo is enqueued (via call_soon_threadsafe) moments
@@ -132,6 +172,35 @@ class TestFrameOrdering:
         assert after1["type"] == "stopped"
         assert after2["type"] == "complete"
         assert after2["data"]["status"] == "stopped"
+
+    def test_worker_thread_emit_in_terminal_window_precedes_complete(self, client):
+        """#45, cross-thread flavor: a bus event scheduled (but not yet
+        run) while the turn coroutine is inside the no-await window before
+        the `complete` enqueue must still be delivered BEFORE complete —
+        _send_frame yields once so the scheduled enqueue lands in the FIFO
+        first."""
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _LateThreadEmitGraph(),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                assert ws.receive_json()["type"] == "started"
+                ws.send_json({"type": "message", "content": "run"})
+
+                frames = []
+                while True:
+                    frame = ws.receive_json()
+                    frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+        types = [f["type"] for f in frames]
+        assert types[-1] == "complete"
+        assert "tool_start" in types
+        # The worker-thread emission raced the complete enqueue from
+        # inside get_state — it must not land after the terminal frame.
+        assert types.index("tool_start") < types.index("complete")
 
 
 class TestUnserializableFrameDrop:

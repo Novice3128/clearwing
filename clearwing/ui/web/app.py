@@ -859,6 +859,14 @@ def create_app():
             frame in the background, but a False here means teardown is
             imminent.
             """
+            # Yield once before entering the FIFO: a bus event emitted just
+            # before the turn ended (a late worker-thread booking) reaches
+            # the queue via call_soon_threadsafe, and without this yield
+            # the code between the last flush and this enqueue contains no
+            # await — the terminal frame would enter the queue ahead of the
+            # already-scheduled echo and deliver after `complete`
+            # (issue #45's symptom, cross-thread flavor).
+            await asyncio.sleep(0)
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
             flush_futures.add(fut)
             try:
