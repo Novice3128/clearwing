@@ -300,6 +300,27 @@ class NativeAgentGraph:
             else None
         )
         self.event_bus = EventBus() if enable_event_bus and capabilities.has("events") else None
+        if self.event_bus is not None:
+            # Retry/fallback visibility (issue #17): the LLM layer (and the
+            # FallbackChain) report waits and provider switches as they
+            # happen instead of surfacing them only in the final error's
+            # attempts count. The bus is thread-safe, so notices fired from
+            # worker threads land safely on the webui pump.
+            notice_setter = getattr(self.llm, "set_retry_notice", None)
+            if notice_setter is not None:
+                bus = self.event_bus
+
+                def _llm_notice(text: str) -> None:
+                    # session_id rides the payload so the webui pump can
+                    # scope retry/fallback chatter to this session's socket
+                    # instead of broadcasting every session's notices to
+                    # every connected client.
+                    bus.emit(
+                        EventType.MESSAGE,
+                        {"content": text, "type": "system", "session_id": self.session_id},
+                    )
+
+                notice_setter(_llm_notice)
         self.input_guardrail = (
             InputGuardrail() if enable_input_guardrail and capabilities.has("guardrails") else None
         )
@@ -576,12 +597,18 @@ class NativeAgentGraph:
                                 s_input,
                                 s_output,
                                 # Same pricing attribution as the main loop:
-                                # the client's resolved model, else the
-                                # graph's label.
-                                getattr(self.llm, "model_name", None)
+                                # the member that actually served the call
+                                # (a FallbackChain records it), else the
+                                # client's resolved model, else the graph's
+                                # label (Codex PR-55 r3 — summary tokens used
+                                # to be priced as the primary provider even
+                                # when a fallback served them).
+                                getattr(self.llm, "served_model_name", None)
+                                or getattr(self.llm, "model_name", None)
                                 or self.model_name,
                                 cached_tokens=s_cached,
-                                provider=getattr(self.llm, "provider_name", None),
+                                provider=getattr(self.llm, "served_provider_name", None)
+                                or getattr(self.llm, "provider_name", None),
                                 session_id=self.session_id,
                             )
                         self._cost_totals["cost_usd"] += summary_cost
@@ -618,6 +645,7 @@ class NativeAgentGraph:
         system = "\n\n".join(part for part in (sys_prompt, system) if part) or sys_prompt
 
         provider_name = getattr(self.llm, "provider_name", None)
+        configured_provider = provider_name
         # Prompt-cache wiring (issue #36): the growing history is the
         # cacheable prefix (single ephemeral breakpoint on the last stable
         # message, applied by the client), routed per-session so
@@ -648,6 +676,11 @@ class NativeAgentGraph:
             prompt_cache_key=self.session_id or None,
             context_note=context_note,
         )
+        # A FallbackChain records which member actually served the call;
+        # a bare client has no such attribute and the pre-call value stays.
+        served_provider = getattr(self.llm, "served_provider_name", None)
+        if served_provider:
+            provider_name = served_provider
         usage = response.usage
         input_tokens = (usage.prompt_tokens or 0) if usage else 0
         output_tokens = (usage.completion_tokens or 0) if usage else 0
@@ -681,6 +714,17 @@ class NativeAgentGraph:
             and served_model != configured_model
             and not CostTracker.has_pricing(served_model)
             and CostTracker.has_pricing(configured_model)
+            # The configured-name fallback pricing rule exists for versioned
+            # echoes of the SAME provider's model (claude-opus-4-7-20260901
+            # vs claude-opus-4-7). When a FallbackChain served the call the
+            # configured name belongs to a DIFFERENT provider's model —
+            # billing it at the primary's rates would silently misstate
+            # spend on exactly the failover scenario the chain enables.
+            # served_by_primary (not provider-name comparison — two
+            # openai_compat members share the same label) is the failover
+            # signal; bare clients have no such attribute and default True.
+            and getattr(self.llm, "served_by_primary", True)
+            and served_provider in (None, configured_provider)
         ):
             pricing_model = configured_model
         ai_message = AIMessage(

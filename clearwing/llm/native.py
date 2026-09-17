@@ -704,6 +704,28 @@ class AsyncLLMClient:
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
         self._spend_ledger: SpendLedger | None = None
         self._spend_stage = "llm"
+        # Optional retry-visibility hook (issue #17): invoked whenever a
+        # retry is scheduled so UI layers can surface the wait as it
+        # happens instead of only in the final error's attempts count.
+        # Must never raise into the call path — see _emit_retry_notice.
+        self.on_retry_notice: Callable[[str], None] | None = None
+
+    def set_retry_notice(self, callback: Callable[[str], None] | None) -> None:
+        """Route retry notices to *callback* (used by FallbackChain/runtime)."""
+        self.on_retry_notice = callback
+
+    def _emit_retry_notice(
+        self, reason: str, attempt: int, retry_limit: int, delay: float
+    ) -> None:
+        if self.on_retry_notice is None:
+            return
+        try:
+            self.on_retry_notice(
+                f"llm {reason}: retrying {self.provider_name}/{self.model_name} "
+                f"(retry {attempt}/{retry_limit}) in {delay:.0f}s"
+            )
+        except Exception:
+            logger.debug("retry-notice callback failed", exc_info=True)
 
     def with_spend_ledger(self, ledger: SpendLedger, *, stage: str) -> AsyncLLMClient:
         """Return a run-bound view that shares this client's transport limits.
@@ -1931,13 +1953,19 @@ class AsyncLLMClient:
                     raise
                 is_rate_limit = self._is_rate_limit_error(exc)
                 is_transport = self._is_transient_transport_error(exc)
+                # 5xx joins the retryable classes as billable-ambiguous
+                # (issue #17): the provider may have partially generated
+                # before the server-side failure, so it shares the
+                # conservative timeout cap rather than the rate-limit one.
+                is_server_error = self._is_server_error(exc)
+                is_billable_ambiguous = is_server_error or self._is_timeout_error(exc)
                 retry_limit = (
                     min(self.rate_limit_max_retries, self.timeout_max_retries)
-                    if self._is_timeout_error(exc)
+                    if is_billable_ambiguous
                     else self.rate_limit_max_retries
                 )
                 if (
-                    not is_rate_limit and not is_transport
+                    not is_rate_limit and not is_transport and not is_server_error
                 ) or attempt >= retry_limit:
                     if attempt > 0:
                         try:
@@ -1945,19 +1973,18 @@ class AsyncLLMClient:
                         except Exception:
                             pass
                     raise
-                if (
-                    self._is_timeout_error(exc)
-                    and self._spend_ledger is not None
-                    and self._spend_ledger.enforcing
+                if is_billable_ambiguous and (
+                    self._spend_ledger is not None and self._spend_ledger.enforcing
                 ):
-                    # Billable-ambiguous failures — read timeouts and
-                    # close-after-accept disconnects alike — under an
-                    # actively enforcing spend ledger: each resend now books
-                    # its own reservation (so retries are accounted), but
-                    # an ambiguous attempt consumes its full reservation,
-                    # which under a tight limit starves the retry anyway.
-                    # Keep refusing rather than risk unaccounted billable
-                    # generations (Codex PR-40 r3, symmetric rule) until
+                    # Billable-ambiguous failures — read timeouts,
+                    # close-after-accept disconnects, and 5xx statuses alike
+                    # — under an actively enforcing spend ledger: each resend
+                    # now books its own reservation (so retries are
+                    # accounted), but an ambiguous attempt consumes its full
+                    # reservation, which under a tight limit starves the
+                    # retry anyway. Keep refusing rather than risk
+                    # unaccounted billable generations (Codex PR-40 r3,
+                    # symmetric rule; 5xx added by issue #17) until
                     # per-attempt accounting has live evidence.
                     # Non-enforcing callers (the webui default) keep the
                     # retry — chaos-P1 showed a single such disconnect
@@ -1971,12 +1998,20 @@ class AsyncLLMClient:
 
                 delay = self._retry_delay_seconds(exc, attempt)
                 attempt += 1
+                reason = (
+                    "rate-limited"
+                    if is_rate_limit
+                    else "server error (5xx)"
+                    if is_server_error
+                    else "transport error"
+                )
+                self._emit_retry_notice(reason, attempt, retry_limit, delay)
                 logger.warning(
                     "LLM call failed for model=%s provider=%s (%s); retrying in "
                     "%.2fs (attempt %d/%d): %s",
                     self.model_name,
                     self.provider_name,
-                    "rate-limited" if is_rate_limit else "transport error",
+                    reason,
                     delay,
                     attempt,
                     retry_limit,
@@ -2085,12 +2120,67 @@ class AsyncLLMClient:
             or "ratelimit" in text
         )
 
-    # Transport failures where the request never completed a round-trip, so the
-    # provider never generated (and never billed) — safe to retry. These come
-    # from genai-pyo3's reqwest layer ("Web call failed ... Cause: Reqwest
-    # error: error sending request ...") or a stalled/aborted stream. We match
-    # on connection-establishment / send-side phrases only; we deliberately do
-    # NOT retry generic 5xx here (those may have partially generated).
+    # HTTP 5xx statuses: server-side failures that are usually transient.
+    # Billable-ambiguous — the provider may have partially generated before
+    # failing — so retries share the conservative timeout cap, not the full
+    # rate-limit budget (issue #17).
+    _SERVER_ERROR_PHRASES = (
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway time-out",
+        # Anthropic's 529/503 overload wording — opencode's retryable list
+        # carries "overloaded" for the same reason: it arrives without a
+        # numeric status in several SDK shapes.
+        "overloaded",
+        "overloaded_error",
+    )
+    # Status-ANCHORED 5xx marker: "status code 502", "HTTP 500",
+    # "error: 503", "Error code: 529", and genai-pyo3's quoted form
+    # "Request failed with status code '502'". The anchor prefix is what
+    # keeps a bare number inside a response body ("...see ticket 502...")
+    # from classifying as a server error — matching the status, not the
+    # digits, is the whole point (opencode's retry matcher does the same).
+    _SERVER_STATUS_ANCHOR = re.compile(
+        r"(?:status(?:\s*code)?|http|error(?:\s*code)?)\s*[:=]?\s*['\"]?5\d{2}\b",
+        re.IGNORECASE,
+    )
+
+    def _is_server_error(self, exc: Exception) -> bool:
+        """True for HTTP 5xx failures — structured attributes first, then
+        status-anchored text markers on the exception chain."""
+        cur: BaseException | None = exc
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            # Only unambiguous HTTP-status attributes — a bare `code`
+            # attribute also exists on application-level errors (gRPC
+            # codes, library internals) whose 500-599 values are not HTTP.
+            for attr in ("status", "status_code", "http_status"):
+                value = getattr(cur, attr, None)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int) and 500 <= value <= 599:
+                    return True
+                if (
+                    isinstance(value, str)
+                    and value.isdigit()
+                    and 500 <= int(value) <= 599
+                ):
+                    return True
+            cur = cur.__cause__ or cur.__context__
+        text = _exception_chain_text(exc)
+        if self._SERVER_STATUS_ANCHOR.search(text):
+            return True
+        return any(phrase in text for phrase in self._SERVER_ERROR_PHRASES)
+
+# Transport failures where the request never completed a round-trip, so the
+# provider never generated (and never billed) — safe to retry. These come
+# from genai-pyo3's reqwest layer ("Web call failed ... Cause: Reqwest
+# error: error sending request ...") or a stalled/aborted stream. We match
+# on connection-establishment / send-side phrases only; 5xx statuses are
+# deliberately NOT here — they get their own billable-ambiguous classifier
+# (`_is_server_error`, issue #17) with the conservative timeout cap.
     _TRANSPORT_ERROR_MARKERS = (
         "error sending request",
         "connection refused",

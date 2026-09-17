@@ -37,29 +37,35 @@ async def drive_with_auto_decline(
     """
     first = True
     declines = 0
-    while True:
-        payload = initial_state if first else Command(resume=False)
-        first = False
-        async for _event in graph.astream(payload, config, stream_mode="values"):
+    # session_scope: cost attribution and kali container scoping
+    # (current_session_id) must see this run's session id, not fall back
+    # to the shared adhoc scope (parallel CI runs would share a container).
+    from clearwing.agent.tooling import session_scope
+
+    with session_scope(getattr(graph, "session_id", None)):
+        while True:
+            payload = initial_state if first else Command(resume=False)
+            first = False
+            async for _event in graph.astream(payload, config, stream_mode="values"):
+                if limits_exceeded():
+                    return
             if limits_exceeded():
                 return
-        if limits_exceeded():
-            return
-        snapshot = graph.get_state(config)
-        if not getattr(snapshot, "next", ()):
-            return
-        declines += 1
-        if declines > max_declines:
-            logger.warning(
-                "CI/CD run abandoned after %d auto-declined approval gates",
+            snapshot = graph.get_state(config)
+            if not getattr(snapshot, "next", ()):
+                return
+            declines += 1
+            if declines > max_declines:
+                logger.warning(
+                    "CI/CD run abandoned after %d auto-declined approval gates",
+                    max_declines,
+                )
+                return
+            logger.info(
+                "CI/CD run auto-declined a pending approval gate (%d/%d)",
+                declines,
                 max_declines,
             )
-            return
-        logger.info(
-            "CI/CD run auto-declined a pending approval gate (%d/%d)",
-            declines,
-            max_declines,
-        )
 
 
 @dataclass
@@ -279,6 +285,11 @@ class CICDRunner:
         findings: list[dict[str, Any]] = []
 
         for vuln in vulnerabilities:
+            # Issue #15: keyword-candidate entries are unverified NVD
+            # description-text hits — promoting them to actionable findings
+            # failed CI on unrelated high-CVSS noise (Codex PR-55 P1).
+            if vuln.get("match_quality") == "keyword-candidate":
+                continue
             finding: dict[str, Any] = {
                 "description": vuln.get("description", vuln.get("cve", "Unknown vulnerability")),
                 "severity": vuln.get("severity", self._cvss_to_severity(vuln.get("cvss", 0.0))),

@@ -88,6 +88,48 @@ clearwing config --show-provider
 which prints the effective model, base URL, API key status, and
 source (`cli` / `env` / `config` / `default`).
 
+## Provider fallback chain (runtime failover)
+
+A hard primary-endpoint failure — retries exhausted after a persistent
+5xx, a rejected credential, a dead upstream — used to kill the whole
+session (issue #17). Configuring `fallbacks:` under `provider:` gives
+chat sessions an ordered chain: each fallback is tried, in order, after
+the previous member's own retries are exhausted.
+
+```yaml
+provider:
+  base_url: https://primary.example.com/v1
+  model: glm-5.3
+  api_key: ${PRIMARY_KEY}
+  fallbacks:
+    - base_url: https://backup.example.com/v1
+      model: gpt-5.4-mini
+      api_key: ${BACKUP_KEY}
+    - base_url: http://localhost:11434/v1   # final safety net: local Ollama
+      model: qwen2.5-coder:32b
+```
+
+Rules:
+
+- Each `fallbacks` entry is a **complete endpoint** (its own
+  `base_url` / `model` / `api_key` / `adapter`); nothing merges from the
+  primary block, and an entry's `api_key` is only ever sent to the
+  `base_url` named in the same entry.
+- The chain applies to env/config-tier deployments. A session started
+  with explicit per-request credentials (webui start frame
+  `base_url`/`api_key`, or CLI flags) pins itself to that endpoint and
+  never re-routes.
+- Retries and provider switches are visible in the WebUI as
+  `type: "system"` bus messages (`llm server error (5xx): retrying …`,
+  `… falling back to …`).
+- Cost attribution follows the model that actually served each call
+  (the serving provider's response echoes its own model name).
+- An enforcing spend budget (sourcehunt runs) disables the chain — a
+  cross-provider dispatch could bill reservations the ledger cannot
+  account for. (Binding any spend ledger collapses the chain to the
+  primary client for the same reason.)
+
+
 ## Anthropic direct (default)
 
 No setup beyond the API key. This is what Clearwing used before

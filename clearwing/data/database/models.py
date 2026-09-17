@@ -116,9 +116,19 @@ class Database:
 
                 port_id = cursor.lastrowid
 
-                # Insert vulnerabilities for this port
+                # Insert vulnerabilities for this port. A deduplicated CVE
+                # carries every affected port in `ports` (issue #15) while
+                # the compatibility `port` field holds only the one that
+                # produced the strongest evidence — matching solely on
+                # `port` dropped the other service associations from
+                # persistent history (Codex PR-55 r2). Keyword candidates
+                # are unverified leads, never persisted as history
+                # (Codex PR-55 r3).
                 port_vulns = [
-                    v for v in scan_result.vulnerabilities if v.get("port") == port["port"]
+                    v
+                    for v in scan_result.vulnerabilities
+                    if v.get("match_quality") != "keyword-candidate"
+                    and port["port"] in (v.get("ports") or [v.get("port")])
                 ]
                 for vuln in port_vulns:
                     cursor.execute(
@@ -131,10 +141,19 @@ class Database:
 
                     vuln_id = cursor.lastrowid
 
-                    # Insert exploits for this vulnerability
+                    # Insert exploits for this vulnerability. Exploitation
+                    # is attempted ONCE per CVE, against the compatibility
+                    # `port` (the strongest-evidence port) — attaching that
+                    # single result to every affected port's row would
+                    # claim exploitation on ports that were never tested
+                    # (Codex PR-55 r3).
                     vuln_exploits = [
-                        e for e in scan_result.exploits if e.get("cve") == vuln.get("cve")
+                        e
+                        for e in scan_result.exploits
+                        if e.get("cve") == vuln.get("cve")
                     ]
+                    if port["port"] != vuln.get("port"):
+                        vuln_exploits = []
                     for exploit in vuln_exploits:
                         cursor.execute(
                             """

@@ -416,9 +416,15 @@ class OperatorAgent:
                     CostTracker().record_llm_call(
                         usage_in,
                         usage_out,
-                        getattr(operator_llm, "model_name", "unknown"),
+                        # Price/attribute the member that actually served the
+                        # call: a FallbackChain records it (Codex PR-55 r4) —
+                        # otherwise failover spend was booked at the primary's
+                        # rate and the job's limit check used a wrong model.
+                        getattr(operator_llm, "served_model_name", None)
+                        or getattr(operator_llm, "model_name", "unknown"),
                         cached_tokens=usage_cached if isinstance(usage_cached, int) else 0,
-                        provider=getattr(operator_llm, "provider_name", None),
+                        provider=getattr(operator_llm, "served_provider_name", None)
+                        or getattr(operator_llm, "provider_name", None),
                         session_id=self._session_id,
                     )
             return response_text(response).strip()
@@ -444,7 +450,15 @@ class OperatorAgent:
             target=self.config.target,
             status=status,
             turns=self._turns,
-            findings=sv.get("vulnerabilities", [])
+            # Issue #15: keyword-candidate entries are unverified NVD
+            # description-text hits — presenting them as confirmed operator
+            # findings (count + descriptions in the `operate` CLI) inflates
+            # the report exactly like the CI path did (Codex PR-55 r5).
+            findings=[
+                v
+                for v in sv.get("vulnerabilities", [])
+                if v.get("match_quality") != "keyword-candidate"
+            ]
             + [
                 {
                     "description": f"Exploitable: {e.get('vulnerability', '?')}",

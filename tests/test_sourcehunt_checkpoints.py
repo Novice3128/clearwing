@@ -759,6 +759,26 @@ def test_stop_after_verify_returns_accumulated_verification_result(tmp_path: Pat
     monkeypatch.setattr(runner, "_hunt", fake_hunt)
     monkeypatch.setattr(runner, "_verify", fake_verify)
 
+    # The variant loop runs AFTER _verify and talks to the REAL verifier
+    # LLM (real ~/.clearwing config): a lucky pattern generation pass
+    # matches sample.c and appends a nondeterministic `variant-*` finding
+    # — the documented order/environment flakiness of this test. Stub the
+    # loop with the full result shape so runner.py's post-arun reads
+    # (patterns_generated / matches_found) don't fall into the degraded
+    # except path.
+    class _NoVariantLoop:
+        def __init__(self, pattern_gen=None):
+            pass
+
+        async def arun(self, **kwargs):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                seeds=[], patterns_generated=0, matches_found=0, iterations=0
+            )
+
+    monkeypatch.setattr("clearwing.sourcehunt.runner.VariantLoop", _NoVariantLoop)
+
     result = runner.run()
 
     assert [finding.id for finding in result.findings] == ["hunt-1"]

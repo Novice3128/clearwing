@@ -8,6 +8,23 @@ from jinja2 import Environment, FileSystemLoader
 from .safety import markdown_inline, markdown_table_cell, redact_text, redact_tree
 
 
+def _scope_label(vuln: dict) -> str:
+    """Render every affected endpoint of a deduplicated CVE (issue #15).
+
+    The scanner collapses one CVE across ports into a single entry whose
+    `ports`/`services` lists carry the full scope; rendering only the
+    compatibility `service` field hid every additional affected endpoint
+    (Codex PR-55 r3).
+    """
+    services = vuln.get("services") or ([vuln.get("service")] if vuln.get("service") else [])
+    ports = vuln.get("ports") or ([vuln.get("port")] if vuln.get("port") else [])
+    ports_text = ", ".join(str(p) for p in ports if p is not None)
+    services_text = ", ".join(str(s) for s in services if s)
+    if services_text and ports_text:
+        return f"{services_text} (ports {ports_text})"
+    return services_text or ports_text or "N/A"
+
+
 class ReportGenerator:
     """Report generation module supporting multiple formats."""
 
@@ -114,12 +131,7 @@ class ReportGenerator:
         lines.append("VULNERABILITIES")
         lines.append("-" * 70)
         if scan_result.vulnerabilities:
-            for vuln in scan_result.vulnerabilities:
-                lines.append(f"  [{vuln.get('cve', 'N/A')}] {vuln.get('description', 'N/A')}")
-                lines.append(
-                    f"    Service: {vuln.get('service', 'N/A')} (Port {vuln.get('port', 'N/A')})"
-                )
-                lines.append(f"    CVSS Score: {vuln.get('cvss', 'N/A')}")
+            self._render_vulnerability_lines(lines, scan_result.vulnerabilities)
         else:
             lines.append("  No vulnerabilities found")
         lines.append("")
@@ -151,6 +163,66 @@ class ReportGenerator:
         lines.append("=" * 70)
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _partition_vulnerabilities(vulnerabilities: list) -> tuple[list, list]:
+        """Split findings from unverified keyword candidates (issue #15).
+
+        Candidates are NVD keyword hits without product identity: they are
+        listed separately and never counted or rendered as findings.
+        Entries without a match_quality label predate the field and count
+        as findings.
+        """
+        candidates = [
+            v for v in vulnerabilities if v.get("match_quality") == "keyword-candidate"
+        ]
+        findings = [
+            v for v in vulnerabilities if v.get("match_quality") != "keyword-candidate"
+        ]
+        return findings, candidates
+
+    @staticmethod
+    def _render_vulnerability_lines(lines: list, vulnerabilities: list) -> None:
+        """Render the VULNERABILITIES section body (issue #15 semantics).
+
+        Keyword hits without product identity are candidates, not findings
+        — headline counts must not include them. Entries without a
+        match_quality label predate the field and count as findings.
+        NVD/target-controlled strings are flattened to one line so a
+        hostile description cannot forge report lines (fake findings,
+        fake counts, END OF REPORT).
+        """
+
+        def _flat(value) -> str:
+            return " ".join(str(value or "N/A").split())
+
+        findings, candidates = ReportGenerator._partition_vulnerabilities(
+            vulnerabilities
+        )
+        suffix = f" (plus {len(candidates)} unverified keyword candidates)" if candidates else ""
+        lines.append(f"  Findings: {len(findings)}{suffix}")
+        for vuln in findings:
+            lines.append(f"  [{_flat(vuln.get('cve'))}] {_flat(vuln.get('description'))}")
+            ports = vuln.get("ports") or [vuln.get("port", "N/A")]
+            lines.append(
+                f"    Service: {_flat(vuln.get('service'))} "
+                f"(Port(s) {', '.join(str(p) for p in ports)})"
+            )
+            lines.append(f"    CVSS Score: {vuln.get('cvss', 'N/A')}")
+            quality = vuln.get("match_quality")
+            if quality:
+                label = f"    Match: {quality}"
+                if vuln.get("product"):
+                    label += f" ({_flat(vuln.get('product'))}"
+                    if vuln.get("version"):
+                        label += f" {_flat(vuln.get('version'))}"
+                    label += ")"
+                lines.append(label)
+        if candidates:
+            lines.append("")
+            lines.append("  Unverified keyword candidates (NOT confirmed findings):")
+            for vuln in candidates:
+                lines.append(f"  [{_flat(vuln.get('cve'))}] {_flat(vuln.get('description'))[:100]}")
 
     def _generate_json(self, scan_result: Any) -> str:
         """Generate JSON report."""
@@ -217,19 +289,42 @@ class ReportGenerator:
     <table>
         <tr><th>CVE</th><th>Description</th><th>Service</th><th>CVSS</th></tr>
 """
-        for vuln in scan_result.vulnerabilities:
+        # Issue #15: keyword candidates are NOT confirmed findings — every
+        # human-readable format must keep them out of the findings table,
+        # or an unverified hit is presented as a CVE (Codex PR-55 r2).
+        findings, candidates = self._partition_vulnerabilities(
+            scan_result.vulnerabilities
+        )
+        for vuln in findings:
             html += (
                 "        <tr>"
                 f"<td>{html_escape(str(vuln.get('cve', 'N/A')))}</td>"
                 f"<td>{html_escape(str(vuln.get('description', 'N/A')))}</td>"
-                f"<td>{html_escape(str(vuln.get('service', 'N/A')))}</td>"
+                f"<td>{html_escape(_scope_label(vuln))}</td>"
                 f"<td>{html_escape(str(vuln.get('cvss', 'N/A')))}</td>"
                 "</tr>\n"
             )
 
         html += """
     </table>
-    
+"""
+        if candidates:
+            html += """
+    <h2>Unverified keyword candidates (NOT confirmed findings)</h2>
+    <table>
+        <tr><th>CVE</th><th>Description</th></tr>
+"""
+            for vuln in candidates:
+                html += (
+                    "        <tr>"
+                    f"<td>{html_escape(str(vuln.get('cve', 'N/A')))}</td>"
+                    f"<td>{html_escape(str(vuln.get('description', 'N/A')))}</td>"
+                    "</tr>\n"
+                )
+            html += """
+    </table>
+"""
+        html += """
     <h2>Exploits</h2>
     <table>
         <tr><th>Exploit</th><th>CVE</th><th>Status</th><th>Message</th></tr>
@@ -277,13 +372,28 @@ class ReportGenerator:
         md += "| CVE | Description | Service | CVSS |\n"
         md += "|-----|-------------|---------|------|\n"
 
-        for vuln in scan_result.vulnerabilities:
+        findings, candidates = self._partition_vulnerabilities(
+            scan_result.vulnerabilities
+        )
+        for vuln in findings:
             md += (
                 f"| {markdown_table_cell(vuln.get('cve', 'N/A'))} "
                 f"| {markdown_table_cell(vuln.get('description', 'N/A'))} "
-                f"| {markdown_table_cell(vuln.get('service', 'N/A'))} "
+                f"| {markdown_table_cell(_scope_label(vuln))} "
                 f"| {markdown_table_cell(vuln.get('cvss', 'N/A'))} |\n"
             )
+
+        if candidates:
+            # Issue #15: unverified keyword hits stay OUT of the findings
+            # table in every format (Codex PR-55 r2).
+            md += "\n## Unverified keyword candidates (NOT confirmed findings)\n\n"
+            md += "| CVE | Description |\n"
+            md += "|-----|-------------|\n"
+            for vuln in candidates:
+                md += (
+                    f"| {markdown_table_cell(vuln.get('cve', 'N/A'))} "
+                    f"| {markdown_table_cell(vuln.get('description', 'N/A'))} |\n"
+                )
 
         md += "\n## Exploits\n\n"
         md += "| Exploit | CVE | Success | Message |\n"

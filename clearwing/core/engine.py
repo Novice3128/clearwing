@@ -160,6 +160,11 @@ class CoreEngine:
         )
 
         for vuln in self.scan_result.vulnerabilities:
+            # Issue #15: never send exploit traffic at unverified keyword
+            # hits — only version-verified findings and service heuristics
+            # are actionable (Codex PR-55 P1).
+            if vuln.get("match_quality") == "keyword-candidate":
+                continue
             exploit_result = await rce_exploiter.exploit(target, vuln)
             if exploit_result["success"]:
                 self.scan_result.exploits.append(exploit_result)
