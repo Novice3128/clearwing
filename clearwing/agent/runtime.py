@@ -730,6 +730,12 @@ class NativeAgentGraph:
                 )
 
         if self.event_bus:
+            # A 200-char PREVIEW tag: the webui dedups its turn-end inline
+            # agent_message against this echo by BYTE-EQUALITY (see
+            # _note_delivered_frame in ui/web/app.py). Never change this to
+            # full text without revisiting that gate, and never switch the
+            # gate to prefix matching — a full-text echo would then swallow
+            # the authoritative full-text send.
             self.event_bus.emit_message(assistant_text[:200], "agent")
 
         if assistant_text:

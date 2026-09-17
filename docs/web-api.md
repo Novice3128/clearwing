@@ -183,8 +183,10 @@ Payload:
 }
 ```
 
-Note: the inline non-bus `agent_message` frame produced by the
-LangGraph streaming loop has a different payload — see
+Note: `type: "agent"` marks the runtime's per-step assistant echo — a
+**200-character preview** of each assistant message (issue #53). The
+inline non-bus `agent_message` frame produced by the LangGraph streaming
+loop has a different payload — see
 [Inline server frames](#inline-server-frames).
 
 ### `tool_start`
@@ -573,6 +575,13 @@ the client as `tool_start` / `tool_result` bus frames.
 }
 ```
 
+This frame is the authoritative full-text delivery, but it is **not
+guaranteed to be sent**: when the bus echo of the same text (the
+200-char `"agent"` preview above) was already delivered verbatim during
+the turn — which is the norm for short texts at approval pauses — the
+server skips the redundant inline frame (issue #53). Clients must not
+rely on receiving it.
+
 ### `error` (inline)
 
 Produced when the `message` or `approve` handler catches an
@@ -628,8 +637,11 @@ or `stop`) before the session is usable again.
 existed treat its absence as `"ok"`.
 
 `produced_new` (boolean, present on `message` / `approve` turns) reports
-whether the turn surfaced new assistant text (a fresh `agent_message`
-frame was sent for it). `false` means no new assistant content arrived
+whether the turn surfaced new assistant text. It does NOT imply a fresh
+`agent_message` frame followed: when the bus echo of that text was
+already delivered verbatim, the redundant inline frame is skipped
+(issue #53) while `produced_new` stays `true`. `false` means no new
+assistant content arrived
 and no previous turn's text was replayed — for example a stale
 `approve` with nothing pending, a resume that only appended tool
 output, or an unreadable graph state (the server then replays nothing

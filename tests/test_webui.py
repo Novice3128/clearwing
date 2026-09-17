@@ -1643,7 +1643,10 @@ class _EchoingPauseGraph(_FakeGraph):
         EventBus().emit(
             EventType.MESSAGE, {"content": self.text[:200], "type": "agent"}
         )
-        await asyncio.sleep(self.delay)  # let the pump deliver the echo first
+        # delay=0 reproduces the normally-ending-turn shape: the emit has
+        # no await boundary before the turn's dedup gate (mirror order).
+        if self.delay:
+            await asyncio.sleep(self.delay)
         self.pending = self.pause_after
         for ev in self.events:
             yield ev
@@ -1653,9 +1656,10 @@ class _EchoingResumeGraph(_EchoingPauseGraph):
     """Approve-turn variant: the resume (ainvoke) echoes its new reply on
     the bus and sleeps, so the echo is delivered before the turn ends."""
 
-    def __init__(self, first, resumed):
+    def __init__(self, first, resumed, resume_delay=0.25):
         super().__init__(first)
         self.resumed = resumed
+        self.resume_delay = resume_delay
 
     async def ainvoke(self, input_data, config):
         import asyncio
@@ -1666,7 +1670,8 @@ class _EchoingResumeGraph(_EchoingPauseGraph):
         EventBus().emit(
             EventType.MESSAGE, {"content": self.resumed[:200], "type": "agent"}
         )
-        await asyncio.sleep(0.25)
+        if self.resume_delay:
+            await asyncio.sleep(self.resume_delay)
         self.pending = False  # the resume parks nowhere: the turn ends "ok"
         return GraphStateSnapshot(values={"messages": [_FakeAI(self.resumed)]})
 
@@ -1734,7 +1739,52 @@ class TestDuplicateAgentFrameDedup:
                         break
 
         report = client.get(report_url, headers=AUTH).text
-        assert text in report  # transcript keeps what the WS frame skipped
+        # Exactly once: the report neither thins (frame skip must not drop
+        # the text) nor double-records it.
+        assert report.count(text) == 1
+
+    def test_normal_turn_mirror_order_no_duplicate(self, client):
+        # Issue #53 review P1: on a normally-ending turn the final echo is
+        # emitted with no await boundary before the dedup gate — the inline
+        # frame went out first and the echo followed via the tail drain,
+        # duplicating short texts verbatim. The pre-gate flush fixes both
+        # orderings.
+        text = "任務完成,已產出報告"  # short: echo == full text
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _EchoingPauseGraph(text, pause_after=False, delay=0),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                frames, complete = self._collect(ws)
+
+        contents = [f["data"]["content"] for f in frames]
+        assert contents.count(text) == 1
+        assert complete["data"]["status"] == "ok"
+
+    def test_approve_resume_mirror_order_no_duplicate(self, client):
+        import json
+
+        resumed = "審批通過,繼續執行"
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _EchoingResumeGraph(
+                "我將執行需要審批的掃描指令", resumed, resume_delay=0
+            ),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                while True:
+                    if json.loads(ws.receive_text())["type"] == "complete":
+                        break
+                ws.send_json({"type": "approve", "approved": True})
+                frames, complete = self._collect(ws)
+
+        contents = [f["data"]["content"] for f in frames]
+        assert contents.count(resumed) == 1
+        assert complete["data"]["status"] == "ok"
 
     def test_no_echo_turn_still_sends_inline(self, client):
         with patch(

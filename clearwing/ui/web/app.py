@@ -750,12 +750,17 @@ def create_app():
             # must not suppress the authoritative full-text send.
             # Assistant echoes carry type:"agent" (runtime emit_message);
             # warning/system notes map to the same frame type but are not
-            # assistant text and must not participate in the dedup.
+            # assistant text and must not participate in the dedup. The
+            # runtime also echoes EMPTY assistant steps; an empty echo must
+            # not overwrite the last real one (fail-open, review P3).
             if msg.get("type") != "agent_message":
                 return
-            data = msg.get("data") or {}
-            if data.get("type") == "agent":
-                turn_state["last_bus_agent_text"] = data.get("content")
+            data = msg.get("data")
+            if not isinstance(data, dict):
+                return
+            content = data.get("content")
+            if data.get("type") == "agent" and content:
+                turn_state["last_bus_agent_text"] = content
 
         async def _pump_events() -> None:
             # Forward queued bus events while the agent loop is running —
@@ -893,6 +898,17 @@ def create_app():
                                     last_content = c
                 finally:
                     _cancel_heartbeat(heartbeat)
+                # Issue #53, mirror order: on a normally-ending turn the
+                # final step's bus echo is emitted with NO await boundary
+                # before this point, so the dedup gate cannot have seen it
+                # (the inline frame would go out first and the echo would
+                # follow via the tail drain — a verbatim duplicate for
+                # texts ≤200 chars). Yield one loop turn so the scheduled
+                # enqueue lands, flush the queue, THEN decide. On pause
+                # turns the pump has already delivered the echo and this
+                # is a no-op.
+                await asyncio.sleep(0)
+                await _drain_events()
                 # Stream events are produced by this turn, so non-empty
                 # last_content is by construction fresh (issue #33:
                 # produced_new reports it instead of a message count).
@@ -970,6 +986,12 @@ def create_app():
                 if not await _safe_send(_error_payload(e)):
                     return
             else:
+                # Issue #53, mirror order (see _run_message_turn): the
+                # resumed step's echo may still be sitting in the
+                # call_soon_threadsafe queue with no await boundary since
+                # the emit — flush before the dedup gate decides.
+                await asyncio.sleep(0)
+                await _drain_events()
                 after = _ai_text_stats(getattr(snapshot, "values", None))
                 produced_new = before is not None and after != before
                 if produced_new:
