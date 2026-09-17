@@ -428,3 +428,75 @@ class TestServedByPrimaryFlag:
         # Same adapter label on both members — provider_name alone would
         # have been ambiguous.
         assert chain.served_provider_name == chain.primary.provider_name
+class TestChainContextBudgetAndDeltaPolicy:
+    """Codex PR-55 r4: the chain exposes the SMALLEST context budget, and a
+    mid-stream failover never interleaves a second answer into abandoned
+    partial output."""
+
+    def test_context_budget_is_the_minimum_across_members(self):
+        primary = _FakeClient("primary")
+        primary.context_budget_tokens = 200_000
+        backup = _FakeClient("backup")
+        backup.context_budget_tokens = 32_000
+        chain = FallbackChain(primary, [backup])
+        assert chain.context_budget_tokens == 32_000
+
+        # Members without a budget are ignored; none at all → None.
+        backup.context_budget_tokens = None
+        assert chain.context_budget_tokens == 200_000
+        primary.context_budget_tokens = None
+        assert chain.context_budget_tokens is None
+
+    def test_mid_stream_failover_suppresses_later_deltas(self):
+        emitted: list[str] = []
+
+        class _PartialThenFail:
+            model_name = "primary"
+            provider_name = "openai"
+
+            async def achat_stream(self, **kwargs):
+                callback = kwargs.get("on_text_delta")
+                if callback is not None:
+                    callback("partial primary text")
+                raise RuntimeError("stream died")
+
+        class _Backup:
+            model_name = "backup"
+            provider_name = "openai"
+
+            async def achat_stream(self, **kwargs):
+                callback = kwargs.get("on_text_delta")
+                if callback is not None:
+                    callback("fallback text")
+                return "fallback answer"
+
+        chain = FallbackChain(_PartialThenFail(), [_Backup()])
+        notices: list[str] = []
+        chain.set_retry_notice(notices.append)
+
+        result = asyncio.run(chain.achat_stream(messages=[], on_text_delta=emitted.append))
+
+        assert result == "fallback answer"
+        # Only the primary's partial text reached the consumer; the
+        # fallback's live deltas were suppressed (its text arrives via the
+        # returned response) and the notice says so.
+        assert emitted == ["partial primary text"]
+        assert any("abandoned" in n for n in notices)
+
+    def test_healthy_primary_streams_live(self):
+        emitted: list[str] = []
+
+        class _Streamer:
+            model_name = "primary"
+            provider_name = "openai"
+
+            async def achat_stream(self, **kwargs):
+                callback = kwargs.get("on_text_delta")
+                for chunk in ("a", "b", "c"):
+                    if callback is not None:
+                        callback(chunk)
+                return "abc"
+
+        chain = FallbackChain(_Streamer(), [])
+        asyncio.run(chain.achat_stream(messages=[], on_text_delta=emitted.append))
+        assert emitted == ["a", "b", "c"]

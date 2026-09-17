@@ -120,10 +120,23 @@ class FallbackChain:
 
     @property
     def context_budget_tokens(self) -> int | None:
-        """The primary's context budget (Codex PR-55 r2): the runtime picks
-        its summarizer threshold from this attribute, so a chain without it
-        silently fell back to the built-in default."""
-        return getattr(self.primary, "context_budget_tokens", None)
+        """The SMALLEST context budget among chain members (Codex PR-55 r4).
+
+        The runtime picks its summarizer threshold from this attribute: a
+        primary with a large window would let history grow past a fallback's
+        smaller one, so the fallback would reject both the summary and the
+        next assistant request as oversized — failover defeating itself
+        exactly in long sessions.
+        """
+        budgets = [
+            budget
+            for budget in (
+                getattr(client, "context_budget_tokens", None)
+                for client in self.clients
+            )
+            if budget
+        ]
+        return min(budgets) if budgets else None
 
     @property
     def pricing(self):
@@ -168,10 +181,36 @@ class FallbackChain:
         return FallbackChain(bound_primary, [])
 
     async def achat_stream(self, **kwargs: Any):
-        """Stream through the primary, then each fallback in order."""
+        """Stream through the primary, then each fallback in order.
+
+        Delta policy on failover (Codex PR-55 r4): deltas cannot be
+        retracted once a live consumer printed them, and buffering every
+        stream would destroy incremental display for the common (healthy)
+        case. So the first member streams live; if it dies mid-stream, the
+        user gets an explicit restart notice and later members' deltas are
+        SUPPRESSED — their text still arrives authoritatively via the
+        returned response (and therefore graph state) instead of being
+        concatenated onto the abandoned partial output.
+        """
         clients = self.clients
         last_exc: Exception | None = None
+        deltas_emitted = False
+        original_callback = kwargs.get("on_text_delta")
+
+        def _counting_callback(text: str) -> None:
+            nonlocal deltas_emitted
+            deltas_emitted = True
+            if original_callback is not None:
+                original_callback(text)
+
+        if original_callback is not None:
+            kwargs["on_text_delta"] = _counting_callback
+
         for index, client in enumerate(clients):
+            if index > 0 and deltas_emitted:
+                # Abandoned partial output already reached the consumer —
+                # never interleave a second answer into it.
+                kwargs["on_text_delta"] = None
             try:
                 response = await client.achat_stream(**kwargs)
                 self._record_served(client)
@@ -182,13 +221,16 @@ class FallbackChain:
                 last_exc = exc
                 if index + 1 >= len(clients):
                     raise
-                self._notify(
+                notice = (
                     f"llm provider {getattr(client, 'provider_name', '?')}/"
                     f"{getattr(client, 'model_name', '?')} failed "
                     f"({type(exc).__name__}); falling back to "
                     f"{getattr(clients[index + 1], 'provider_name', '?')}/"
                     f"{getattr(clients[index + 1], 'model_name', '?')}"
                 )
+                if deltas_emitted:
+                    notice += " — partial output above is abandoned; the full answer follows"
+                self._notify(notice)
                 logger.warning(
                     "LLM provider %s/%s failed (%s); falling back to %s/%s",
                     getattr(client, "provider_name", "?"),

@@ -1409,3 +1409,100 @@ class TestFallbackGateBlankFields:
 
         assert captured["name"] == "clearwing-kali"
         assert result["artifacts_dir"] == str(tmp_path / "kali" / "adhoc" / "artifacts")
+
+
+class TestCodexRound4Findings:
+    """Regressions for the Codex PR-55 fourth-round findings."""
+
+    @pytest.fixture
+    def scanner(self):
+        return VulnerabilityScanner()
+
+    @pytest.mark.asyncio
+    async def test_nvd_pagination_visits_every_page(self, scanner):
+        """P1: an exact-version query can return >20 records (apache 2.4.49
+        returns 81, live-verified) and NVD does not order by relevance —
+        results must be paged, not truncated to the first page."""
+        pages: list[dict] = []
+
+        class _FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return self._payload
+
+        class _FakeGet:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def __aenter__(self):
+                return _FakeResponse(self._payload)
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                from urllib.parse import parse_qs, urlparse
+
+                params = parse_qs(urlparse(url).query)
+                start = int(params.get("startIndex", ["0"])[0])
+                size = int(params.get("resultsPerPage", ["20"])[0])
+                pages.append({"start": start, "size": size})
+                total = 450  # > one page: forces pagination
+
+                def _item(n):
+                    return {
+                        "cve": {
+                            "id": f"CVE-2021-{n}",
+                            "descriptions": [{"value": f"d{n}"}],
+                            "metrics": {},
+                            "configurations": [
+                                {
+                                    "nodes": [
+                                        {
+                                            "cpeMatch": [
+                                                {
+                                                    "criteria": "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+                                                    "vulnerable": True,
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ],
+                        }
+                    }
+
+                batch = [_item(n) for n in range(start, min(start + size, total))]
+                return _FakeGet({"totalResults": total, "vulnerabilities": batch})
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("HTTP", "", "Apache/2.4.49")
+        result = await scanner._query_nvd("HTTP", identity)
+
+        # Every page was fetched with an explicit size, and all 450 records
+        # came back rather than only the first page's worth.
+        assert {p["start"] for p in pages} == {0, 200, 400}
+        assert all(p["size"] == 200 for p in pages)
+        assert len(result) == 450
+
+    def test_mariadb_version_first_greeting(self, scanner):
+        """P1: MariaDB's real greeting is '5.5.5-10.11.6-MariaDB-...' — the
+        leading 5.5.5 is a compatibility prefix; 10.11.6 is the version."""
+        identity = scanner._resolve_identity(
+            "MySQL", "", "5.5.5-10.11.6-MariaDB-0+deb12u1"
+        )
+        assert identity is not None
+        assert identity.product == "mariadb"
+        assert identity.version == "10.11.6"
+        assert identity.cpe_prefix == "cpe:2.3:a:mariadb:mariadb"
+
+        # The name-first form keeps working.
+        identity = scanner._resolve_identity("MySQL", "", "mariadb  Ver 10.11.6")
+        assert identity is not None and identity.version == "10.11.6"
