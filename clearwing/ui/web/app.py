@@ -741,6 +741,27 @@ def create_app():
                 # disconnect. Never let a send failure kill the handler.
                 return False
 
+        def _note_delivered_frame(msg: dict) -> None:
+            # Issue #53: remember the last bus-delivered assistant echo so
+            # a turn's closing inline agent_message can skip re-sending
+            # text the client already received verbatim (approval-pause
+            # turns let the pump win the race against the inline send).
+            # Only frames actually DELIVERED count — a queued-but-lost echo
+            # must not suppress the authoritative full-text send.
+            # Assistant echoes carry type:"agent" (runtime emit_message);
+            # warning/system notes map to the same frame type but are not
+            # assistant text and must not participate in the dedup. The
+            # runtime also echoes EMPTY assistant steps; an empty echo must
+            # not overwrite the last real one (fail-open, review P3).
+            if msg.get("type") != "agent_message":
+                return
+            data = msg.get("data")
+            if not isinstance(data, dict):
+                return
+            content = data.get("content")
+            if data.get("type") == "agent" and content:
+                turn_state["last_bus_agent_text"] = content
+
         async def _pump_events() -> None:
             # Forward queued bus events while the agent loop is running —
             # the receive loop below cannot drain the queue mid-turn, so
@@ -755,6 +776,7 @@ def create_app():
                 # cancelled by the disconnect path).
                 while not await _safe_send(msg):
                     await asyncio.sleep(_PUMP_SEND_RETRY_SECONDS)
+                _note_delivered_frame(msg)
 
         async def _drain_events() -> None:
             while True:
@@ -764,6 +786,7 @@ def create_app():
                     break
                 if not await _safe_send(msg):
                     return
+                _note_delivered_frame(msg)
 
         async def _llm_progress_heartbeat() -> None:
             # Issue #4: a turn against a slow or flaky endpoint used to be a
@@ -850,6 +873,10 @@ def create_app():
             produced_new = False
             try:
                 turn_state["active"] = True
+                # Issue #53: dedup only against echoes delivered within
+                # THIS turn — a previous turn's echo must never suppress
+                # this turn's inline send.
+                turn_state.pop("last_bus_agent_text", None)
                 last_content = ""
                 heartbeat = asyncio.create_task(_llm_progress_heartbeat())
                 try:
@@ -871,6 +898,17 @@ def create_app():
                                     last_content = c
                 finally:
                     _cancel_heartbeat(heartbeat)
+                # Issue #53, mirror order: on a normally-ending turn the
+                # final step's bus echo is emitted with NO await boundary
+                # before this point, so the dedup gate cannot have seen it
+                # (the inline frame would go out first and the echo would
+                # follow via the tail drain — a verbatim duplicate for
+                # texts ≤200 chars). Yield one loop turn so the scheduled
+                # enqueue lands, flush the queue, THEN decide. On pause
+                # turns the pump has already delivered the echo and this
+                # is a no-op.
+                await asyncio.sleep(0)
+                await _drain_events()
                 # Stream events are produced by this turn, so non-empty
                 # last_content is by construction fresh (issue #33:
                 # produced_new reports it instead of a message count).
@@ -878,13 +916,21 @@ def create_app():
                 if produced_new:
                     if transcript_ref:
                         transcript_ref.add_agent(last_content)
-                    if not await _safe_send(
-                        {
-                            "type": "agent_message",
-                            "data": {"content": last_content},
-                        }
-                    ):
-                        return
+                    # Issue #53: approval-pause turns let the pump deliver
+                    # the bus echo of this very text before the turn ends;
+                    # re-sending it inline duplicated short messages
+                    # verbatim. Skip only the redundant FRAME — the
+                    # transcript above still records the text, and a long
+                    # text (echo is a 200-char preview, never the full
+                    # text) still gets its authoritative full send.
+                    if turn_state.get("last_bus_agent_text") != last_content:
+                        if not await _safe_send(
+                            {
+                                "type": "agent_message",
+                                "data": {"content": last_content},
+                            }
+                        ):
+                            return
             except Exception as e:
                 sent_error = True
                 logger.exception("Agent turn failed")
@@ -924,6 +970,9 @@ def create_app():
                 # failures).
                 before = _state_fingerprint(graph_ref, config_ref)
                 turn_state["active"] = True
+                # Issue #53: dedup only against echoes delivered within
+                # THIS turn (see _run_message_turn).
+                turn_state.pop("last_bus_agent_text", None)
                 heartbeat = asyncio.create_task(_llm_progress_heartbeat())
                 try:
                     snapshot = await graph_ref.ainvoke(Command(resume=approved), config_ref)
@@ -937,19 +986,29 @@ def create_app():
                 if not await _safe_send(_error_payload(e)):
                     return
             else:
+                # Issue #53, mirror order (see _run_message_turn): the
+                # resumed step's echo may still be sitting in the
+                # call_soon_threadsafe queue with no await boundary since
+                # the emit — flush before the dedup gate decides.
+                await asyncio.sleep(0)
+                await _drain_events()
                 after = _ai_text_stats(getattr(snapshot, "values", None))
                 produced_new = before is not None and after != before
                 if produced_new:
                     content = after[1]
                     if transcript_ref:
                         transcript_ref.add_agent(content)
-                    if not await _safe_send(
-                        {
-                            "type": "agent_message",
-                            "data": {"content": content},
-                        }
-                    ):
-                        return
+                    # Issue #53: skip the redundant inline frame when the
+                    # bus echo of this text was already delivered verbatim
+                    # during this resume (same gate as message turns).
+                    if turn_state.get("last_bus_agent_text") != content:
+                        if not await _safe_send(
+                            {
+                                "type": "agent_message",
+                                "data": {"content": content},
+                            }
+                        ):
+                            return
             finally:
                 turn_state["active"] = False
             # Complete follows both success and failure, so the client never
