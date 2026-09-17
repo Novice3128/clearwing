@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 from typing import Any
 
@@ -8,13 +9,16 @@ from clearwing.agent.runtime import NativeAgentGraph, populate_knowledge_graph
 from clearwing.agent.state import AgentState
 from clearwing.agent.tooling import ensure_agent_tool
 from clearwing.capabilities import capabilities
+from clearwing.llm.fallback import FallbackChain
 from clearwing.llm.native import AsyncLLMClient
 from clearwing.providers import ProviderManager, resolve_llm_endpoint
 from clearwing.providers.binding import AgentLimits
-from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
+from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL, resolve_fallback_endpoints
 
 from .prompts import build_dynamic_context, build_system_prompt
 from .tools import get_all_tools, get_custom_tools
+
+logger = logging.getLogger(__name__)
 
 
 def _default_agent_limits() -> AgentLimits:
@@ -133,6 +137,50 @@ def build_react_graph(
     )
 
 
+def _maybe_wrap_fallback_chain(
+    primary: AsyncLLMClient,
+    *,
+    cli_base_url: str | None,
+    cli_api_key: str | None,
+) -> Any:
+    """Wrap *primary* in a FallbackChain when config.yaml declares one.
+
+    Gated on per-request credentials (issue #17): an explicit base_url or
+    api_key from a webui start frame / CLI flag means the operator chose
+    THIS endpoint for the session — the conversation must never be silently
+    re-routed to a different provider. Env/config-tier deployments (the
+    compose stack) keep the chain.
+
+    Failures building an individual fallback client only drop that entry;
+    the primary alone is still a valid (chain-less) result.
+    """
+    if cli_base_url or cli_api_key:
+        return primary
+    endpoints = resolve_fallback_endpoints()
+    if not endpoints:
+        return primary
+    fallbacks: list[AsyncLLMClient] = []
+    for endpoint in endpoints:
+        try:
+            fallbacks.append(
+                ProviderManager.for_endpoint(endpoint).get_native_client("default")
+            )
+        except Exception:
+            logger.warning(
+                "Failed to build fallback client for %s; skipping it",
+                endpoint.describe(),
+                exc_info=True,
+            )
+    if not fallbacks:
+        return primary
+    logger.info(
+        "LLM fallback chain active: %s -> %s",
+        primary.model_name,
+        " -> ".join(client.model_name for client in fallbacks),
+    )
+    return FallbackChain(primary, fallbacks)
+
+
 def _create_llm(
     model_name: str | None,
     base_url: str | None = None,
@@ -182,7 +230,10 @@ def _create_llm(
         or model_name != DEFAULT_ANTHROPIC_MODEL
     ):
         endpoint = dataclasses.replace(endpoint, model=model_name)
-    return ProviderManager.for_endpoint(endpoint).get_native_client("default")
+    primary = ProviderManager.for_endpoint(endpoint).get_native_client("default")
+    return _maybe_wrap_fallback_chain(
+        primary, cli_base_url=base_url, cli_api_key=api_key
+    )
 
 
 def create_agent(

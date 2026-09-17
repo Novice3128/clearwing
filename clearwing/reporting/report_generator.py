@@ -114,12 +114,7 @@ class ReportGenerator:
         lines.append("VULNERABILITIES")
         lines.append("-" * 70)
         if scan_result.vulnerabilities:
-            for vuln in scan_result.vulnerabilities:
-                lines.append(f"  [{vuln.get('cve', 'N/A')}] {vuln.get('description', 'N/A')}")
-                lines.append(
-                    f"    Service: {vuln.get('service', 'N/A')} (Port {vuln.get('port', 'N/A')})"
-                )
-                lines.append(f"    CVSS Score: {vuln.get('cvss', 'N/A')}")
+            self._render_vulnerability_lines(lines, scan_result.vulnerabilities)
         else:
             lines.append("  No vulnerabilities found")
         lines.append("")
@@ -151,6 +146,52 @@ class ReportGenerator:
         lines.append("=" * 70)
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_vulnerability_lines(lines: list, vulnerabilities: list) -> None:
+        """Render the VULNERABILITIES section body (issue #15 semantics).
+
+        Keyword hits without product identity are candidates, not findings
+        — headline counts must not include them. Entries without a
+        match_quality label predate the field and count as findings.
+        NVD/target-controlled strings are flattened to one line so a
+        hostile description cannot forge report lines (fake findings,
+        fake counts, END OF REPORT).
+        """
+
+        def _flat(value) -> str:
+            return " ".join(str(value or "N/A").split())
+
+        candidates = [
+            v for v in vulnerabilities if v.get("match_quality") == "keyword-candidate"
+        ]
+        findings = [
+            v for v in vulnerabilities if v.get("match_quality") != "keyword-candidate"
+        ]
+        suffix = f" (plus {len(candidates)} unverified keyword candidates)" if candidates else ""
+        lines.append(f"  Findings: {len(findings)}{suffix}")
+        for vuln in findings:
+            lines.append(f"  [{_flat(vuln.get('cve'))}] {_flat(vuln.get('description'))}")
+            ports = vuln.get("ports") or [vuln.get("port", "N/A")]
+            lines.append(
+                f"    Service: {_flat(vuln.get('service'))} "
+                f"(Port(s) {', '.join(str(p) for p in ports)})"
+            )
+            lines.append(f"    CVSS Score: {vuln.get('cvss', 'N/A')}")
+            quality = vuln.get("match_quality")
+            if quality:
+                label = f"    Match: {quality}"
+                if vuln.get("product"):
+                    label += f" ({_flat(vuln.get('product'))}"
+                    if vuln.get("version"):
+                        label += f" {_flat(vuln.get('version'))}"
+                    label += ")"
+                lines.append(label)
+        if candidates:
+            lines.append("")
+            lines.append("  Unverified keyword candidates (NOT confirmed findings):")
+            for vuln in candidates:
+                lines.append(f"  [{_flat(vuln.get('cve'))}] {_flat(vuln.get('description'))[:100]}")
 
     def _generate_json(self, scan_result: Any) -> str:
         """Generate JSON report."""

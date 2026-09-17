@@ -74,6 +74,19 @@ def _last_ai_content(values: dict[str, Any] | None) -> str:
     return _ai_text_stats(values)[1]
 
 
+def _is_foreign_session_message(payload: dict, current_session_id: str | None) -> bool:
+    """True when a bus MESSAGE payload is stamped for ANOTHER session.
+
+    LLM retry/fallback notices (issue #17) carry the emitting session's id
+    on the payload; without this check every connected socket would see
+    every session's retry chatter on the process-wide bus. Unstamped
+    payloads (legacy emitters, session-less subsystems) stay broadcast —
+    same rule the session-scoped cost frames follow.
+    """
+    origin = payload.get("session_id")
+    return origin is not None and origin != current_session_id
+
+
 def _state_fingerprint(graph_ref: Any, config_ref: dict) -> tuple[int, str] | None:
     """(AI-text-count, last-AI-text) fingerprint of the graph state (#33).
 
@@ -643,6 +656,14 @@ def create_app():
                             if serializable is None:
                                 # A concurrent session's frame — never
                                 # reaches this socket or its transcript.
+                                return
+                        if event_type_name == "agent_message" and isinstance(
+                            serializable, dict
+                        ):
+                            # Retry/fallback notices (issue #17) carry the
+                            # emitting session's id; every other socket
+                            # must not receive this session's LLM chatter.
+                            if _is_foreign_session_message(serializable, session_id):
                                 return
                         item = {"type": event_type_name, "data": serializable}
                         try:

@@ -1821,3 +1821,34 @@ class TestDuplicateAgentFrameDedup:
         contents = [f["data"]["content"] for f in frames]
         assert contents.count(resumed) == 1  # echo only, no inline repeat
         assert complete["data"]["status"] == "ok"
+
+
+class TestForeignSessionMessageFilter:
+    """Issue #17: retry/fallback notices carry the emitting session's id;
+    the pump must scope them instead of broadcasting LLM chatter across
+    sockets."""
+
+    def test_matching_session_passes(self):
+        from clearwing.ui.web.app import _is_foreign_session_message
+
+        payload = {"content": "llm server error (5xx)", "session_id": "aa11"}
+        assert not _is_foreign_session_message(payload, "aa11")
+
+    def test_foreign_session_is_dropped(self):
+        from clearwing.ui.web.app import _is_foreign_session_message
+
+        payload = {"content": "retrying", "session_id": "bb22"}
+        assert _is_foreign_session_message(payload, "aa11")
+
+    def test_socket_without_session_drops_stamped_messages(self):
+        from clearwing.ui.web.app import _is_foreign_session_message
+
+        payload = {"content": "retrying", "session_id": "bb22"}
+        assert _is_foreign_session_message(payload, None)
+
+    def test_unstamped_payloads_stay_broadcast(self):
+        from clearwing.ui.web.app import _is_foreign_session_message
+
+        # Legacy emitters and session-less subsystem notes carry no id.
+        assert not _is_foreign_session_message({"content": "context summarized"}, "aa11")
+        assert not _is_foreign_session_message({"content": "note"}, None)

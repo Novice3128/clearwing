@@ -110,10 +110,82 @@ class TestVulnerabilityScanner:
         assert isinstance(result, list)
 
     def test_local_db_lookup(self, scanner):
-        """Test local vulnerability database lookup."""
-        vulns = scanner._check_local_db("FTP")
-        assert isinstance(vulns, list)
-        assert len(vulns) > 0
+        """Test local vulnerability database lookup.
+
+        Issue #15: a bare service name ("FTP") no longer returns every
+        FTP-ish CVE — ProFTPD/vsftpd entries require a product identity,
+        and version verification needs the banner's version.
+        """
+        # Product + version verified via banner → finding.
+        vulns = scanner._check_local_db("FTP", version="", banner="220 ProFTPD 1.3.5 Server")
+        assert [v["cve"] for v in vulns] == ["CVE-2015-3306"]
+        assert vulns[0]["match_quality"] == "version-verified"
+        assert vulns[0]["product"] == "proftpd"
+        assert vulns[0]["version"] == "1.3.5"
+
+        # Version outside the affected range → dropped (not affected).
+        vulns = scanner._check_local_db("FTP", version="", banner="220 ProFTPD 1.3.8 Server")
+        assert vulns == []
+
+        # Product recognized, version unknown → heuristic, honestly labeled.
+        vulns = scanner._check_local_db("FTP", version="", banner="220 ProFTPD Server ready")
+        assert [v["cve"] for v in vulns] == ["CVE-2015-3306"]
+        assert vulns[0]["match_quality"] == "service-heuristic"
+
+        # Bare service name without any banner → no product identity.
+        assert scanner._check_local_db("FTP") == []
+
+        # Protocol-level advisory (no product binding) stays as heuristic.
+        vulns = scanner._check_local_db("RDP")
+        assert [v["cve"] for v in vulns] == ["CVE-2019-0708"]
+        assert vulns[0]["match_quality"] == "service-heuristic"
+
+    def test_version_range_comparator(self, scanner):
+        """Issue #15: dotted versions with patch suffixes compare sanely."""
+        from clearwing.scanning.vulnerability_scanner import _version_in_ranges
+
+        lt_78 = [{"end_excluding": "7.8"}]
+        assert _version_in_ranges("7.1", lt_78)
+        assert _version_in_ranges("7.7p1", lt_78)
+        assert not _version_in_ranges("7.8", lt_78)
+        assert not _version_in_ranges("8.0", lt_78)
+
+        lt_71p2 = [{"end_excluding": "7.1p2"}]
+        assert _version_in_ranges("7.1", lt_71p2)
+        assert _version_in_ranges("7.1p1", lt_71p2)
+        assert not _version_in_ranges("7.1p2", lt_71p2)
+
+        exact = [{"start_including": "2.4.49", "end_including": "2.4.50"}]
+        assert _version_in_ranges("2.4.49", exact)
+        assert _version_in_ranges("2.4.50", exact)
+        assert not _version_in_ranges("2.4.51", exact)
+        assert not _version_in_ranges("2.4.48", exact)
+
+        # Unbounded range matches everything; empty version matches nothing.
+        assert _version_in_ranges("1.0", [{}])
+        assert not _version_in_ranges("", [{}])
+        assert not _version_in_ranges("1.0", None)
+
+    def test_resolve_identity_from_banner(self, scanner):
+        """Issue #15: banners carry the product truth, not the service name."""
+        cases = [
+            ("FTP", "220 ProFTPD 1.3.5 Server", "proftpd", "1.3.5"),
+            ("FTP", "220 (vsFTPd 3.0.3)", "vsftpd", "3.0.3"),
+            ("SSH", "SSH-2.0-OpenSSH_7.4", "openssh", "7.4"),
+            ("SSH", "SSH-2.0-OpenSSH_8.2p1 Debian", "openssh", "8.2p1"),
+            ("HTTP", "Server: Apache/2.4.49 (Unix)", "apache", "2.4.49"),
+            ("HTTP", "Server: nginx/1.18.0", "nginx", "1.18.0"),
+            ("MYSQL", "mysql  Ver 8.0.31", "mysql", "8.0.31"),
+        ]
+        for service, banner, product, version in cases:
+            identity = scanner._resolve_identity(service, "", banner)
+            assert identity is not None, f"no identity from {banner!r}"
+            assert identity.product == product, banner
+            assert identity.version == version, banner
+
+        # No product signal anywhere → no identity.
+        assert scanner._resolve_identity("HTTP", "", "") is None
+        assert scanner._resolve_identity("HTTP", "2.4.41", "") is None
 
     def test_cvss_extraction(self, scanner):
         """Test CVSS score extraction."""
@@ -243,6 +315,342 @@ class TestVulnerabilityScanner:
         result = await scanner._query_nvd("http")
         assert result == []
         assert len(calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_scan_dedups_same_cve_across_ports(self, scanner):
+        """Issue #15: the same CVE on N ports is ONE entry with a ports list."""
+        services = [
+            {"port": 21, "service": "FTP", "banner": "220 ProFTPD 1.3.5 Server", "version": ""},
+            {"port": 2121, "service": "FTP", "banner": "220 ProFTPD 1.3.5 Server", "version": ""},
+        ]
+
+        async def _fake_query(service, identity=None):
+            return []
+
+        scanner._query_nvd = _fake_query
+        result = await scanner.scan("127.0.0.1", services)
+
+        assert len(result) == 1
+        assert result[0]["cve"] == "CVE-2015-3306"
+        assert result[0]["ports"] == [21, 2121]
+        assert result[0]["match_quality"] == "version-verified"
+
+    @pytest.mark.asyncio
+    async def test_scan_false_positive_inflation_is_gone(self, scanner, monkeypatch):
+        """Issue #15 offline replay: same service on many ports used to
+        multiply keyword hits into dozens of unverified entries; findings
+        are now unique verified CVEs."""
+        services = [
+            # Banners unreadable → no product identity → keyword path.
+            {"port": p, "service": "HTTP", "banner": "", "version": None}
+            for p in (80, 81, 8080, 8081, 8000)
+        ]
+
+        async def _fake_query(service, identity=None):
+            # NVD keyword noise: one irrelevant CVE per port query.
+            return [
+                {
+                    "cve": "CVE-2023-99999",
+                    "description": "some other product entirely",
+                    "cvss": 5.0,
+                    "references": [],
+                    "match_quality": "keyword-candidate",
+                }
+            ]
+
+        scanner._query_nvd = _fake_query
+        result = await scanner.scan("127.0.0.1", services)
+
+        # 2.4.41 is outside every local Apache range → no local findings.
+        # The keyword noise dedups to one entry, labeled candidate.
+        assert len(result) == 1
+        assert result[0]["cve"] == "CVE-2023-99999"
+        assert result[0]["match_quality"] == "keyword-candidate"
+        assert result[0]["ports"] == [80, 81, 8080, 8081, 8000]
+
+    @pytest.mark.asyncio
+    async def test_nvd_cpe_query_verifies_version_ranges(self, scanner, monkeypatch):
+        """With a product identity the NVD query uses cpeName and drops
+        CVEs whose CPE criteria ranges exclude the detected version."""
+        urls: list[str] = []
+
+        def _cve_item(cve_id, start, end):
+            return {
+                "cve": {
+                    "id": cve_id,
+                    "descriptions": [{"value": f"{cve_id} desc"}],
+                    "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": 7.5}}]},
+                    "configurations": [
+                        {
+                            "nodes": [
+                                {
+                                    "cpeMatch": [
+                                        {
+                                            "cpe23Uri": f"cpe:2.3:a:apache:http_server:{start or '*'}:*:*:*:*:*:*:*",
+                                            "versionStartIncluding": start,
+                                            "versionEndIncluding": end,
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ],
+                }
+            }
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return {
+                    "vulnerabilities": [
+                        _cve_item("CVE-2021-41773", "2.4.49", "2.4.49"),
+                        _cve_item("CVE-2019-0215", "2.4.17", "2.4.38"),
+                    ]
+                }
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                urls.append(url)
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+
+        identity = scanner._resolve_identity("HTTP", "", "Server: Apache/2.4.49 (Unix)")
+        assert identity is not None and identity.version == "2.4.49"
+        result = await scanner._query_nvd("HTTP", identity)
+
+        # NVD's current CPE product name for httpd is "http_server".
+        assert "cpeName=cpe%3A2.3%3Aa%3Aapache%3Ahttp_server%3A2.4.49" in urls[0]
+        assert [v["cve"] for v in result] == ["CVE-2021-41773"]
+        assert result[0]["match_quality"] == "version-verified"
+        assert result[0]["version"] == "2.4.49"
+
+    @pytest.mark.asyncio
+    async def test_nvd_verification_accepts_legacy_cpe_product_names(self, scanner):
+        """Pre-migration NVD records still carry cpe:...:httpd:... — the
+        alias must verify like the current http_server spelling."""
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return {
+                    "vulnerabilities": [
+                        {
+                            "cve": {
+                                "id": "CVE-2017-9788",
+                                "descriptions": [{"value": "mod_http2"}],
+                                "metrics": {},
+                                "configurations": [
+                                    {
+                                        "nodes": [
+                                            {
+                                                "cpeMatch": [
+                                                    {
+                                                        "cpe23Uri": "cpe:2.3:a:apache:httpd:2.4.49",
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("HTTP", "", "Apache/2.4.49")
+        result = await scanner._query_nvd("HTTP", identity)
+        assert [v["cve"] for v in result] == ["CVE-2017-9788"]
+        assert result[0]["match_quality"] == "version-verified"
+
+    @pytest.mark.asyncio
+    async def test_versionless_identity_queries_by_keyword(self, scanner):
+        """NVD rejects versionless cpeName with a permanent 404, so a
+        versionless product identity must fall back to keyword search."""
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return {"vulnerabilities": []}
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        urls: list[str] = []
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                urls.append(url)
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("FTP", "", "220 ProFTPD Server ready")
+        assert identity is not None and identity.version is None
+        await scanner._query_nvd("FTP", identity)
+        assert "keywordSearch=proftpd" in urls[0]
+        assert "cpeName" not in urls[0]
+
+    @pytest.mark.asyncio
+    async def test_versionless_keyword_hits_require_product_cpe(self, scanner):
+        """A keyword hit whose CPE criteria never name the product is a
+        description-text coincidence — it must not count as a finding."""
+
+        def _item(cve_id, cpe_product):
+            uri = f"cpe:2.3:a:someone:{cpe_product}:1.0" if cpe_product else None
+            criterion = {"cpe23Uri": uri} if uri else {}
+            return {
+                "cve": {
+                    "id": cve_id,
+                    "descriptions": [{"value": "mentions proftpd in prose"}],
+                    "metrics": {},
+                    "configurations": [{"nodes": [{"cpeMatch": [criterion]}]}],
+                }
+            }
+
+        payload = {
+            "vulnerabilities": [
+                _item("CVE-2022-11111", "otherproduct"),
+                _item("CVE-2022-22222", None),
+                _item("CVE-2022-33333", "proftpd"),
+            ]
+        }
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return payload
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("FTP", "", "220 ProFTPD Server ready")
+        result = await scanner._query_nvd("FTP", identity)
+
+        by_cve = {v["cve"]: v for v in result}
+        assert by_cve["CVE-2022-11111"]["match_quality"] == "keyword-candidate"
+        assert by_cve["CVE-2022-22222"]["match_quality"] == "keyword-candidate"
+        assert by_cve["CVE-2022-33333"]["match_quality"] == "service-heuristic"
+
+    @pytest.mark.asyncio
+    async def test_nvd_keyword_hits_without_identity_are_candidates(self, scanner):
+        """No product identity → keyword search runs but hits are labeled
+        candidates, never findings (issue #15)."""
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return {
+                    "vulnerabilities": [
+                        {
+                            "cve": {
+                                "id": "CVE-2020-1234",
+                                "descriptions": [{"value": "keyword hit"}],
+                                "metrics": {},
+                                "configurations": [],
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                assert "keywordSearch=" in url
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+        result = await scanner._query_nvd("HTTP", identity=None)
+
+        assert len(result) == 1
+        assert result[0]["match_quality"] == "keyword-candidate"
+
+    def test_report_separates_findings_from_candidates(self):
+        """The rendered report counts only verified/heuristic entries as
+        findings and lists keyword candidates separately."""
+        from clearwing.core.config import ScanConfig  # noqa: F401  (import parity)
+        from clearwing.core.engine import ScanResult
+        from clearwing.reporting.report_generator import ReportGenerator
+
+        result = ScanResult(target="127.0.0.1")
+        result.vulnerabilities = [
+            {
+                "cve": "CVE-2015-3306",
+                "description": "ProFTPD mod_copy RCE",
+                "cvss": 9.8,
+                "port": 21,
+                "ports": [21],
+                "service": "FTP",
+                "match_quality": "version-verified",
+                "product": "proftpd",
+                "version": "1.3.5",
+            },
+            {
+                "cve": "CVE-2020-9999",
+                "description": "keyword noise",
+                "cvss": 5.0,
+                "port": 80,
+                "ports": [80],
+                "service": "HTTP",
+                "match_quality": "keyword-candidate",
+            },
+        ]
+        report = ReportGenerator().generate(result, "text")
+        assert "Findings: 1 (plus 1 unverified keyword candidates)" in report
+        assert "Unverified keyword candidates" in report
+        assert "Match: version-verified (proftpd 1.3.5)" in report
 
     @pytest.mark.asyncio
     async def test_engine_closes_scanner_even_when_scan_raises(self):

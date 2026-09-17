@@ -145,20 +145,29 @@ def _endpoint_from_fields(
     api_key: str | None,
     source: str,
     adapter: str | None = None,
+    inherit_env_key: bool = True,
 ) -> LLMEndpoint:
     """Build an `LLMEndpoint` from explicit base_url/model/api_key fields.
 
-    Shared by the CLI and process-routing tiers so both apply
-    identical provider-dialect rules: an Anthropic-compatible base_url (or no
-    base_url at all) is Anthropic; any other base_url is OpenAI-compatible.
+    Shared by the CLI and process-routing tiers so both apply identical
+    provider-dialect rules: an Anthropic-compatible base_url (or no base_url
+    at all) is Anthropic; any other base_url is OpenAI-compatible.
+
+    ``inherit_env_key=False`` (fallback-chain entries) skips the
+    ``CLEARWING_API_KEY``/``ANTHROPIC_API_KEY`` env fallback for missing
+    keys: those credentials belong to the PRIMARY endpoint's host, and a
+    fallback entry that omitted its own key must never silently transmit
+    them to a different base_url (same crossing PR #43 banned for the
+    config key).
     """
     if base_url:
+        env_key = os.environ.get(ENV_API_KEY) if inherit_env_key else None
         if _is_anthropic_compat_base_url(base_url):
             return LLMEndpoint(
                 provider="anthropic",
                 model=model or _default_anthropic_compat_model(base_url),
                 base_url=base_url,
-                api_key=api_key or os.environ.get(ENV_API_KEY),
+                api_key=api_key or env_key,
                 source=source,
                 adapter=adapter,
             )
@@ -166,7 +175,7 @@ def _endpoint_from_fields(
             provider="openai_compat",
             model=model or _default_openai_compat_model(base_url),
             base_url=base_url,
-            api_key=api_key or os.environ.get(ENV_API_KEY) or _placeholder_for(base_url),
+            api_key=api_key or env_key or _placeholder_for(base_url),
             source=source,
             adapter=adapter,
         )
@@ -175,7 +184,8 @@ def _endpoint_from_fields(
         provider="anthropic",
         model=model or DEFAULT_ANTHROPIC_MODEL,
         base_url=None,
-        api_key=api_key or os.environ.get(ENV_ANTHROPIC_KEY),
+        api_key=api_key
+        or (os.environ.get(ENV_ANTHROPIC_KEY) if inherit_env_key else None),
         source=source,
         adapter=adapter,
     )
@@ -376,6 +386,69 @@ def resolve_llm_endpoint(
     )
 
 
+def resolve_fallback_endpoints(
+    config_provider: dict[str, Any] | None = None,
+) -> list[LLMEndpoint]:
+    """Resolve the ordered LLM fallback chain from config.yaml (issue #17).
+
+    Reads ``provider.fallbacks`` — a list of COMPLETE endpoint blocks:
+
+    .. code-block:: yaml
+
+        provider:
+          base_url: https://primary.example.com/v1
+          model: glm-5.3
+          fallbacks:
+            - base_url: https://backup.example.com/v1
+              model: gpt-5.4-mini
+              api_key: ${BACKUP_KEY}
+            - base_url: http://localhost:11434/v1
+              model: qwen2.5-coder:32b
+
+    Each entry describes its OWN endpoint: nothing merges from the primary
+    block, and an entry's ``api_key`` authenticates only the ``base_url``
+    named in the same entry (the same credential-scoping invariant the
+    primary resolution enforces). Entries lacking both ``base_url`` and
+    ``model`` are skipped; a malformed ``fallbacks`` section is ignored
+    with a warning, never raised.
+
+    Returns an empty list when nothing is configured.
+    """
+    if config_provider is None:
+        config_provider = _load_default_config_provider()
+    config_provider = config_provider or {}
+    raw = config_provider.get("fallbacks")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning("provider.fallbacks must be a list; ignoring it")
+        return []
+    endpoints: list[LLMEndpoint] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            logger.warning("provider.fallbacks[%d] is not a mapping; skipping", index)
+            continue
+        base_url = _clean_field(entry.get("base_url"))
+        model = _clean_field(entry.get("model"))
+        api_key = _resolve_config_secret(entry.get("api_key"))
+        adapter = entry.get("adapter")
+        if not base_url and not model:
+            continue
+        endpoints.append(
+            _endpoint_from_fields(
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                source="config",
+                adapter=adapter,
+                # No env-key inheritance: CLEARWING_API_KEY authenticates
+                # the PRIMARY endpoint's host, not this entry's.
+                inherit_env_key=False,
+            )
+        )
+    return endpoints
+
+
 def _load_default_config_provider() -> dict[str, Any]:
     """Read the `provider:` section from ~/.clearwing/config.yaml.
 
@@ -553,4 +626,5 @@ __all__ = [
     "EndpointPricing",
     "LLMEndpoint",
     "resolve_llm_endpoint",
+    "resolve_fallback_endpoints",
 ]

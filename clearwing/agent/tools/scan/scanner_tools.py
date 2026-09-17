@@ -114,8 +114,14 @@ async def scan_vulnerabilities(target: str, services: list[dict]) -> list[dict] 
         services: List of service dicts from detect_services.
 
     Returns:
-        List of vulnerability dicts with keys: cve, description, cvss, port,
-        service. On failure: an error dict.
+        List of vulnerability dicts deduplicated by CVE (each carries a
+        ``ports`` list) with keys: cve, description, cvss, port, service,
+        match_quality. ``match_quality`` is "version-verified" (product and
+        version confirmed in the affected range), "service-heuristic"
+        (protocol-level advisory, banner cannot verify the version), or
+        "keyword-candidate" (NVD keyword hit without product identity — an
+        unverified lead, NOT a confirmed finding). On failure: an error
+        dict.
     """
     scanner = scanning.VulnerabilityScanner()
     try:

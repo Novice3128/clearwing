@@ -189,6 +189,14 @@ inline non-bus `agent_message` frame produced by the LangGraph streaming
 loop has a different payload — see
 [Inline server frames](#inline-server-frames).
 
+Note: `type: "system"` carries LLM resilience notices (issue #17) —
+`llm server error (5xx): retrying openai/glm-5.3 (retry 1/2) in 4s` or
+`llm provider openai/glm-5.3 failed (...); falling back to
+ollama/qwen2.5-coder:32b` — emitted as they happen so a retrying or
+failing-over turn is visible instead of silent. These rides the same
+bus frames; clients that ignore unknown message categories can ignore
+them.
+
 ### `tool_start`
 
 Fires when a tool invocation begins
