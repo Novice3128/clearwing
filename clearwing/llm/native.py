@@ -1172,45 +1172,61 @@ class AsyncLLMClient:
                         # transport gets its own fresh per-attempt budget
                         # (and per-attempt reservations).
                         #
-                        # Delta policy (Codex PR-56 r1): the first fallback
-                        # attempt streams live; if it emits partial text and
-                        # then fails retryably, later attempts' deltas are
-                        # SUPPRESSED (never concatenated onto the abandoned
-                        # prefix) and the complete answer is emitted once on
-                        # success — delta-only consumers (the interactive
-                        # CLI) otherwise displayed two merged answers.
-                        fallback_delta_state = {"emitted": False, "suppressed": False}
-
-                        def _counting_fallback_delta(text: str) -> None:
-                            fallback_delta_state["emitted"] = True
-                            if on_text_delta is not None:
-                                on_text_delta(text)
+                        # Delta policy (Codex PR-56 r2): fallback deltas are
+                        # BUFFERED per attempt and flushed only when that
+                        # attempt succeeds — a failed attempt's partial
+                        # text never reaches append-only consumers, so a
+                        # retry can never concatenate two generations. The
+                        # healthy path pays one flush instead of live
+                        # streaming, acceptable for the exceptional route.
+                        fallback_buffer: list[str] = []
 
                         async def _fallback_attempt():
-                            if fallback_delta_state["emitted"]:
-                                fallback_delta_state["suppressed"] = True
-                                callback = None
-                            else:
-                                callback = _counting_fallback_delta
+                            fallback_buffer.clear()
                             return await self._openai_chat_http_fallback(
                                 request,
                                 options,
-                                on_text_delta=callback,
+                                on_text_delta=fallback_buffer.append,
                             )
 
-                        response = await self._with_retries(
-                            _fallback_attempt, reserve=_reserve
-                        )
-                        if (
-                            fallback_delta_state["suppressed"]
-                            and on_text_delta is not None
-                        ):
-                            try:
-                                complete_text = response_text(response)
-                            except Exception:
-                                complete_text = ""
-                            if complete_text:
-                                on_text_delta(complete_text)
+                        # Carry the native stream's consumed retries into the
+                        # fallback phase: the fallback's _with_retries starts
+                        # a fresh counter, and the final exception's attempts
+                        # count must reflect BOTH transports (Codex PR-56
+                        # r2) or the websocket error payload misstates them.
+                        native_attempts = getattr(exc, "_clearwing_attempts", 0) or 0
+                        try:
+                            response = await self._with_retries(
+                                _fallback_attempt, reserve=_reserve
+                            )
+                        except Exception as fallback_exc:
+                            fallback_attempts = (
+                                getattr(fallback_exc, "_clearwing_attempts", 0) or 0
+                            )
+                            if native_attempts and fallback_attempts:
+                                try:
+                                    fallback_exc._clearwing_attempts = (  # type: ignore[attr-defined]
+                                        native_attempts + fallback_attempts
+                                    )
+                                except Exception:
+                                    pass
+                            raise
+                        if on_text_delta is not None:
+                            # Flush the winning attempt's buffered deltas
+                            # chunk-for-chunk (original granularity); a
+                            # fallback that never streamed gets its complete
+                            # response text instead — delta-only consumers
+                            # see exactly one generation either way.
+                            if fallback_buffer:
+                                for chunk in list(fallback_buffer):
+                                    on_text_delta(chunk)
+                            elif response is not None:
+                                try:
+                                    complete_text = response_text(response)
+                                except Exception:
+                                    complete_text = ""
+                                if complete_text:
+                                    on_text_delta(complete_text)
                     else:
                         raise
                 if response is None:

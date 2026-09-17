@@ -662,8 +662,7 @@ class TestHttpFallbackDeltaPolicy:
                 if callback is not None:
                     callback("abandoned partial")
                 raise RuntimeError("server disconnected")  # retryable
-            # Attempt 2 must receive NO callback (suppressed) and succeed.
-            assert callback is None
+            # Attempt 2 buffers nothing (fresh buffer per attempt).
             return _Response()
 
         from unittest.mock import patch as _upatch
@@ -685,6 +684,7 @@ class TestHttpFallbackDeltaPolicy:
             )
 
         assert response.first_text == "complete answer"
-        # Live: the abandoned partial; then the COMPLETE answer exactly
-        # once — never attempt 2's per-token deltas.
-        assert emitted == ["abandoned partial", "complete answer"]
+        # The abandoned partial NEVER reached the consumer (buffered per
+        # attempt and discarded with the failed attempt); the consumer saw
+        # exactly one generation — the complete answer.
+        assert emitted == ["complete answer"]
