@@ -710,10 +710,14 @@ class NativeAgentGraph:
             and CostTracker.has_pricing(configured_model)
             # The configured-name fallback pricing rule exists for versioned
             # echoes of the SAME provider's model (claude-opus-4-7-20260901
-            # vs claude-opus-4-7). When a FallbackChain served the call,
-            # the configured name belongs to a DIFFERENT provider's model —
+            # vs claude-opus-4-7). When a FallbackChain served the call the
+            # configured name belongs to a DIFFERENT provider's model —
             # billing it at the primary's rates would silently misstate
             # spend on exactly the failover scenario the chain enables.
+            # served_by_primary (not provider-name comparison — two
+            # openai_compat members share the same label) is the failover
+            # signal; bare clients have no such attribute and default True.
+            and getattr(self.llm, "served_by_primary", True)
             and served_provider in (None, configured_provider)
         ):
             pricing_model = configured_model

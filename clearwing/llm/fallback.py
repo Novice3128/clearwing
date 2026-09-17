@@ -85,6 +85,10 @@ class FallbackChain:
         # that attribute cost/provider by client instead of by response.
         self.served_model_name: str | None = None
         self.served_provider_name: str | None = None
+        # True when the PRIMARY member served the last call. Provider-name
+        # comparison cannot detect failover when both members share an
+        # adapter label (e.g. two openai_compat endpoints) — this flag can.
+        self.served_by_primary: bool = True
         self._retry_notice: Callable[[str], None] | None = None
 
     # -- AsyncLLMClient-compatible surface --------------------------------
@@ -120,6 +124,7 @@ class FallbackChain:
     def _record_served(self, client: AsyncLLMClient) -> None:
         self.served_model_name = getattr(client, "model_name", None)
         self.served_provider_name = getattr(client, "provider_name", None)
+        self.served_by_primary = client is self.primary
 
     @property
     def spend_ledger(self):

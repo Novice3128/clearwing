@@ -410,3 +410,21 @@ class TestChainWiringGate:
             )
             is primary
         )
+
+
+class TestServedByPrimaryFlag:
+    """Codex PR-55 P2: provider labels cannot detect failover between two
+    openai_compat members — the chain's served_by_primary flag can."""
+
+    def test_flag_tracks_who_served(self):
+        primary = _FakeClient("primary-model", "openai", exc=RuntimeError("boom"))
+        backup = _FakeClient("backup-model", "openai", response="saved")
+        chain = FallbackChain(primary, [backup])
+
+        assert chain.served_by_primary is True
+        asyncio.run(chain.achat_stream(messages=[]))
+        assert chain.served_by_primary is False
+        assert chain.served_model_name == "backup-model"
+        # Same adapter label on both members — provider_name alone would
+        # have been ambiguous.
+        assert chain.served_provider_name == chain.primary.provider_name

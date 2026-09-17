@@ -105,10 +105,25 @@ def kali_setup() -> dict:
                 "message": f"Reusing existing Kali container {existing.short_id}",
             }
         existing.start()
+        if not mounted:
+            # A stopped legacy container restarts equally mount-less — same
+            # honest degraded warning as the running-legacy branch (Codex
+            # PR-55 P2: silently restarting it kept losing artifacts).
+            return {
+                **base,
+                "status": "restarted",
+                "artifacts_mount": None,
+                "message": (
+                    f"Restarted existing Kali container {existing.short_id} "
+                    "(LEGACY: no /artifacts mount — files written inside "
+                    "will NOT persist; run kali_cleanup then kali_setup "
+                    "to get a mounted container)"
+                ),
+            }
         return {
             **base,
             "status": "restarted",
-            "artifacts_mount": ARTIFACTS_MOUNT if mounted else None,
+            "artifacts_mount": ARTIFACTS_MOUNT,
             "message": f"Restarted existing Kali container {existing.short_id}",
         }
     except docker.errors.NotFound:

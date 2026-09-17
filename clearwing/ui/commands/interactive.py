@@ -306,7 +306,13 @@ def _run_interactive_legacy(cli, args, session=None):
         initial_state = {}
 
         async def _collect_events(g, msg) -> list:
-            return [ev async for ev in g.astream(msg, config, stream_mode="values")]
+            # Bind the session so cost attribution and kali container
+            # scoping (current_session_id) see this frontend's session
+            # instead of falling back to the shared adhoc scope.
+            from clearwing.agent.tooling import session_scope
+
+            with session_scope(getattr(g, "session_id", None)):
+                return [ev async for ev in g.astream(msg, config, stream_mode="values")]
 
         try:
             while True:

@@ -965,3 +965,73 @@ class TestScannerToolErrorEvents:
 
         result = await scan_ports.ainvoke({"target": "127.0.0.1", "scan_type": "connect"})
         assert result == []
+
+
+class TestNvdApi20CriteriaShape:
+    """Codex PR-55 P1: the CVE API 2.0 stores the CPE string in
+    ``criteria`` (cpe23Uri is the legacy 1.1 field and is ABSENT in real
+    2.0 responses) and criteria carry a ``vulnerable`` flag."""
+
+    @pytest.fixture
+    def scanner(self):
+        return VulnerabilityScanner()
+
+    @pytest.mark.asyncio
+    async def test_criteria_field_and_vulnerable_flag(self, scanner):
+        def _item(cve_id, criteria, vulnerable=True, **ranges):
+            criterion = {"criteria": criteria, "vulnerable": vulnerable}
+            criterion.update(ranges)
+            return {
+                "cve": {
+                    "id": cve_id,
+                    "descriptions": [{"value": f"{cve_id}"}],
+                    "metrics": {},
+                    "configurations": [{"nodes": [{"cpeMatch": [criterion]}]}],
+                }
+            }
+
+        payload = {
+            "vulnerabilities": [
+                # 2.0 shape, vulnerable, version in range → verified.
+                _item(
+                    "CVE-2021-41773",
+                    "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                    versionStartIncluding="2.4.49",
+                    versionEndIncluding="2.4.49",
+                ),
+                # 2.0 shape but vulnerable:false (environment criterion) → skip.
+                _item(
+                    "CVE-2020-0001",
+                    "cpe:2.3:a:apache:http_server:2.4.49",
+                    vulnerable=False,
+                ),
+                # No criteria AND no cpe23Uri at all → skip safely.
+                _item("CVE-2020-0002", ""),
+            ]
+        }
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return payload
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("HTTP", "", "Apache/2.4.49")
+        result = await scanner._query_nvd("HTTP", identity)
+
+        assert [v["cve"] for v in result] == ["CVE-2021-41773"]
+        assert result[0]["match_quality"] == "version-verified"

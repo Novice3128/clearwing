@@ -307,7 +307,6 @@ class ClearwingApp(App):
 
     async def _agent_loop(self) -> None:
         """Read from the input queue, drive the agent, display responses."""
-        from clearwing.agent.runtime import Command
         from clearwing.llm.chat import extract_text_content
 
         initial_state: dict = {}
@@ -325,75 +324,86 @@ class ClearwingApp(App):
             input_msg.update(initial_state)
             initial_state = {}
 
-            try:
-                got_response = False
-                last_msg_count = 0
-                async for event in self._agent_graph.astream(
-                    input_msg, self._agent_config, stream_mode="values"
-                ):
-                    msgs = event.get("messages", [])
-                    if len(msgs) <= last_msg_count:
-                        continue
-                    last_msg_count = len(msgs)
-                    last = msgs[-1]
-                    if (
-                        hasattr(last, "content")
-                        and last.content
-                        and getattr(last, "type", None) == "ai"
-                        and not getattr(last, "tool_calls", None)
+            # session_scope: cost attribution and kali container scoping
+            # (current_session_id) must see this TUI's session, not the
+            # shared adhoc fallback.
+            from clearwing.agent.tooling import session_scope
+
+            with session_scope(self.session_id):
+                try:
+                    got_response = False
+                    last_msg_count = 0
+                    async for event in self._agent_graph.astream(
+                        input_msg, self._agent_config, stream_mode="values"
                     ):
-                        text = extract_text_content(last.content)
-                        if text:
-                            feed.add_message(text, "success")
-                            got_response = True
+                        msgs = event.get("messages", [])
+                        if len(msgs) <= last_msg_count:
+                            continue
+                        last_msg_count = len(msgs)
+                        last = msgs[-1]
+                        if (
+                            hasattr(last, "content")
+                            and last.content
+                            and getattr(last, "type", None) == "ai"
+                            and not getattr(last, "tool_calls", None)
+                        ):
+                            text = extract_text_content(last.content)
+                            if text:
+                                feed.add_message(text, "success")
+                                got_response = True
 
-                if not got_response:
-                    feed.add_message("(no response from agent)", "warning")
+                    if not got_response:
+                        feed.add_message("(no response from agent)", "warning")
 
-                # Drain pending approvals; the agent can chain them (each
-                # resume may surface another interrupt). Re-check state after
-                # every resume so subsequent interrupts are prompted instead
-                # of leaking a dangling tool_use when the outer loop consumes
-                # the next keystroke.
-                while True:
-                    state = self._agent_graph.get_state(self._agent_config)
-                    if not (state.next and state.tasks):
-                        break
-                    for task in state.tasks:
-                        if hasattr(task, "interrupts") and task.interrupts:
-                            for intr in task.interrupts:
-                                prompt = str(intr.value)
-                                feed.add_message(
-                                    f"APPROVAL NEEDED: {prompt}  (type 'yes' or 'no')",
-                                    "warning",
-                                )
-                                answer = await self._user_input_queue.get()
-                                approved = answer.strip().lower() in ("yes", "y", "approve")
-                                resume_input = Command(resume=approved)
-                                resume_msg_count = 0
-                                async for ev in self._agent_graph.astream(
-                                    resume_input, self._agent_config
-                                ):
-                                    msgs = ev.get("messages", [])
-                                    if len(msgs) <= resume_msg_count:
-                                        continue
-                                    resume_msg_count = len(msgs)
-                                    last = msgs[-1]
-                                    if (
-                                        hasattr(last, "content")
-                                        and last.content
-                                        and getattr(last, "type", None) == "ai"
-                                        and not getattr(last, "tool_calls", None)
-                                    ):
-                                        text = extract_text_content(last.content)
-                                        if text:
-                                            feed.add_message(text, "success")
+                    await self._drain_pending_approvals(feed)
 
-            except Exception as exc:
-                logger.exception("Agent loop error")
-                attempts = getattr(exc, "_clearwing_attempts", 0) or 0
-                suffix = f" (gave up after {attempts} retr{'y' if attempts == 1 else 'ies'})" if attempts else ""
-                feed.add_message(f"Error: {exc}{suffix}", "error")
+                except Exception as exc:
+                    logger.exception("Agent loop error")
+                    attempts = getattr(exc, "_clearwing_attempts", 0) or 0
+                    suffix = f" (gave up after {attempts} retr{'y' if attempts == 1 else 'ies'})" if attempts else ""
+                    feed.add_message(f"Error: {exc}{suffix}", "error")
+
+    async def _drain_pending_approvals(self, feed) -> None:
+        """Drain pending approval gates; the agent can chain them (each
+        resume may surface another interrupt). Re-check state after every
+        resume so subsequent interrupts are prompted instead of leaking a
+        dangling tool_use when the outer loop consumes the next keystroke.
+        """
+        from clearwing.agent.runtime import Command
+        from clearwing.llm.chat import extract_text_content
+        while True:
+            state = self._agent_graph.get_state(self._agent_config)
+            if not (state.next and state.tasks):
+                break
+            for task in state.tasks:
+                if hasattr(task, "interrupts") and task.interrupts:
+                    for intr in task.interrupts:
+                        prompt = str(intr.value)
+                        feed.add_message(
+                            f"APPROVAL NEEDED: {prompt}  (type 'yes' or 'no')",
+                            "warning",
+                        )
+                        answer = await self._user_input_queue.get()
+                        approved = answer.strip().lower() in ("yes", "y", "approve")
+                        resume_input = Command(resume=approved)
+                        resume_msg_count = 0
+                        async for ev in self._agent_graph.astream(
+                            resume_input, self._agent_config
+                        ):
+                            msgs = ev.get("messages", [])
+                            if len(msgs) <= resume_msg_count:
+                                continue
+                            resume_msg_count = len(msgs)
+                            last = msgs[-1]
+                            if (
+                                hasattr(last, "content")
+                                and last.content
+                                and getattr(last, "type", None) == "ai"
+                                and not getattr(last, "tool_calls", None)
+                            ):
+                                text = extract_text_content(last.content)
+                                if text:
+                                    feed.add_message(text, "success")
 
     # ------------------------------------------------------------------
     # Key binding actions
