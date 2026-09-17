@@ -75,6 +75,13 @@ class TestHeaderTextParsing:
         assert parse_retry_after_seconds("try again in 1200ms") == 1.2
         assert parse_retry_after_seconds("wait 500ms") == 0.5
 
+    def test_unitless_legacy_phrasings_do_not_match(self):
+        # A number without an explicit ms/s unit is not a delay the
+        # provider specified — "wait 5 minutes" must never read as 5s.
+        assert parse_retry_after_seconds("please wait 5 minutes") is None
+        assert parse_retry_after_seconds("try again in 5 minutes") is None
+        assert parse_retry_after_seconds("wait 5") is None
+
 
 class TestChainParsing:
     def test_hint_in_nested_cause(self):
@@ -152,9 +159,19 @@ class TestHeaderExtraction:
         assert _retry_after_hint_from_headers(None) is None
 
     def test_suffix_renders_the_text_protocol(self):
-        assert _retry_after_suffix({"Retry-After-Ms": "2500"}) == " (retry-after: 2.5s)"
-        assert _retry_after_suffix({"Retry-After": "30"}) == " (retry-after: 30s)"
+        assert _retry_after_suffix({"Retry-After-Ms": "2500"}) == " (retry-after: 2.500s)"
+        assert _retry_after_suffix({"Retry-After": "30"}) == " (retry-after: 30.000s)"
         assert _retry_after_suffix({}) == ""
+
+    def test_suffix_fixed_point_round_trip_for_huge_hints(self):
+        # ``:g`` formatting went scientific at ≥ 1e6 ("3e+06"), and the
+        # downstream numeric regex truncated that to 3 s. The fixed-point
+        # render must round-trip: embedded → parsed → capped at 300, never
+        # silently read as 3.
+        suffix = _retry_after_suffix({"Retry-After": "3000000"})
+        assert suffix == " (retry-after: 3000000.000s)"
+        exc = RuntimeError(f"HTTP 503 upstream exploded{suffix}")
+        assert parse_retry_after_seconds(exc) == 300.0
 
 
 class _FakeResponse:
@@ -205,7 +222,7 @@ class TestAiohttpFallbackEmbedsHeader:
                 client._openai_chat_http_fallback(self._request(), ChatOptions())
             )
         # The header hint rides the exception text in the shared protocol.
-        assert "retry-after: 2.5s" in str(exc_info.value)
+        assert "retry-after: 2.500s" in str(exc_info.value)
         assert parse_retry_after_seconds(exc_info.value) == 2.5
 
     def test_raise_carries_http_date_header(self, monkeypatch):
@@ -243,16 +260,29 @@ class TestRetryDelayIntegration:
     def test_retry_delay_uses_parsed_hint_over_backoff(self):
         client = _client()
         exc = RuntimeError("HTTP 503 (retry-after: 20)")
-        # base = 20; jitter ≤ min(1, 20*0.2) = 1 → delay in [20, 21].
-        delay = client._retry_delay_seconds(exc, attempt=0)
-        assert 20.0 <= delay <= 21.0
+        # Server advice is honored verbatim — no jitter (the server named a
+        # time; randomizing it can only land closer to the limit).
+        assert client._retry_delay_seconds(exc, attempt=0) == 20.0
 
     def test_retry_delay_uses_hint_from_nested_cause(self):
         client = _client()
         wrapped = RuntimeError("Web call failed")
         wrapped.__cause__ = RuntimeError("gateway says retry-after: 8")
-        delay = client._retry_delay_seconds(wrapped, attempt=3)
-        assert 8.0 <= delay <= 9.0
+        assert client._retry_delay_seconds(wrapped, attempt=3) == 8.0
+
+    def test_parsed_hint_bypasses_local_backoff_cap(self):
+        # opencode retry.ts / codex parity: a server-suggested delay may
+        # exceed the LOCAL rate_limit_max_backoff_seconds — only the
+        # parser's 300s absolute cap applies.
+        client = _client(rate_limit_max_backoff_seconds=60.0)
+        exc = RuntimeError("HTTP 503 (retry-after: 200)")
+        assert client._retry_delay_seconds(exc, attempt=0) == 200.0
+
+    def test_no_hint_still_capped_at_local_backoff_max(self):
+        client = _client(rate_limit_max_backoff_seconds=60.0)
+        # attempt 10 → exponential 1*2^10 = 1024, capped at 60 (+ jitter).
+        delay = client._retry_delay_seconds(RuntimeError("no hint"), attempt=10)
+        assert 60.0 <= delay <= 61.0
 
     def test_retry_delay_falls_back_to_exponential(self):
         client = _client(rate_limit_initial_backoff_seconds=1.0)

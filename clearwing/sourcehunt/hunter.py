@@ -1580,8 +1580,12 @@ class NativeHunter:
         # records below: the ambient session (operator job / webui turn
         # that spawned this hunt) or the hunt's own sh-* execution id.
         # Hunters run in-process (asyncio tasks), so the jsonl appends land
-        # in the same audit.jsonl the spawning session writes — AuditLogger
-        # serializes appends with its own lock.
+        # in the same audit.jsonl the spawning session writes — AuditLogger's
+        # lock is PER-INSTANCE (it serializes appends through one logger,
+        # not across loggers); cross-instance safety comes from every
+        # hunter appending from the same event loop's synchronous segments
+        # plus a single ``write()`` per append under open("a") (O_APPEND),
+        # which the kernel positions atomically.
         audit_logger = init_session_audit_logger(
             current_session_id() or self.ctx.session_id
         )
@@ -1788,7 +1792,9 @@ class NativeHunter:
                         # Single-entry bookkeeping (#61): priced AND audited
                         # together, same attribution id as the main calls
                         # below — the summary call used to reach the tracker
-                        # but never the audit trail.
+                        # but never the audit trail. The agent dimension is
+                        # the ROLE ("summarizer", matching the runtime's
+                        # context-summarizer rows), not the subsystem.
                         book_llm_call(
                             s_in,
                             s_out,
@@ -1798,7 +1804,7 @@ class NativeHunter:
                             provider=getattr(self.llm, "provider_name", None),
                             session_id=current_session_id() or self.ctx.session_id,
                             audit_logger=audit_logger,
-                            agent="hunter",
+                            agent="summarizer",
                         )
                     visible_read_ranges.clear()
                     overlapping_refreshes.clear()

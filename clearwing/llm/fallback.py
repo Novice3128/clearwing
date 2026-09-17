@@ -137,6 +137,11 @@ class FallbackChain:
         # counts CONSECUTIVE cooldowns and only a success resets it.
         self._cooldown_until: dict[int, float] = {}
         self._cooldown_streak: dict[int, int] = {}
+        # Fail-open notices fire once per all-cooling EPISODE (review r1):
+        # every dispatch while all members cool would otherwise repeat
+        # the same announcement; reset by any dispatch that has an
+        # eligible member again.
+        self._fail_open_notified = False
 
     # -- AsyncLLMClient-compatible surface --------------------------------
 
@@ -216,7 +221,9 @@ class FallbackChain:
         remaining = until - time.monotonic()
         return remaining if remaining > 0.0 else 0.0
 
-    def _start_cooldown(self, client: AsyncLLMClient, exc: Exception) -> None:
+    def _start_cooldown(
+        self, client: AsyncLLMClient, exc: Exception, *, extend_only: bool = False
+    ) -> None:
         """Cool *client* after a chain-level failure (its dispatch raised).
 
         Window = 60s × 2^(streak-1), capped at 600s. A Retry-After hint
@@ -224,14 +231,28 @@ class FallbackChain:
         EXTENDS the window when larger — the provider knows its own load.
         Consecutive cooldowns accumulate: recovering, failing again doubles
         the window; only a success resets the streak.
+
+        ``extend_only`` (fail-open tours): the dispatch that failed started
+        while EVERY member was already cooling, so the failure adds no new
+        information — refresh the window from the EXISTING streak (base
+        60s when the member has none) WITHOUT incrementing, so a total
+        outage cannot grow every window per call toward the 600s cap and
+        mislead the logs about how long the provider has been down.
         """
         if len(self.clients) < 2:
             # Single-member chains (spend-ledger collapse, dropped
             # fallbacks) have nothing to skip: the chain does not act.
             return
-        streak = self._cooldown_streak.get(id(client), 0) + 1
-        self._cooldown_streak[id(client)] = streak
-        window = min(_COOLDOWN_BASE_SECONDS * (2 ** (streak - 1)), _COOLDOWN_MAX_SECONDS)
+        streak = self._cooldown_streak.get(id(client), 0)
+        if not extend_only:
+            streak += 1
+            self._cooldown_streak[id(client)] = streak
+        if streak >= 1:
+            window = min(_COOLDOWN_BASE_SECONDS * (2 ** (streak - 1)), _COOLDOWN_MAX_SECONDS)
+        else:
+            # extend_only with no prior streak: defensive — a cooling
+            # member always has one — fall back to the base window.
+            window = _COOLDOWN_BASE_SECONDS
         retry_after = parse_retry_after_seconds(
             exc, max_seconds=_COOLDOWN_RETRY_AFTER_MAX_SECONDS
         )
@@ -250,35 +271,56 @@ class FallbackChain:
         self._cooldown_until.pop(id(client), None)
         self._cooldown_streak.pop(id(client), None)
 
-    def _dispatch_order(self) -> tuple[list[AsyncLLMClient], list[AsyncLLMClient], bool]:
+    def _dispatch_order(
+        self,
+    ) -> tuple[list[AsyncLLMClient], list[AsyncLLMClient], bool, dict[int, float]]:
         """Members to dispatch over, in order, plus the cooling ones skipped.
 
-        Returns ``(order, skipped, fail_open)``. Cooling members are
-        skipped so a persistently-failing primary stops re-charging its
-        retry budget on every call — unless EVERY member is cooling, in
-        which case the chain fails open to the normal order (never an
-        empty-candidates error).
+        Returns ``(order, skipped, fail_open, remaining)`` where *remaining*
+        maps ``id(client)`` → cooldown seconds left AT DECISION TIME.
+        Cooling members are skipped so a persistently-failing primary stops
+        re-charging its retry budget on every call — unless EVERY member is
+        cooling, in which case the chain fails open to the normal order
+        (never an empty-candidates error).
+
+        The remaining seconds are read in a SINGLE pass (review r1): two
+        separate comprehensions call ``_cooldown_remaining`` twice per
+        member, and time advances between them — a member whose cooldown
+        expires exactly between the scans lands in NEITHER list, and the
+        skip notices would report a different count than the split acted
+        on. Callers (``_notify_skips``) must reuse this map.
         """
         clients = self.clients
-        order = [client for client in clients if self._cooldown_remaining(client) <= 0.0]
-        skipped = [client for client in clients if self._cooldown_remaining(client) > 0.0]
+        remaining = {id(client): self._cooldown_remaining(client) for client in clients}
+        order = [client for client in clients if remaining[id(client)] <= 0.0]
+        skipped = [client for client in clients if remaining[id(client)] > 0.0]
         if order:
-            return order, skipped, False
-        longest = max((self._cooldown_remaining(c) for c in clients), default=0.0)
-        self._notify(
-            f"all llm fallback members cooling (longest {longest:.0f}s remaining); "
-            "failing open to the normal dispatch order"
-        )
-        return clients, [], True
+            # A dispatch with at least one eligible member ends the
+            # all-cooling episode — a later one must announce itself again.
+            self._fail_open_notified = False
+            return order, skipped, False, remaining
+        if not self._fail_open_notified:
+            longest = max(remaining.values(), default=0.0)
+            self._notify(
+                f"all llm fallback members cooling (longest {longest:.0f}s remaining); "
+                "failing open to the normal dispatch order"
+            )
+            self._fail_open_notified = True
+        return clients, [], True, remaining
 
-    def _notify_skips(self, skipped: Sequence[AsyncLLMClient], first: AsyncLLMClient) -> None:
+    def _notify_skips(
+        self,
+        skipped: Sequence[AsyncLLMClient],
+        first: AsyncLLMClient,
+        remaining: dict[int, float],
+    ) -> None:
         if first is None:  # pragma: no cover - order always has the primary
             return
         for client in skipped:
             self._notify(
                 f"llm provider {getattr(client, 'provider_name', '?')}/"
                 f"{getattr(client, 'model_name', '?')} skipping "
-                f"(cooldown {self._cooldown_remaining(client):.0f}s remaining), "
+                f"(cooldown {remaining[id(client)]:.0f}s remaining), "
                 f"dispatching to {getattr(first, 'provider_name', '?')}/"
                 f"{getattr(first, 'model_name', '?')}"
             )
@@ -313,9 +355,9 @@ class FallbackChain:
         """
         # Cooldown-aware dispatch order (issue #57): cooling members are
         # skipped (with a notice); all-cooling fails open to normal order.
-        clients, skipped, _fail_open = self._dispatch_order()
+        clients, skipped, fail_open, remaining = self._dispatch_order()
         if skipped:
-            self._notify_skips(skipped, clients[0])
+            self._notify_skips(skipped, clients[0], remaining)
         last_exc: Exception | None = None
         deltas_emitted = False
         original_callback = kwargs.get("on_text_delta")
@@ -362,8 +404,10 @@ class FallbackChain:
                 # final member whose failure re-raises: otherwise a total
                 # outage could never reach the all-cooling state that the
                 # fail-open path below resolves. Cancellation never reaches
-                # here (BaseException).
-                self._start_cooldown(client, exc)
+                # here (BaseException). In a fail-open tour (every member
+                # was already cooling) the cooldown is extend-only: the
+                # streak does not grow per call.
+                self._start_cooldown(client, exc, extend_only=fail_open)
                 if index + 1 >= len(clients):
                     raise
                 notice = (
@@ -389,9 +433,9 @@ class FallbackChain:
     async def achat(self, **kwargs: Any):
         """Non-streaming dispatch through the chain."""
         # Cooldown-aware dispatch order (issue #57), same as achat_stream.
-        clients, skipped, _fail_open = self._dispatch_order()
+        clients, skipped, fail_open, remaining = self._dispatch_order()
         if skipped:
-            self._notify_skips(skipped, clients[0])
+            self._notify_skips(skipped, clients[0], remaining)
         last_exc: Exception | None = None
         for index, client in enumerate(clients):
             try:
@@ -401,8 +445,9 @@ class FallbackChain:
             except Exception as exc:
                 last_exc = exc
                 # Chain-level failure → cooldown (issue #57), including the
-                # final re-raise (mirrors achat_stream's rule).
-                self._start_cooldown(client, exc)
+                # final re-raise (mirrors achat_stream's rule). Fail-open
+                # tours extend the window without growing the streak.
+                self._start_cooldown(client, exc, extend_only=fail_open)
                 if index + 1 >= len(clients):
                     raise
                 self._notify(

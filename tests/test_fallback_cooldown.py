@@ -238,6 +238,61 @@ class TestFailOpen:
             asyncio.run(chain.achat(messages=[]))
         assert any("failing open" in n for n in notices)
 
+    def test_fail_open_notice_fires_once_per_episode(self, clock):
+        primary = _Member("primary-model")
+        primary.exc = RuntimeError("primary down")
+        backup = _Member("backup-model")
+        backup.exc = RuntimeError("backup down")
+        chain = FallbackChain(primary, [backup])
+        notices: list[str] = []
+        chain.set_retry_notice(notices.append)
+
+        # Normal dispatch: both fail → both cool (streak 1, 60s windows).
+        with pytest.raises(RuntimeError):
+            asyncio.run(chain.achat(messages=[]))
+        # Two consecutive all-cooling tours: the announcement fires ONCE.
+        with pytest.raises(RuntimeError):
+            asyncio.run(chain.achat(messages=[]))
+        with pytest.raises(RuntimeError):
+            asyncio.run(chain.achat(messages=[]))
+        assert len([n for n in notices if "failing open" in n]) == 1
+
+        # Cooldowns expire → a normal dispatch re-arms the announcement;
+        # the members fail again (streak 2) and the NEXT all-cooling
+        # dispatch announces itself again.
+        clock.now += 61
+        with pytest.raises(RuntimeError):
+            asyncio.run(chain.achat(messages=[]))
+        with pytest.raises(RuntimeError):
+            asyncio.run(chain.achat(messages=[]))
+        assert len([n for n in notices if "failing open" in n]) == 2
+
+    def test_fail_open_tour_does_not_amplify_streaks(self, clock):
+        primary = _Member("primary-model")
+        primary.exc = RuntimeError("primary down")
+        backup = _Member("backup-model")
+        backup.exc = RuntimeError("backup down")
+        chain = FallbackChain(primary, [backup])
+
+        # Normal dispatch: streak 1, 60s window for each member.
+        with pytest.raises(RuntimeError):
+            asyncio.run(chain.achat(messages=[]))
+
+        # Fail-open tours: each failure refreshes the window from the
+        # EXISTING streak but must not increment it — a total outage would
+        # otherwise grow every window per call toward the 600s cap and
+        # mislead the logs about how long the provider has been down.
+        for _ in range(5):
+            with pytest.raises(RuntimeError):
+                asyncio.run(chain.achat(messages=[]))
+
+        assert chain._cooldown_streak[id(primary)] == 1
+        assert chain._cooldown_streak[id(backup)] == 1
+        # Window stays the 60s the existing streak sizes — not doubled,
+        # not capped at 600s by call-volume amplification.
+        assert 59.0 <= chain._cooldown_remaining(primary) <= 60.0
+        assert 59.0 <= chain._cooldown_remaining(backup) <= 60.0
+
 
 class TestNoCooldownPaths:
     def test_cancellation_never_cools(self, clock):
@@ -255,6 +310,48 @@ class TestNoCooldownPaths:
         primary.exc = None
         assert asyncio.run(chain.achat(messages=[])) == "ok"
         assert primary.calls == 2
+
+    def test_cancellation_while_fallback_serves_keeps_cooldowns(self):
+        """Primary already cooling, the backup is mid-dispatch when the
+        task is cancelled: the primary's cooldown is untouched and the
+        backup never enters one — cancellation is not provider failure
+        (pinning the existing never-cool-on-cancel semantics).
+
+        No ``clock`` fixture: it freezes ``time.monotonic`` globally,
+        which also freezes the event loop's own clock and would hang
+        ``asyncio.sleep`` forever. Real time keeps the 60s window at
+        ~59-60s remaining for the whole (sub-second) scenario.
+        """
+
+        class _HangingBackup:
+            model_name = "backup-model"
+            provider_name = "openai"
+            spend_ledger = None
+            calls = 0
+
+            async def achat(self, **kwargs):
+                self.calls += 1
+                await asyncio.sleep(3600)
+
+        primary = _Member("primary-model")
+        primary.exc = RuntimeError("status code 503")
+        backup = _HangingBackup()
+        chain = FallbackChain(primary, [backup])
+
+        async def _cancelled_dispatch():
+            task = asyncio.ensure_future(chain.achat(messages=[]))
+            await asyncio.sleep(0.05)  # primary failed + cooled; backup serving
+            task.cancel()
+            await task
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(_cancelled_dispatch())
+
+        assert backup.calls == 1  # the dispatch really reached the backup
+        assert chain._cooldown_remaining(backup) == 0.0  # cancelled ≠ failed
+        # Primary's own earlier cooldown is neither extended nor cleared.
+        assert 59.0 <= chain._cooldown_remaining(primary) <= 60.0
+        assert chain._cooldown_streak[id(primary)] == 1
 
     def test_spend_ledger_collapse_is_unaffected(self, clock, tmp_path):
         from clearwing.llm.budget import SpendLedger

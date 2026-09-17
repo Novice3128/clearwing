@@ -211,10 +211,12 @@ _RE_RETRY_AFTER_MS = re.compile(r"retry[-_ ]after[-_ ]?ms[:=]?\s*([0-9]+(?:\.[0-
 # Numeric Retry-After with a trailing ms unit ("retry-after: 500 ms").
 _RE_RETRY_AFTER_MS_SUFFIX = re.compile(r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*ms\b")
 _RE_RETRY_AFTER_SECONDS = re.compile(r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)")
-# Legacy provider-body phrasings kept from the previous parser, now with an
-# explicit unit capture so "try again in 1200ms" is read as 1.2 s.
-_RE_TRY_AGAIN = re.compile(r"try again in\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)?")
-_RE_WAIT = re.compile(r"\bwait\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)?")
+# Legacy provider-body phrasings kept from the previous parser. The unit
+# is REQUIRED: "try again in 1200ms" reads as 1.2 s while "please wait 5
+# minutes" must not match at all (a unitless number is not a delay the
+# provider actually specified).
+_RE_TRY_AGAIN = re.compile(r"try again in\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)")
+_RE_WAIT = re.compile(r"\bwait\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)")
 # Retry-After as an HTTP-date (RFC 1123 shape; matched on the ORIGINAL-case
 # text because parsedate_to_datetime expects canonical casing).
 _RE_RETRY_AFTER_DATE = re.compile(
@@ -345,7 +347,10 @@ def _retry_after_suffix(headers: Any) -> str:
     hint = _retry_after_hint_from_headers(headers)
     if hint is None or hint <= 0:
         return ""
-    return f" (retry-after: {hint:g}s)"
+    # Fixed-point, never ``:g``: general formatting switches to scientific
+    # notation at ≥ 1e6 ("3e+06"), and the downstream regex would truncate
+    # that to 3 s — breaking the round-trip the suffix exists for.
+    return f" (retry-after: {hint:.3f}s)"
 
 
 def _non_negative_int_env(name: str, default: int) -> int:
@@ -2505,12 +2510,19 @@ class AsyncLLMClient:
         # capped at 300s by parse_retry_after_seconds.
         retry_after = parse_retry_after_seconds(exc)
         if retry_after is not None:
-            base_delay = retry_after
-        else:
-            base_delay = min(
-                self.rate_limit_initial_backoff_seconds * (2**attempt),
-                self.rate_limit_max_backoff_seconds,
-            )
+            # Server advice wins over the LOCAL backoff schedule (opencode
+            # retry.ts lets a header suggestion exceed the local max; codex
+            # treats server advice as authoritative): the parser's 300s
+            # absolute cap is the only ceiling, the local
+            # rate_limit_max_backoff_seconds does not apply. No jitter
+            # either — the server named an exact time, and randomizing it
+            # can only land closer to (or past) the limit it just asked us
+            # to clear.
+            return retry_after
+        base_delay = min(
+            self.rate_limit_initial_backoff_seconds * (2**attempt),
+            self.rate_limit_max_backoff_seconds,
+        )
 
         jitter = min(1.0, base_delay * 0.2) * random.random()
         return min(base_delay + jitter, self.rate_limit_max_backoff_seconds)

@@ -13,6 +13,12 @@ enabled, ``sum(row.details["cost_usd"] for llm_call rows in
 ~/.clearwing/audit/<session_id>/audit.jsonl)`` equals
 ``CostTracker().session_total(session_id)`` — audit rows carry the
 PER-CALL cost returned by ``record_llm_call``, never a running total.
+
+The equation holds within the session's LIFETIME (before
+``CostTracker.forget_session``): operator job completion and webui socket
+teardown both forget the session, after which the tracker side reads zero
+while the audit file keeps every row. Post-hoc reconciliation must treat
+the audit file as the source of truth, not ``session_total``.
 """
 
 from __future__ import annotations

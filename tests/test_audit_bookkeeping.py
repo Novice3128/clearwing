@@ -101,12 +101,17 @@ class TestBookLlmCallHelper:
             tracker.session_total(sid)
         )
 
-    def test_none_audit_logger_still_records(self, tmp_path):
+    def test_none_audit_logger_still_records(self, monkeypatch, tmp_path):
+        self._patch_audit_home(monkeypatch, tmp_path)
         sid = f"bk-{uuid.uuid4().hex[:8]}"
         cost = book_llm_call(10, 5, tracker=CostTracker(), model="claude-sonnet-4-6", session_id=sid)
         assert cost > 0.0
         assert CostTracker().session_total(sid) == pytest.approx(cost)
-        assert _audit_rows(tmp_path, sid) == []  # no audit home patched → none written
+        # The audit home must be PINNED for this assertion to mean anything:
+        # an unpinned run read the real ~/.clearwing tree — a path no
+        # in-test write could ever land in — making "no rows" vacuously
+        # true rather than evidence that audit_logger=None writes nothing.
+        assert _audit_rows(tmp_path / "audit-home", sid) == []
 
     def test_pricing_and_audit_model_split(self, monkeypatch, tmp_path):
         self._patch_audit_home(monkeypatch, tmp_path)
