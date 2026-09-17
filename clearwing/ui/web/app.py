@@ -735,6 +735,16 @@ def create_app():
                                 event_type_name,
                                 exc_info=True,
                             )
+                            # Dropped from the SOCKET, not from history:
+                            # transcript recording is unconditional and
+                            # independent of the frame gate (#53), and the
+                            # report render falls back to str()/default=str
+                            # for values json cannot encode, so the event
+                            # stays legible there. Recording the dropped
+                            # tool_start also keeps its own tool_result's
+                            # content_length from mis-sticking onto the
+                            # previous tool entry.
+                            _record_in_transcript(event_type_name, serializable)
                             return
                         try:
                             ws_loop.call_soon_threadsafe(
@@ -1209,7 +1219,35 @@ def create_app():
             with session_scope(bound_session_id):
                 await turn_fn(*turn_args)
 
+        def _writer_died(task: asyncio.Task) -> None:
+            # Zombie-connection guard: the writer is only ever cancelled in
+            # teardown, so a death outside cancellation means it crashed.
+            # Every pending flush handshake would then wait forever — and
+            # because the handler parks inside `await fut`, it would never
+            # return to receive_text to notice the client is gone, leaving
+            # a connection that neither sends nor reaps. Resolving all
+            # pending futures False routes each waiter onto the same
+            # teardown path a failed send takes. add_done_callback runs on
+            # the event loop like every other flush_futures touch, and the
+            # normal cancel path finds the set already drained (callers
+            # discard their future in `finally`), so this stays a no-op
+            # there.
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is None:
+                return
+            logger.warning(
+                "Outbound writer died unexpectedly; failing pending frame "
+                "flushes to trigger connection teardown",
+                exc_info=exc,
+            )
+            for pending in flush_futures:
+                if not pending.done():
+                    pending.set_result(False)
+
         writer_task = asyncio.create_task(_writer_loop())
+        writer_task.add_done_callback(_writer_died)
 
         try:
             while True:

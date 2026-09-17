@@ -14,7 +14,11 @@ import logging
 import pytest
 from genai_pyo3 import ChatMessage, ChatOptions, ChatRequest
 
-from clearwing.llm.native import AsyncLLMClient, _url_for_path
+from clearwing.llm.native import (
+    AsyncLLMClient,
+    _redact_url_credentials,
+    _url_for_path,
+)
 
 
 class TestUrlForPathJoinMatrix:
@@ -110,6 +114,35 @@ class TestPathlessBaseUrlWarning:
         assert not any(
             "has no path component" in r.getMessage() for r in caplog.records
         )
+
+    def test_double_slash_pathless_base_still_warns(self, caplog):
+        # "http://host:8787//" is as pathless as "/" or "" — all mount
+        # endpoints at the host root, so all must warn.
+        with caplog.at_level(logging.WARNING, logger="clearwing.llm.native"):
+            _openai_client("http://localhost:8787//")
+        warnings = [
+            r
+            for r in caplog.records
+            if "has no path component" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "http://localhost:8787//" in warnings[0].getMessage()
+
+    def test_userinfo_base_url_is_redacted_in_warning(self, caplog):
+        # aiohttp honors user:pass@ as basic auth on the REQUEST, but the
+        # warning text must not leak the credentials.
+        with caplog.at_level(logging.WARNING, logger="clearwing.llm.native"):
+            _openai_client("http://user:pass@localhost:8787")
+        warnings = [
+            r
+            for r in caplog.records
+            if "has no path component" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "user:pass" not in message
+        assert "user" not in message
+        assert "localhost:8787" in message
 
 
 class TestAiohttpFallbackUrl:
@@ -214,6 +247,37 @@ class TestPathless404Advice:
         assert "has no path component" not in str(excinfo.value)
 
     @pytest.mark.asyncio
+    async def test_404_from_double_slash_pathless_base_gains_advice(self):
+        # "//" is as pathless as "/" — the advice must fire there too.
+        client = _openai_client("http://host:8787//")
+
+        async def op():
+            raise RuntimeError(
+                "OpenAI-compatible fallback failed with HTTP 404: not found"
+            )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await client._with_retries(op)
+        assert "has no path component" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_userinfo_base_url_is_redacted_in_404_advice(self):
+        client = _openai_client("http://user:pass@host:8787")
+
+        async def op():
+            raise RuntimeError(
+                "OpenAI-compatible fallback failed with HTTP 404: not found"
+            )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await client._with_retries(op)
+        message = str(excinfo.value)
+        assert "has no path component" in message
+        assert "user:pass" not in message
+        assert "user" not in message
+        assert "host:8787" in message
+
+    @pytest.mark.asyncio
     async def test_structured_404_status_attribute_is_detected(self):
         client = _openai_client("http://host:8787")
 
@@ -265,3 +329,27 @@ class TestPathless404Advice:
         with pytest.raises(RuntimeError) as excinfo:
             await client._with_retries(op)
         assert str(excinfo.value).count("has no path component") == 1
+
+
+class TestRedactUrlCredentials:
+    def test_no_userinfo_returned_unchanged(self):
+        assert (
+            _redact_url_credentials("http://host:8787/v1") == "http://host:8787/v1"
+        )
+
+    def test_userinfo_stripped_port_and_path_kept(self):
+        assert (
+            _redact_url_credentials("http://user:pass@host:8787/v1")
+            == "http://host:8787/v1"
+        )
+
+    def test_userinfo_without_port(self):
+        assert _redact_url_credentials("https://ak@kw.test") == "https://kw.test"
+
+    def test_last_at_sign_is_the_split_point(self):
+        # A userinfo may itself contain an encoded "@"; the hostinfo is
+        # everything after the LAST one.
+        assert (
+            _redact_url_credentials("http://u%40x:pass@host:8787")
+            == "http://host:8787"
+        )

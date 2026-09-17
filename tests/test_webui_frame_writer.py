@@ -255,12 +255,13 @@ class TestUnserializableFrameDrop:
         )
         assert frames[-1]["type"] == "complete"
 
-    def test_report_transcript_records_good_tool_and_skips_dropped_one(
+    def test_report_transcript_records_dropped_poison_and_good_tool(
         self, client, results_dir
     ):
-        """Transcript recording follows successful enqueue: the dropped
-        (unserializable) tool never lands in the report; the good one
-        does."""
+        """Transcript recording is unconditional: the dropped
+        (unserializable) tool STILL lands in the report in readable form
+        (the report render str()s what json cannot encode), and the good
+        one does too — in emission order."""
 
         class _ToolGraph:
             def get_state(self, config):
@@ -286,7 +287,11 @@ class TestUnserializableFrameDrop:
 
         report = client.get(report_url, headers=AUTH).text
         assert "good_tool" in report
-        assert "poison_tool" not in report
+        # The poison frame never reached the socket, but the transcript
+        # records it anyway — dropping it would also mis-stick the NEXT
+        # tool_result's content_length onto the previous tool entry.
+        assert "poison_tool" in report
+        assert report.index("poison_tool") < report.index("good_tool")
 
 
 class TestDedupGateWithSingleWriter:
@@ -433,10 +438,16 @@ class TestOutOfTurnCostScoping:
                     }
                 )
                 out_of_turn = None
-                while out_of_turn is None:
+                # Frame-count cap instead of an open-ended loop: if the
+                # adapter ever stops forwarding the frame, fail fast
+                # instead of parking on receive forever.
+                for _ in range(20):
                     frame = json.loads(ws.receive_text())
                     if frame["type"] == "cost_update":
                         out_of_turn = frame
+                        break
+                if out_of_turn is None:
+                    pytest.fail("no out-of-turn cost_update within 20 frames")
 
                 # Forwarded, but with session-scoped totals — never the
                 # emitter's 999.0 process-global numbers.
@@ -523,3 +534,64 @@ class TestSessionCostThreadSafety:
         last = cost_frames[-1]["data"]
         assert last["total_cost_usd"] == pytest.approx(total_emissions * 0.01)
         assert last["total_tokens"] == total_emissions
+
+
+class TestWriterFailureTeardown:
+    """A terminal frame whose send keeps failing must drive the handler
+    into its teardown path (connection closed) — never a hang."""
+
+    def test_terminal_frame_send_failure_tears_down_connection(
+        self, client, monkeypatch
+    ):
+        import threading
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        from clearwing.core.events import EventBus
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
+
+        # Since #45 every frame leaves via the single writer's send_text
+        # (pre-serialized JSON), so the dead transport is injected there:
+        # healthy until the flag flips, then every send raises — the
+        # "client vanished mid-session" shape.
+        real_send_text = FastAPIWebSocket.send_text
+        transport_dead = {"now": False}
+
+        async def dying_send_text(self_ws, data):
+            if transport_dead["now"]:
+                raise RuntimeError("client vanished mid-send")
+            return await real_send_text(self_ws, data)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", dying_send_text)
+
+        # Teardown runs bus.unsubscribe for every handler this connection
+        # registered. starlette's TestClient synthesizes no close frame
+        # when the handler merely returns, so the client socket cannot
+        # observe the teardown — but the handler firing unsubscribe while
+        # the client is still connected and idle proves it exited its
+        # loop on the failed terminal send instead of parking forever.
+        torn_down = threading.Event()
+        real_unsubscribe = EventBus.unsubscribe
+
+        def recording_unsubscribe(bus_self, event_type, handler):
+            real_unsubscribe(bus_self, event_type, handler)
+            torn_down.set()
+
+        monkeypatch.setattr(EventBus, "unsubscribe", recording_unsubscribe)
+
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "10.0.0.9"})
+            assert ws.receive_json()["type"] == "started"
+
+            # Kill the transport, then ask for a stop: its `stopped`
+            # terminal frame can never be delivered, and the flush
+            # handshake must resolve False (the pre-#45 single-strike
+            # signal) so the handler breaks out and tears down.
+            transport_dead["now"] = True
+            ws.send_json({"type": "stop"})
+
+            assert torn_down.wait(timeout=10), (
+                "handler must tear down when a terminal frame's send keeps "
+                "failing — not hang on a dead socket"
+            )

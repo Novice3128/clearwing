@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import jsonschema
@@ -170,10 +170,41 @@ def _url_for_path(base: str, path: str) -> str:
     the base (``http://h/v1`` and ``http://h/v1/`` both yield
     ``http://h/v1/chat/completions``). An empty *path* returns *base*
     unchanged, so callers passing a fully-resolved URL are inert.
+
+    A *base* carrying a query or fragment is NOT supported: the query is
+    not stripped and rides along verbatim (garbage in, garbage out).
     """
     if not path:
         return base
     return f"{base.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _is_pathless_base_url(base_url: str) -> bool:
+    """True when *base_url* carries no path component.
+
+    ``""``, ``"/"`` and ``"//"`` all count: a host followed by any number
+    of bare slashes still mounts endpoints at the host root.
+    """
+    return urlparse(base_url).path.strip("/") == ""
+
+
+def _redact_url_credentials(url: str) -> str:
+    """Display-only form of *url* with any ``user:pass@`` userinfo removed.
+
+    aiohttp honors userinfo in the request URL as HTTP basic auth, so the
+    real request path keeps the original *url* — this helper exists solely
+    for warnings and error messages, where embedded credentials must not
+    leak into logs. Query and fragment are dropped along the way; only
+    scheme/host/port/path are preserved for display.
+    """
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return url
+    if "@" not in parts.netloc:
+        return url
+    hostinfo = parts.netloc.rsplit("@", 1)[1]
+    return urlunparse((parts.scheme, hostinfo, parts.path, "", "", ""))
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -622,17 +653,18 @@ class AsyncLLMClient:
         # manager's default branch) funnels through this constructor — and
         # it is a warning only: a gateway genuinely mounted at the root
         # keeps working exactly as before. Other adapter families
-        # (openai_resp/openai_codex/ollama/gemini/anthropic*) resolve their
-        # own paths and are exempt (the ollama preset is pathless by
-        # design).
+        # (openai_resp/openai_codex/ollama/gemini/anthropic*) build their
+        # URLs the same base-plus-fixed-path way; they are exempt only
+        # because custom pathless gateway configs are rare there (the
+        # ollama preset is pathless by design).
         if (
             provider_name == "openai"
             and self.base_url
-            and urlparse(self.base_url).path in ("", "/")
+            and _is_pathless_base_url(self.base_url)
         ):
             logger.warning(
                 "base_url %r %s",
-                self.base_url,
+                _redact_url_credentials(self.base_url),
                 _PATHLESS_BASE_URL_ADVICE,
             )
 
@@ -2310,7 +2342,7 @@ class AsyncLLMClient:
         """
         if self.provider_name != "openai" or not self.base_url:
             return
-        if urlparse(self.base_url).path not in ("", "/"):
+        if not _is_pathless_base_url(self.base_url):
             return
         if not self._is_not_found_error(exc):
             return
@@ -2319,7 +2351,8 @@ class AsyncLLMClient:
             if _PATHLESS_BASE_URL_ADVICE in text:
                 return
             exc.args = (
-                f"{text} (base_url {self.base_url!r} {_PATHLESS_BASE_URL_ADVICE})",
+                f"{text} (base_url {_redact_url_credentials(self.base_url)!r} "
+                f"{_PATHLESS_BASE_URL_ADVICE})",
             )
         except Exception:
             logger.debug(
