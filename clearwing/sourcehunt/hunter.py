@@ -36,6 +36,7 @@ from clearwing.llm import (
     last_finish_reason,
 )
 from clearwing.llm.budget import spend_metadata
+from clearwing.observability.bookkeeping import book_llm_call, init_session_audit_logger
 from clearwing.observability.otel import get_oi_tracer
 from clearwing.observability.telemetry import CostTracker
 from clearwing.reporting.safety import redact_tree
@@ -1575,6 +1576,15 @@ class NativeHunter:
             initial_messages=messages,
             tools=self.tools,
         )
+        # Session audit trail (#61), same attribution source as the cost
+        # records below: the ambient session (operator job / webui turn
+        # that spawned this hunt) or the hunt's own sh-* execution id.
+        # Hunters run in-process (asyncio tasks), so the jsonl appends land
+        # in the same audit.jsonl the spawning session writes — AuditLogger
+        # serializes appends with its own lock.
+        audit_logger = init_session_audit_logger(
+            current_session_id() or self.ctx.session_id
+        )
         total_input_tokens = 0
         total_output_tokens = 0
         total_cost_usd = 0.0
@@ -1775,13 +1785,20 @@ class NativeHunter:
                         # aggregates under-counted vs cost.
                         total_input_tokens += s_in
                         total_output_tokens += s_out
-                        CostTracker().record_llm_call(
+                        # Single-entry bookkeeping (#61): priced AND audited
+                        # together, same attribution id as the main calls
+                        # below — the summary call used to reach the tracker
+                        # but never the audit trail.
+                        book_llm_call(
                             s_in,
                             s_out,
-                            self.llm.model_name,
+                            tracker=CostTracker(),
+                            model=self.llm.model_name,
                             cached_tokens=s_cached,
                             provider=getattr(self.llm, "provider_name", None),
                             session_id=current_session_id() or self.ctx.session_id,
+                            audit_logger=audit_logger,
+                            agent="hunter",
                         )
                     visible_read_ranges.clear()
                     overlapping_refreshes.clear()
@@ -1885,13 +1902,23 @@ class NativeHunter:
             # session happens to have an active turn. The sh-* id still keys
             # outputs/execution semantics; only billing attribution changes.
             if input_tokens or output_tokens:
-                CostTracker().record_llm_call(
+                # Single-entry bookkeeping (#61): tracker + audit row move
+                # together. Pricing keeps the configured model (current
+                # hunter attribution); the audit row prefers the served
+                # model echo for forensics, mirroring the runtime's
+                # effective_model.
+                book_llm_call(
                     input_tokens,
                     output_tokens,
-                    self.llm.model_name,
+                    tracker=CostTracker(),
+                    model=self.llm.model_name,
+                    audit_model=getattr(response, "provider_model_name", None)
+                    or self.llm.model_name,
                     cached_tokens=cached_tokens,
                     provider=provider_name,
                     session_id=current_session_id() or self.ctx.session_id,
+                    audit_logger=audit_logger,
+                    agent="hunter",
                 )
 
             last_assistant_text = response.first_text or ""

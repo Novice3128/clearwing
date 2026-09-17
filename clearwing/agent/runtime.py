@@ -24,10 +24,10 @@ from clearwing.llm.messages import (
     _coerce_chat_messages,
 )
 from clearwing.llm.native import NativeToolSpec, response_text
+from clearwing.observability.bookkeeping import book_llm_call, init_session_audit_logger
 from clearwing.observability.otel import get_oi_tracer
 from clearwing.observability.telemetry import CostTracker
 from clearwing.providers.binding import AgentLimits
-from clearwing.safety.audit import AuditLogger
 from clearwing.safety.guardrails import InputGuardrail, OutputGuardrail
 
 from .protocols import KnowledgeGraphPopulator, LLMInvokable, StateUpdater, SystemPromptFactory
@@ -330,12 +330,7 @@ class NativeAgentGraph:
             if enable_output_guardrail and capabilities.has("guardrails")
             else None
         )
-        self.audit_logger = None
-        if enable_audit and capabilities.has("audit") and session_id:
-            try:
-                self.audit_logger = AuditLogger(session_id)
-            except Exception:
-                logger.warning("Failed to initialize AuditLogger", exc_info=True)
+        self.audit_logger = init_session_audit_logger(session_id) if enable_audit else None
 
         self.knowledge_graph = None
         if enable_knowledge_graph and capabilities.has("knowledge"):
@@ -616,26 +611,34 @@ class NativeAgentGraph:
                         s_input = int(summary_usage.get("input_tokens") or 0)
                         s_output = int(summary_usage.get("output_tokens") or 0)
                         s_cached = int(summary_usage.get("cached_tokens") or 0)
-                        summary_cost = 0.0
-                        if self.cost_tracker:
-                            summary_cost = self.cost_tracker.record_llm_call(
-                                s_input,
-                                s_output,
-                                # Same pricing attribution as the main loop:
-                                # the member that actually served the call
-                                # (a FallbackChain records it), else the
-                                # client's resolved model, else the graph's
-                                # label (Codex PR-55 r3 — summary tokens used
-                                # to be priced as the primary provider even
-                                # when a fallback served them).
-                                getattr(self.llm, "served_model_name", None)
-                                or getattr(self.llm, "model_name", None)
-                                or self.model_name,
-                                cached_tokens=s_cached,
-                                provider=getattr(self.llm, "served_provider_name", None)
-                                or getattr(self.llm, "provider_name", None),
-                                session_id=self.session_id,
-                            )
+                        # Same pricing attribution as the main loop: the
+                        # member that actually served the call (a
+                        # FallbackChain records it), else the client's
+                        # resolved model, else the graph's label (Codex
+                        # PR-55 r3 — summary tokens used to be priced as the
+                        # primary provider even when a fallback served them).
+                        # Bookkeeping is single-entry (#61): the tracker
+                        # record and the audit row move together — the
+                        # summarizer call used to be priced but never
+                        # audited (session 61279304's 0.16% reconciliation
+                        # gap was exactly one such call).
+                        summary_model = (
+                            getattr(self.llm, "served_model_name", None)
+                            or getattr(self.llm, "model_name", None)
+                            or self.model_name
+                        )
+                        summary_cost = book_llm_call(
+                            s_input,
+                            s_output,
+                            tracker=self.cost_tracker,
+                            model=summary_model,
+                            cached_tokens=s_cached,
+                            provider=getattr(self.llm, "served_provider_name", None)
+                            or getattr(self.llm, "provider_name", None),
+                            session_id=self.session_id,
+                            audit_logger=self.audit_logger,
+                            agent="summarizer",
+                        )
                         totals = self._cost_totals_for(self._thread_for_state(state))
                         totals["cost_usd"] += summary_cost
                         totals["input_tokens"] += s_input
@@ -765,16 +768,23 @@ class NativeAgentGraph:
         state.setdefault("messages", []).append(ai_message)
 
         if input_tokens or output_tokens:
-            call_cost = 0.0
-            if self.cost_tracker:
-                call_cost = self.cost_tracker.record_llm_call(
-                    input_tokens,
-                    output_tokens,
-                    pricing_model,
-                    cached_tokens=cached_tokens,
-                    provider=provider_name,
-                    session_id=self.session_id,
-                )
+            # Single-entry bookkeeping (#61): the tracker record and the
+            # audit row are written together — per-call cost, never the
+            # graph's running total (the cumulative value double-counts
+            # when audit rows are summed per session, issue #10 live
+            # evidence). Pricing normalizes to pricing_model while the
+            # audit row keeps the served/configured effective_model.
+            call_cost = book_llm_call(
+                input_tokens,
+                output_tokens,
+                tracker=self.cost_tracker,
+                model=pricing_model,
+                audit_model=effective_model,
+                cached_tokens=cached_tokens,
+                provider=provider_name,
+                session_id=self.session_id,
+                audit_logger=self.audit_logger,
+            )
             # Instance totals (issues #37/#52): state must report THIS
             # thread's spend on this graph — not the tracker's cross-session
             # running total, and not the other threads sharing the graph.
@@ -784,17 +794,6 @@ class NativeAgentGraph:
             totals["output_tokens"] += output_tokens
             state["total_cost_usd"] = totals["cost_usd"]
             state["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
-            if self.audit_logger and self.cost_tracker:
-                # Per-call cost, not the graph's running total: the
-                # cumulative value double-counts when audit rows are
-                # summed per session (issue #10 live evidence).
-                self.audit_logger.log_llm_call(
-                    model=effective_model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cost_usd=call_cost,
-                    cached_tokens=cached_tokens,
-                )
 
         if self.event_bus:
             # A 200-char PREVIEW tag: the webui dedups its turn-end inline

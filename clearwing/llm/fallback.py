@@ -21,8 +21,15 @@ Semantics:
 - Each client keeps its OWN retry policy (rate-limit backoff, timeout
   caps, per-attempt spend reservations). The chain only intervenes after
   a client's retries are exhausted or it failed non-retryably.
+- Cooldown/stickiness (issue #57): a member whose dispatch failed at chain
+  level is skipped for 60s × 2^(consecutive-cooldowns − 1) (max 600s; a
+  parsed Retry-After extends the window, capped at 300s). Cooldown expiry
+  restores eligibility (half-open); a success resets the streak; when
+  every member is cooling the chain fails open to the normal order
+  instead of erroring with no candidates.
 - Cancellation is never failover: ``asyncio.CancelledError`` /
-  ``KeyboardInterrupt`` (BaseException) propagate immediately.
+  ``KeyboardInterrupt`` (BaseException) propagate immediately (and never
+  start a cooldown).
 - Spend-ledger safety: a chain is inert while any member client runs an
   ENFORCING spend ledger — a fallback dispatch would bill a reservation
   the ledger never sees (its pricing was validated for the primary
@@ -41,6 +48,7 @@ switches after a serving provider fails mid-session.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -59,8 +67,27 @@ from clearwing.llm.native import (  # noqa: E402
     _validate_schema_response,
     extract_json_array,
     extract_json_object,
+    parse_retry_after_seconds,
     response_text,
 )
+
+# --- Member cooldown (issue #57) ---------------------------------------------
+#
+# Design calibrated against known-good agent stacks: openai/codex keeps a
+# session-scoped failure flag so a failed provider stops being re-tried
+# first on every request (codex-rs/core/src/responses_retry.rs), and
+# LiteLLM cools a failing deployment over DEFAULT_COOLDOWN_TIME_SECONDS
+# (= 60s) with exponential growth (litellm/router_utils/cooldown_handler).
+# Without it, a persistently-5xx primary re-charges its FULL retry budget
+# on every turn before the chain switches — exactly the stall the chain
+# exists to prevent.
+
+_COOLDOWN_BASE_SECONDS: float = 60.0
+_COOLDOWN_MAX_SECONDS: float = 600.0
+# A Retry-After hint parsed from the failing member's exception may extend
+# the window beyond the exponential schedule, but the shared parser caps
+# parsed hints at 300s (native._RETRY_AFTER_MAX_SECONDS).
+_COOLDOWN_RETRY_AFTER_MAX_SECONDS: float = 300.0
 
 
 class FallbackChain:
@@ -103,6 +130,13 @@ class FallbackChain:
         # adapter label (e.g. two openai_compat endpoints) — this flag can.
         self.served_by_primary: bool = True
         self._retry_notice: Callable[[str], None] | None = None
+        # Per-member cooldown state (issue #57), keyed by id(client): the
+        # chain holds strong references to every member for its whole
+        # lifetime, so ids cannot be recycled while the state is live.
+        # ``_cooldown_until`` is a time.monotonic() deadline; the streak
+        # counts CONSECUTIVE cooldowns and only a success resets it.
+        self._cooldown_until: dict[int, float] = {}
+        self._cooldown_streak: dict[int, int] = {}
 
     # -- AsyncLLMClient-compatible surface --------------------------------
 
@@ -163,6 +197,91 @@ class FallbackChain:
         self.served_model_name = getattr(client, "model_name", None)
         self.served_provider_name = getattr(client, "provider_name", None)
         self.served_by_primary = client is self.primary
+        # A success proves the member healthy again — its cooldown streak
+        # resets to zero (issue #57 half-open recovery).
+        self._clear_cooldown(client)
+
+    # -- Cooldown bookkeeping (issue #57) ---------------------------------
+
+    def _cooldown_remaining(self, client: AsyncLLMClient) -> float:
+        """Seconds left in *client*'s cooldown (0.0 when eligible).
+
+        Expiry alone restores eligibility (half-open): the next request
+        retries the member naturally, and only a success clears the streak
+        that sizes the next window.
+        """
+        until = self._cooldown_until.get(id(client))
+        if until is None:
+            return 0.0
+        remaining = until - time.monotonic()
+        return remaining if remaining > 0.0 else 0.0
+
+    def _start_cooldown(self, client: AsyncLLMClient, exc: Exception) -> None:
+        """Cool *client* after a chain-level failure (its dispatch raised).
+
+        Window = 60s × 2^(streak-1), capped at 600s. A Retry-After hint
+        parsed from the member's exception (shared parser, capped at 300s)
+        EXTENDS the window when larger — the provider knows its own load.
+        Consecutive cooldowns accumulate: recovering, failing again doubles
+        the window; only a success resets the streak.
+        """
+        if len(self.clients) < 2:
+            # Single-member chains (spend-ledger collapse, dropped
+            # fallbacks) have nothing to skip: the chain does not act.
+            return
+        streak = self._cooldown_streak.get(id(client), 0) + 1
+        self._cooldown_streak[id(client)] = streak
+        window = min(_COOLDOWN_BASE_SECONDS * (2 ** (streak - 1)), _COOLDOWN_MAX_SECONDS)
+        retry_after = parse_retry_after_seconds(
+            exc, max_seconds=_COOLDOWN_RETRY_AFTER_MAX_SECONDS
+        )
+        if retry_after is not None:
+            window = max(window, retry_after)
+        self._cooldown_until[id(client)] = time.monotonic() + window
+        logger.info(
+            "LLM provider %s/%s entering cooldown for %.0fs (consecutive cooldowns: %d)",
+            getattr(client, "provider_name", "?"),
+            getattr(client, "model_name", "?"),
+            window,
+            streak,
+        )
+
+    def _clear_cooldown(self, client: AsyncLLMClient) -> None:
+        self._cooldown_until.pop(id(client), None)
+        self._cooldown_streak.pop(id(client), None)
+
+    def _dispatch_order(self) -> tuple[list[AsyncLLMClient], list[AsyncLLMClient], bool]:
+        """Members to dispatch over, in order, plus the cooling ones skipped.
+
+        Returns ``(order, skipped, fail_open)``. Cooling members are
+        skipped so a persistently-failing primary stops re-charging its
+        retry budget on every call — unless EVERY member is cooling, in
+        which case the chain fails open to the normal order (never an
+        empty-candidates error).
+        """
+        clients = self.clients
+        order = [client for client in clients if self._cooldown_remaining(client) <= 0.0]
+        skipped = [client for client in clients if self._cooldown_remaining(client) > 0.0]
+        if order:
+            return order, skipped, False
+        longest = max((self._cooldown_remaining(c) for c in clients), default=0.0)
+        self._notify(
+            f"all llm fallback members cooling (longest {longest:.0f}s remaining); "
+            "failing open to the normal dispatch order"
+        )
+        return clients, [], True
+
+    def _notify_skips(self, skipped: Sequence[AsyncLLMClient], first: AsyncLLMClient) -> None:
+        if first is None:  # pragma: no cover - order always has the primary
+            return
+        for client in skipped:
+            self._notify(
+                f"llm provider {getattr(client, 'provider_name', '?')}/"
+                f"{getattr(client, 'model_name', '?')} skipping "
+                f"(cooldown {self._cooldown_remaining(client):.0f}s remaining), "
+                f"dispatching to {getattr(first, 'provider_name', '?')}/"
+                f"{getattr(first, 'model_name', '?')}"
+            )
 
     @property
     def spend_ledger(self):
@@ -192,7 +311,11 @@ class FallbackChain:
         returned response (and therefore graph state) instead of being
         concatenated onto the abandoned partial output.
         """
-        clients = self.clients
+        # Cooldown-aware dispatch order (issue #57): cooling members are
+        # skipped (with a notice); all-cooling fails open to normal order.
+        clients, skipped, _fail_open = self._dispatch_order()
+        if skipped:
+            self._notify_skips(skipped, clients[0])
         last_exc: Exception | None = None
         deltas_emitted = False
         original_callback = kwargs.get("on_text_delta")
@@ -233,6 +356,14 @@ class FallbackChain:
                 # Cancellation must never fail over (BaseException is not
                 # caught); only genuine provider failures move the chain.
                 last_exc = exc
+                # The member exhausted its OWN retry policy and failed at
+                # chain level — cool it (issue #57) so the next call skips
+                # it instead of re-paying that budget. This includes the
+                # final member whose failure re-raises: otherwise a total
+                # outage could never reach the all-cooling state that the
+                # fail-open path below resolves. Cancellation never reaches
+                # here (BaseException).
+                self._start_cooldown(client, exc)
                 if index + 1 >= len(clients):
                     raise
                 notice = (
@@ -257,7 +388,10 @@ class FallbackChain:
 
     async def achat(self, **kwargs: Any):
         """Non-streaming dispatch through the chain."""
-        clients = self.clients
+        # Cooldown-aware dispatch order (issue #57), same as achat_stream.
+        clients, skipped, _fail_open = self._dispatch_order()
+        if skipped:
+            self._notify_skips(skipped, clients[0])
         last_exc: Exception | None = None
         for index, client in enumerate(clients):
             try:
@@ -266,6 +400,9 @@ class FallbackChain:
                 return response
             except Exception as exc:
                 last_exc = exc
+                # Chain-level failure → cooldown (issue #57), including the
+                # final re-raise (mirrors achat_stream's rule).
+                self._start_cooldown(client, exc)
                 if index + 1 >= len(clients):
                     raise
                 self._notify(
