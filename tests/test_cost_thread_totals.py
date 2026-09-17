@@ -151,8 +151,6 @@ class TestThreadLookupMechanics:
     def test_assistant_step_keeps_its_tracer_span(self):
         """The cost-bucket helper must not steal the @tracer.chain
         decorator from _aassistant_step (Codex PR-55 r4)."""
-        import inspect
-
         from clearwing.agent.runtime import NativeAgentGraph
 
         step = NativeAgentGraph._aassistant_step
