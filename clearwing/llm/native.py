@@ -1171,14 +1171,46 @@ class AsyncLLMClient:
                         # Route it through _with_retries so the fallback
                         # transport gets its own fresh per-attempt budget
                         # (and per-attempt reservations).
-                        response = await self._with_retries(
-                            lambda: self._openai_chat_http_fallback(
+                        #
+                        # Delta policy (Codex PR-56 r1): the first fallback
+                        # attempt streams live; if it emits partial text and
+                        # then fails retryably, later attempts' deltas are
+                        # SUPPRESSED (never concatenated onto the abandoned
+                        # prefix) and the complete answer is emitted once on
+                        # success — delta-only consumers (the interactive
+                        # CLI) otherwise displayed two merged answers.
+                        fallback_delta_state = {"emitted": False, "suppressed": False}
+
+                        def _counting_fallback_delta(text: str) -> None:
+                            fallback_delta_state["emitted"] = True
+                            if on_text_delta is not None:
+                                on_text_delta(text)
+
+                        async def _fallback_attempt():
+                            if fallback_delta_state["emitted"]:
+                                fallback_delta_state["suppressed"] = True
+                                callback = None
+                            else:
+                                callback = _counting_fallback_delta
+                            return await self._openai_chat_http_fallback(
                                 request,
                                 options,
-                                on_text_delta=on_text_delta,
-                            ),
-                            reserve=_reserve,
+                                on_text_delta=callback,
+                            )
+
+                        response = await self._with_retries(
+                            _fallback_attempt, reserve=_reserve
                         )
+                        if (
+                            fallback_delta_state["suppressed"]
+                            and on_text_delta is not None
+                        ):
+                            try:
+                                complete_text = response_text(response)
+                            except Exception:
+                                complete_text = ""
+                            if complete_text:
+                                on_text_delta(complete_text)
                     else:
                         raise
                 if response is None:

@@ -1110,7 +1110,10 @@ def create_app():
                                 "Failed to retire prior session cost entry",
                                 exc_info=True,
                             )
-                    connection_session_ids.clear()
+                    # The minted-id history is append-only (Codex PR-56 r1):
+                    # an uncancellable worker may still book under a retired
+                    # id after this point, and teardown must be able to
+                    # reclaim it — forgetting again is an idempotent pop.
                     session_id = uuid.uuid4().hex[:8]
                     connection_session_ids.append(session_id)
                     # A start frame begins a new session on this connection:

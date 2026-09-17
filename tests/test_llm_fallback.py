@@ -619,3 +619,72 @@ class TestHttpFallbackRetryBudget:
         assert response.usage.prompt_tokens == 1
         assert attempts["native"] == 1
         assert attempts["fallback"] == 2  # first flaky try retried, second ok
+
+
+class TestHttpFallbackDeltaPolicy:
+    """Codex PR-56 r1: a retrying HTTP fallback attempt that already emitted
+    partial text must not concatenate a second answer into the live stream."""
+
+    def test_failed_attempt_deltas_are_suppressed_and_answer_emitted_once(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from genai_pyo3 import ChatMessage
+
+        client = _client(rate_limit_max_retries=2)
+        emitted: list[str] = []
+
+        class _BrokenStreamClient:
+            async def astream_chat(self, *a, **k):
+                async def _gen():
+                    raise RuntimeError("Web stream error: error sending request")
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        class _Response:
+            first_text = "complete answer"
+            texts = ["complete answer"]
+            usage = SimpleNamespace(
+                prompt_tokens=1,
+                completion_tokens=2,
+                prompt_tokens_details=None,
+                total_tokens=3,
+            )
+            tool_calls = []
+
+        calls = {"n": 0}
+
+        async def _flaky_fallback(*a, **kwargs):
+            calls["n"] += 1
+            callback = kwargs.get("on_text_delta")
+            if calls["n"] == 1:
+                if callback is not None:
+                    callback("abandoned partial")
+                raise RuntimeError("server disconnected")  # retryable
+            # Attempt 2 must receive NO callback (suppressed) and succeed.
+            assert callback is None
+            return _Response()
+
+        from unittest.mock import patch as _upatch
+
+        def _build_client(_factory):
+            return _BrokenStreamClient()
+
+        with (
+            _upatch.object(client, "_build_client", _build_client),
+            _upatch.object(client, "_openai_chat_http_fallback", _flaky_fallback),
+            _upatch("clearwing.llm.native.asyncio.sleep", new=_no_sleep),
+        ):
+            response = asyncio.run(
+                client.achat_stream(
+                    messages=[ChatMessage("user", "x")],
+                    system="s",
+                    on_text_delta=emitted.append,
+                )
+            )
+
+        assert response.first_text == "complete answer"
+        # Live: the abandoned partial; then the COMPLETE answer exactly
+        # once — never attempt 2's per-token deltas.
+        assert emitted == ["abandoned partial", "complete answer"]
