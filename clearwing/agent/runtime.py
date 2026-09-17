@@ -597,12 +597,18 @@ class NativeAgentGraph:
                                 s_input,
                                 s_output,
                                 # Same pricing attribution as the main loop:
-                                # the client's resolved model, else the
-                                # graph's label.
-                                getattr(self.llm, "model_name", None)
+                                # the member that actually served the call
+                                # (a FallbackChain records it), else the
+                                # client's resolved model, else the graph's
+                                # label (Codex PR-55 r3 — summary tokens used
+                                # to be priced as the primary provider even
+                                # when a fallback served them).
+                                getattr(self.llm, "served_model_name", None)
+                                or getattr(self.llm, "model_name", None)
                                 or self.model_name,
                                 cached_tokens=s_cached,
-                                provider=getattr(self.llm, "provider_name", None),
+                                provider=getattr(self.llm, "served_provider_name", None)
+                                or getattr(self.llm, "provider_name", None),
                                 session_id=self.session_id,
                             )
                         self._cost_totals["cost_usd"] += summary_cost

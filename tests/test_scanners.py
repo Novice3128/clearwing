@@ -1235,3 +1235,177 @@ class TestDatabasePortsPersistence:
             ).fetchall()
         assert len(rows) == 2
         assert {r[1] for r in rows} == {"CVE-2015-3306"}
+
+
+class TestCodexRound3Findings:
+    """Regressions for the Codex PR-55 third-round findings."""
+
+    @pytest.fixture
+    def scanner(self):
+        return VulnerabilityScanner()
+
+    @pytest.mark.asyncio
+    async def test_evidence_upgrade_moves_the_compat_port(self, scanner):
+        """P1: a CVE first seen as a keyword candidate on one port and then
+        version-verified on another must point its compat port/service at
+        the VERIFIED endpoint — exploit selection consumes those fields."""
+        services = [
+            # Port 80: no banner → no identity → keyword-candidate only.
+            {"port": 80, "service": "HTTP", "banner": "", "version": None},
+            # Port 8080: real Apache banner → version-verified.
+            {"port": 8080, "service": "HTTP", "banner": "Apache/2.4.49", "version": ""},
+        ]
+
+        call_count = {"n": 0}
+
+        async def _fake_query(service, identity=None):
+            call_count["n"] += 1
+            if identity is None:
+                return [
+                    {
+                        "cve": "CVE-2021-41773",
+                        "description": "keyword hit",
+                        "cvss": 9.8,
+                        "references": [],
+                        "match_quality": "keyword-candidate",
+                    }
+                ]
+            return []
+
+        scanner._query_nvd = _fake_query
+        result = await scanner.scan("127.0.0.1", services)
+
+        entry = next(v for v in result if v["cve"] == "CVE-2021-41773")
+        assert entry["match_quality"] == "version-verified"
+        # The verified endpoint owns the compat fields; the weak one stays
+        # only in the plural scope lists.
+        assert entry["port"] == 8080
+        assert entry["service"] == "HTTP"
+        assert set(entry["ports"]) == {80, 8080}
+
+
+class TestDatabaseCandidateAndExploitScope:
+    """Codex PR-55 r3: history keeps findings only, and one exploit attempt
+    is not copied onto untested ports."""
+
+    def _result(self):
+        from clearwing.core.engine import ScanResult
+
+        result = ScanResult(target="127.0.0.1")
+        result.open_ports = [
+            {"port": 21, "protocol": "tcp", "state": "open", "service": "FTP"},
+            {"port": 2121, "protocol": "tcp", "state": "open", "service": "FTP"},
+        ]
+        result.vulnerabilities = [
+            {
+                "cve": "CVE-2015-3306",
+                "description": "ProFTPD mod_copy",
+                "cvss": 9.8,
+                "port": 21,
+                "ports": [21, 2121],
+                "service": "FTP",
+                "services": ["FTP"],
+                "match_quality": "version-verified",
+            },
+            {
+                "cve": "CVE-2020-9999",
+                "description": "unverified keyword lead",
+                "cvss": 5.0,
+                "port": 21,
+                "ports": [21],
+                "service": "FTP",
+                "match_quality": "keyword-candidate",
+            },
+        ]
+        result.exploits = [{"cve": "CVE-2015-3306", "success": True}]
+        return result
+
+    def test_candidates_are_not_persisted_and_exploits_are_port_scoped(self, tmp_path):
+        from clearwing.data.database.models import Database
+
+        db = Database(str(tmp_path / "scan.db"))
+        db.save_scan_result(self._result())
+
+        with sqlite3.connect(db.db_path) as conn:
+            vulns = conn.execute("SELECT port_id, cve_id FROM vulnerabilities").fetchall()
+            exploits = conn.execute("SELECT vuln_id, name FROM exploits").fetchall()
+            ports = conn.execute("SELECT id, port FROM ports ORDER BY port").fetchall()
+
+        cves = [v[1] for v in vulns]
+        assert "CVE-2020-9999" not in cves  # unverified lead: never history
+        assert cves.count("CVE-2015-3306") == 2  # both affected ports
+
+        # The exploit was attempted once (port 21) → exactly one row, on
+        # that port's vulnerability, not one per affected port.
+        assert len(exploits) == 1
+        port_by_id = {pid: port for pid, port in ports}
+        vuln_port = {v[0]: port_by_id[v[0]] for v in vulns}
+        assert vuln_port[exploits[0][0]] == 21
+
+
+class TestFallbackGateBlankFields:
+    """Codex PR-55 r3: blank credential fields are UNSET downstream, so they
+    must not disable the configured fallback chain."""
+
+    def test_whitespace_only_fields_still_allow_the_chain(self, monkeypatch):
+        from clearwing.agent import graph as graph_module
+        from clearwing.providers.env import LLMEndpoint
+
+        backup = type("B", (), {"model_name": "backup", "provider_name": "openai"})()
+
+        class _FakeManager:
+            @staticmethod
+            def for_endpoint(endpoint):
+                return type(
+                    "M", (), {"get_native_client": staticmethod(lambda task: backup)}
+                )()
+
+        monkeypatch.setattr(graph_module, "ProviderManager", _FakeManager)
+        monkeypatch.setattr(
+            graph_module,
+            "resolve_fallback_endpoints",
+            lambda config_provider=None: [
+                LLMEndpoint(
+                    provider="openai_compat",
+                    model="backup",
+                    base_url="https://backup.test/v1",
+                ),
+            ],
+        )
+        primary = type("P", (), {"model_name": "primary", "provider_name": "openai"})()
+
+        chain = graph_module._maybe_wrap_fallback_chain(
+            primary, cli_base_url="   ", cli_api_key="  "
+        )
+        from clearwing.llm.fallback import FallbackChain
+
+        assert isinstance(chain, FallbackChain)
+
+    def test_newline_terminated_scope_falls_back_to_adhoc(self, monkeypatch, tmp_path):
+        from clearwing.agent.tools.ops import kali_docker_tool
+
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path))
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.images.get = MagicMock()
+        captured = {}
+
+        def _run(*args, **kwargs):
+            captured.update(kwargs)
+            container = MagicMock()
+            container.id = "id"
+            container.short_id = "short"
+            return container
+
+        client.containers.get = MagicMock(side_effect=__import__("docker").errors.NotFound("x"))
+        client.containers.run = _run
+        monkeypatch.setattr("docker.from_env", lambda: client)
+
+        from clearwing.agent.tooling import session_scope
+
+        with session_scope("tampered\n"):
+            result = kali_docker_tool.kali_setup()
+
+        assert captured["name"] == "clearwing-kali"
+        assert result["artifacts_dir"] == str(tmp_path / "kali" / "adhoc" / "artifacts")

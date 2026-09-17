@@ -13,7 +13,11 @@ from clearwing.llm.fallback import FallbackChain
 from clearwing.llm.native import AsyncLLMClient
 from clearwing.providers import ProviderManager, resolve_llm_endpoint
 from clearwing.providers.binding import AgentLimits
-from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL, resolve_fallback_endpoints
+from clearwing.providers.env import (
+    DEFAULT_ANTHROPIC_MODEL,
+    _clean_field,
+    resolve_fallback_endpoints,
+)
 
 from .prompts import build_dynamic_context, build_system_prompt
 from .tools import get_all_tools, get_custom_tools
@@ -151,10 +155,14 @@ def _maybe_wrap_fallback_chain(
     re-routed to a different provider. Env/config-tier deployments (the
     compose stack) keep the chain.
 
+    The gate applies the same blank-field normalization as endpoint
+    resolution (Codex PR-55 r3): a whitespace-only field is UNSET there, so
+    it must not silently disable the configured chain here.
+
     Failures building an individual fallback client only drop that entry;
     the primary alone is still a valid (chain-less) result.
     """
-    if cli_base_url or cli_api_key:
+    if _clean_field(cli_base_url) or _clean_field(cli_api_key):
         return primary
     endpoints = resolve_fallback_endpoints()
     if not endpoints:

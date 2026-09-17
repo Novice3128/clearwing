@@ -8,6 +8,23 @@ from jinja2 import Environment, FileSystemLoader
 from .safety import markdown_inline, markdown_table_cell, redact_text, redact_tree
 
 
+def _scope_label(vuln: dict) -> str:
+    """Render every affected endpoint of a deduplicated CVE (issue #15).
+
+    The scanner collapses one CVE across ports into a single entry whose
+    `ports`/`services` lists carry the full scope; rendering only the
+    compatibility `service` field hid every additional affected endpoint
+    (Codex PR-55 r3).
+    """
+    services = vuln.get("services") or ([vuln.get("service")] if vuln.get("service") else [])
+    ports = vuln.get("ports") or ([vuln.get("port")] if vuln.get("port") else [])
+    ports_text = ", ".join(str(p) for p in ports if p is not None)
+    services_text = ", ".join(str(s) for s in services if s)
+    if services_text and ports_text:
+        return f"{services_text} (ports {ports_text})"
+    return services_text or ports_text or "N/A"
+
+
 class ReportGenerator:
     """Report generation module supporting multiple formats."""
 
@@ -283,7 +300,7 @@ class ReportGenerator:
                 "        <tr>"
                 f"<td>{html_escape(str(vuln.get('cve', 'N/A')))}</td>"
                 f"<td>{html_escape(str(vuln.get('description', 'N/A')))}</td>"
-                f"<td>{html_escape(str(vuln.get('service', 'N/A')))}</td>"
+                f"<td>{html_escape(_scope_label(vuln))}</td>"
                 f"<td>{html_escape(str(vuln.get('cvss', 'N/A')))}</td>"
                 "</tr>\n"
             )
@@ -362,7 +379,7 @@ class ReportGenerator:
             md += (
                 f"| {markdown_table_cell(vuln.get('cve', 'N/A'))} "
                 f"| {markdown_table_cell(vuln.get('description', 'N/A'))} "
-                f"| {markdown_table_cell(vuln.get('service', 'N/A'))} "
+                f"| {markdown_table_cell(_scope_label(vuln))} "
                 f"| {markdown_table_cell(vuln.get('cvss', 'N/A'))} |\n"
             )
 

@@ -24,9 +24,11 @@ def _kali_scope(session_id: str | None) -> str:
     collide on both the container name and the artifacts dir. Containers
     are named per session so one session's installed tools and artifacts
     never bleed into another's; session-less callers (CLI scripts) share
-    the legacy ``adhoc`` scope.
+    the legacy ``adhoc`` scope. fullmatch (not match+``$``) so a
+    newline-terminated id cannot slip through into a host path and the
+    Docker container name (Codex PR-55 r3).
     """
-    if session_id and _SCOPE_PATTERN.match(session_id):
+    if session_id and _SCOPE_PATTERN.fullmatch(session_id):
         return session_id
     return "adhoc"
 
