@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
@@ -48,6 +49,15 @@ _FAILURE_MARKERS = (
     "unauthorized",
     "permission denied",
     "operation not permitted",
+)
+
+# The thread_id of the agent loop currently executing in this task/thread
+# (issue #52). _arun_loop sets it so downstream bookkeeping (_aassistant_step
+# cost attribution) can key per-thread without threading the id through
+# every signature; None outside a running loop (callers fall back to a
+# shared "default" bucket, matching the pre-#52 single-bucket behavior).
+_current_thread_id: ContextVar[str | None] = ContextVar(
+    "clearwing_agent_thread_id", default=None
 )
 
 
@@ -272,16 +282,17 @@ class NativeAgentGraph:
         # _merge_input copies arbitrary input keys into state, so a state
         # key could be clobbered to re-grant the budget (issue #23).
         self._loop_counters: dict[str, dict[str, int]] = {}
-        # Per-graph cost/token accumulation (issue #37). The CostTracker is
-        # a process-wide singleton, so its running totals pool EVERY session
-        # and operator job in the process — writing them into state made
-        # each job report the cross-job total. Accumulate on the instance
-        # instead (like _loop_counters, deliberately NOT state: _merge_input
-        # copies arbitrary input keys into state): webui graphs live one per
-        # session, operator jobs build one graph per job, so instance totals
-        # are per-session/per-job by construction. The global tracker stays
-        # for process-level observation only.
-        self._cost_totals: dict[str, float] = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+        # Per-graph, per-THREAD cost/token accumulation (issues #37/#52).
+        # The CostTracker is a process-wide singleton, so its running totals
+        # pool EVERY session and operator job in the process — writing them
+        # into state made each job report the cross-job total. Accumulate on
+        # the instance instead (like _loop_counters, deliberately NOT state:
+        # _merge_input copies arbitrary input keys into state). #52: one
+        # graph CAN serve several thread_ids, so the totals key by the
+        # running loop's thread (see _current_thread_id) — thread A's spend
+        # must never write into thread B's state, in either direction. The
+        # global tracker stays for process-level observation only.
+        self._cost_totals: dict[str, dict[str, float]] = {}
 
         self.cost_tracker = (
             CostTracker() if enable_cost_tracker and capabilities.has("telemetry") else None
@@ -479,6 +490,11 @@ class NativeAgentGraph:
             yield event
 
     async def _arun_loop(self, thread_id: str):
+        # Key the loop's thread for per-thread cost bookkeeping (issue #52).
+        # Set (not set+reset): sequential loops on the same task each stamp
+        # their own id before any booking can happen, and the value is only
+        # ever read while this loop is awaiting.
+        _current_thread_id.set(thread_id)
         state = self._get_or_create_state(thread_id)
         limits = self.agent_limits
         max_steps = limits.max_steps if limits else None
@@ -547,6 +563,19 @@ class NativeAgentGraph:
                 break
 
     @tracer.chain(name="agent.assistant_step")
+    def _cost_totals_for(self, thread_id: str | None) -> dict[str, float]:
+        """Per-thread cost/token bucket (issues #37/#52).
+
+        One graph can serve several thread_ids; booking into a shared bucket
+        made thread A's spend land in thread B's state (and vice versa).
+        Calls outside a running loop (None) share the legacy "default"
+        bucket so direct step invocations keep pre-#52 behavior.
+        """
+        return self._cost_totals.setdefault(
+            thread_id or "default",
+            {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
+        )
+
     async def _aassistant_step(self, state: dict[str, Any]) -> dict[str, Any]:
         messages = list(state.get("messages", []))
         if self.context_summarizer:
@@ -611,14 +640,12 @@ class NativeAgentGraph:
                                 or getattr(self.llm, "provider_name", None),
                                 session_id=self.session_id,
                             )
-                        self._cost_totals["cost_usd"] += summary_cost
-                        self._cost_totals["input_tokens"] += s_input
-                        self._cost_totals["output_tokens"] += s_output
-                        state["total_cost_usd"] = self._cost_totals["cost_usd"]
-                        state["total_tokens"] = (
-                            self._cost_totals["input_tokens"]
-                            + self._cost_totals["output_tokens"]
-                        )
+                        totals = self._cost_totals_for(_current_thread_id.get())
+                        totals["cost_usd"] += summary_cost
+                        totals["input_tokens"] += s_input
+                        totals["output_tokens"] += s_output
+                        state["total_cost_usd"] = totals["cost_usd"]
+                        state["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
                     if self.event_bus and len(result["view"]) < pre_compaction:
                         # Only announce ACTUAL compaction: when nothing was
                         # newly coverable the view is unchanged and a
@@ -752,15 +779,15 @@ class NativeAgentGraph:
                     provider=provider_name,
                     session_id=self.session_id,
                 )
-            # Instance totals (issue #37): state must report THIS graph's
-            # spend, not the tracker's cross-session/cross-job running total.
-            self._cost_totals["cost_usd"] += call_cost
-            self._cost_totals["input_tokens"] += input_tokens
-            self._cost_totals["output_tokens"] += output_tokens
-            state["total_cost_usd"] = self._cost_totals["cost_usd"]
-            state["total_tokens"] = (
-                self._cost_totals["input_tokens"] + self._cost_totals["output_tokens"]
-            )
+            # Instance totals (issues #37/#52): state must report THIS
+            # thread's spend on this graph — not the tracker's cross-session
+            # running total, and not the other threads sharing the graph.
+            totals = self._cost_totals_for(_current_thread_id.get())
+            totals["cost_usd"] += call_cost
+            totals["input_tokens"] += input_tokens
+            totals["output_tokens"] += output_tokens
+            state["total_cost_usd"] = totals["cost_usd"]
+            state["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
             if self.audit_logger and self.cost_tracker:
                 # Per-call cost, not the graph's running total: the
                 # cumulative value double-counts when audit rows are

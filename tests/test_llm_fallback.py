@@ -505,3 +505,117 @@ class TestChainContextBudgetAndDeltaPolicy:
         chain = FallbackChain(_Streamer(), [])
         asyncio.run(chain.achat_stream(messages=[], on_text_delta=emitted.append))
         assert emitted == ["a", "b", "c"]
+
+
+
+class TestSpendLedgerAmbiguousAccounting:
+    """Issue #47(a): ambiguous failures charge their reservation in EVERY
+    mode — the enforcing flag governs retry refusal, not accounting."""
+
+    def _reserved(self, client):
+        return client._reserve_spend_call(
+            messages=[], system="", tools=None, max_tokens=4
+        )
+
+    def test_non_enforcing_ambiguous_failure_is_charged(self, tmp_path):
+        from clearwing.llm.budget import SpendLedger
+
+        ledger = SpendLedger(
+            limit_usd=0.0,  # non-enforcing / observability mode
+            session_id="t47",
+            repo_url="/tmp/repo",
+            output_dir=tmp_path,
+            input_price_per_million=0.0,
+            output_price_per_million=1_000_000.0,
+        )
+        client = _client().with_spend_ledger(ledger, stage="t47")
+        reservation = self._reserved(client)
+        assert reservation is not None
+
+        ledger.fail_call(reservation, error="Server disconnected")
+
+        # $1/token × 4-token ceiling reservation, not $0.
+        assert ledger.spent_usd == 4.0
+
+    def test_non_enforcing_definitely_unbilled_still_released(self, tmp_path):
+        from clearwing.llm.budget import SpendLedger
+
+        ledger = SpendLedger(
+            limit_usd=0.0,
+            session_id="t47",
+            repo_url="/tmp/repo",
+            output_dir=tmp_path,
+            input_price_per_million=0.0,
+            output_price_per_million=1_000_000.0,
+        )
+        client = _client().with_spend_ledger(ledger, stage="t47")
+        reservation = self._reserved(client)
+
+        # Connection-refused proves pre-dispatch → definitely unbilled.
+        ledger.fail_call(
+            reservation,
+            error="ConnectionRefusedError",
+            definitely_unbilled=True,
+        )
+        assert ledger.spent_usd == 0.0
+
+
+class TestHttpFallbackRetryBudget:
+    """Issue #47(c): the stream → HTTP transport fallback gets its own
+    retry budget instead of exactly one shot."""
+
+    def test_transport_fallback_retries_transient_failures(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from genai_pyo3 import ChatMessage
+
+        client = _client(rate_limit_max_retries=2)
+
+        class _BrokenStreamClient:
+            async def astream_chat(self, *a, **k):
+                async def _gen():
+                    raise RuntimeError("Web stream error: error sending request")
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        attempts = {"fallback": 0, "native": 0}
+
+        async def _flaky_fallback(*a, **k):
+            attempts["fallback"] += 1
+            if attempts["fallback"] < 2:
+                raise RuntimeError("server disconnected")
+            return SimpleNamespace(
+                usage=SimpleNamespace(
+                    prompt_tokens=1,
+                    completion_tokens=2,
+                    prompt_tokens_details=None,
+                    total_tokens=3,
+                ),
+                tool_calls=[],
+            )
+
+        from unittest.mock import patch as _upatch
+
+        def _build_client(_factory):
+            attempts["native"] += 1
+            return _BrokenStreamClient()
+
+        deltas = []
+        with (
+            _upatch.object(client, "_build_client", _build_client),
+            _upatch.object(client, "_openai_chat_http_fallback", _flaky_fallback),
+            _upatch("clearwing.llm.native.asyncio.sleep", new=_no_sleep),
+        ):
+            response = asyncio.run(
+                client.achat_stream(
+                    messages=[ChatMessage("user", "x")],
+                    system="s",
+                    on_text_delta=deltas.append,
+                )
+            )
+
+        assert response.usage.prompt_tokens == 1
+        assert attempts["native"] == 1
+        assert attempts["fallback"] == 2  # first flaky try retried, second ok

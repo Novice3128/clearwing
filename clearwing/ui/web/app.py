@@ -1087,6 +1087,23 @@ def create_app():
                     )
                     target = data.get("target", "")
                     handler_target = target
+                    # Issue #51: a start frame begins a NEW session on this
+                    # connection — retire the previous session's tracker
+                    # entry immediately instead of waiting for socket
+                    # teardown (which only forgets the final id). Without
+                    # this, every re-start left the earlier entry in the
+                    # process-global tracker forever, and an 8-hex id
+                    # collision later in the process lifetime would inherit
+                    # the stale spend. The busy-frame guard above ensures no
+                    # turn of the old session is still running.
+                    if session_id is not None:
+                        try:
+                            telemetry.CostTracker().forget_session(session_id)
+                        except Exception:
+                            logger.debug(
+                                "Failed to retire prior session cost entry",
+                                exc_info=True,
+                            )
                     session_id = uuid.uuid4().hex[:8]
                     # A start frame begins a new session on this connection:
                     # re-arm the session-scoped cost totals (issue #10).

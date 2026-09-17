@@ -846,16 +846,13 @@ class AsyncLLMClient:
         self,
         reservation: BudgetReservation | None,
         exc: BaseException,
-        *,
-        dispatched: bool,
     ) -> None:
+        # Every caller books this AFTER a dispatch was attempted, so there
+        # is no pre-dispatch release path left on this helper (issue #47
+        # removed the constant-true `dispatched` flag); pre-dispatch
+        # failures surface as reserve() raising before any reservation
+        # exists.
         if reservation is None or self._spend_ledger is None:
-            return
-        if not dispatched:
-            self._spend_ledger.release_call(
-                reservation,
-                reason=type(exc).__name__,
-            )
             return
         self._spend_ledger.fail_call(
             reservation,
@@ -1167,13 +1164,20 @@ class AsyncLLMClient:
                             self.base_url,
                             exc,
                         )
-                        response = await self._attempt_with_reservation(
+                        # Issue #47: the transport fallback used to be a
+                        # ONE-SHOT attempt with zero retries of its own —
+                        # after the native stream exhausted its retry
+                        # budget, the HTTP path got exactly one chance.
+                        # Route it through _with_retries so the fallback
+                        # transport gets its own fresh per-attempt budget
+                        # (and per-attempt reservations).
+                        response = await self._with_retries(
                             lambda: self._openai_chat_http_fallback(
                                 request,
                                 options,
                                 on_text_delta=on_text_delta,
                             ),
-                            _reserve,
+                            reserve=_reserve,
                         )
                     else:
                         raise
@@ -1948,7 +1952,7 @@ class AsyncLLMClient:
                 response = await op()
             except BaseException as exc:
                 if reservation is not None:
-                    self._fail_spend_call(reservation, exc, dispatched=True)
+                    self._fail_spend_call(reservation, exc)
                 if not isinstance(exc, Exception):
                     raise
                 is_rate_limit = self._is_rate_limit_error(exc)
@@ -2028,7 +2032,6 @@ class AsyncLLMClient:
                     self._fail_spend_call(
                         reservation,
                         RuntimeError("LLM stream ended without a terminal usage event"),
-                        dispatched=True,
                     )
                 else:
                     try:
@@ -2041,7 +2044,7 @@ class AsyncLLMClient:
                         # their remaining budget. Close it as an ambiguous
                         # failure — the generation may have been billed —
                         # then surface the original error.
-                        self._fail_spend_call(reservation, exc, dispatched=True)
+                        self._fail_spend_call(reservation, exc)
                         raise
             return response
 
@@ -2057,13 +2060,12 @@ class AsyncLLMClient:
         try:
             response = await op()
         except BaseException as exc:
-            self._fail_spend_call(reservation, exc, dispatched=True)
+            self._fail_spend_call(reservation, exc)
             raise
         if response is None:
             self._fail_spend_call(
                 reservation,
                 RuntimeError("LLM stream ended without a terminal usage event"),
-                dispatched=True,
             )
         else:
             try:
@@ -2071,7 +2073,7 @@ class AsyncLLMClient:
             except Exception as exc:
                 # Same dangling-reservation guard as _with_retries: close
                 # the attempt as an ambiguous failure, then re-raise.
-                self._fail_spend_call(reservation, exc, dispatched=True)
+                self._fail_spend_call(reservation, exc)
                 raise
         return response
 

@@ -782,7 +782,9 @@ def test_billable_ambiguous_retry_settles_each_attempt(tmp_path, monkeypatch):
     )
 
     with patch("clearwing.llm.native.asyncio.sleep", new=_no_sleep):
-        asyncio.run(client.achat(messages=[ChatMessage("user", "x")]))
+        asyncio.run(
+            client.achat(messages=[ChatMessage("user", "x")], max_tokens=4)
+        )
 
     assert get_calls() == 2
 
@@ -794,13 +796,15 @@ def test_billable_ambiguous_retry_settles_each_attempt(tmp_path, monkeypatch):
     closures = [event for event in events if event["event"] == "call_settled"]
     assert len(reservations) == 2  # one per attempt
     assert [event["status"] for event in closures] == [
-        "ambiguous_failure",  # attempt 1: closed, zero charge (non-enforcing)
+        "ambiguous_failure",  # attempt 1: closed, charged its reservation
         "succeeded",  # attempt 2: settled with real usage
     ]
-    # Non-enforcing: only the successful attempt's 2 generated tokens
-    # ($1/token) are charged; the pre-fix code hid the ambiguous attempt
-    # from the ledger entirely (one reservation, one closure).
-    assert ledger.spent_usd == pytest.approx(2.0)
+    # Issue #47: ambiguous failures charge their reservation in EVERY mode
+    # (the enforcing flag governs retry refusal, not accounting) — the
+    # failed attempt may have been billed, so a $0 booking underreported
+    # the real bill. Attempt 1: $4 reservation; attempt 2: 2 tokens ($1
+    # each, output price) — total $6.
+    assert ledger.spent_usd == pytest.approx(6.0)
 
 
 def test_definitely_unbilled_retry_releases_each_attempt(tmp_path, monkeypatch):

@@ -420,7 +420,7 @@ class SpendLedger:
                 raise RuntimeError("cannot reserve an LLM call on a finalized spend ledger")
 
             effective_max_tokens = requested_max_output_tokens
-            reserved_usd = 0.0
+            input_cost = input_token_upper_bound * pricing.input_per_million / 1_000_000
             if self.enforcing:
                 requested = (
                     self.default_max_output_tokens
@@ -431,7 +431,6 @@ class SpendLedger:
                     0.0,
                     self.limit_usd - self._spent_usd - self._reserved_usd,
                 )
-                input_cost = input_token_upper_bound * pricing.input_per_million / 1_000_000
                 if input_cost > available + self._EPSILON:
                     self._mark_exhausted_locked(
                         stage=stage,
@@ -474,6 +473,22 @@ class SpendLedger:
                         f"LLM budget exhausted before {stage}: call reservation "
                         f"${reserved_usd:.6f} exceeds remaining ${available:.6f}"
                     )
+            else:
+                # Non-enforcing (observability) runs still reserve a
+                # worst-case ESTIMATE (issue #47): without it every
+                # reservation booked $0, so ambiguous failures closed at
+                # $0 and spent_usd underreported the real provider bill.
+                # No affordability clamps or BudgetExceeded — there is no
+                # cap to enforce — just the estimate.
+                requested = (
+                    self.default_max_output_tokens
+                    if requested_max_output_tokens is None
+                    else max(1, int(requested_max_output_tokens))
+                )
+                effective_max_tokens = requested
+                reserved_usd = input_cost + (
+                    requested * pricing.output_per_million / 1_000_000
+                )
 
             reservation = BudgetReservation(
                 call_id=uuid.uuid4().hex,
@@ -561,12 +576,20 @@ class SpendLedger:
         error: str,
         definitely_unbilled: bool = False,
     ) -> None:
-        """Close a failed call, conservatively charging ambiguous failures."""
+        """Close a failed call, conservatively charging ambiguous failures.
+
+        The charge is mode-independent (issue #47): the ``enforcing`` flag
+        governs whether billable-ambiguous attempts may be RETRIED at
+        dispatch time, not whether they are accounted — a non-enforcing
+        (observability) ledger that booked ambiguous failures at $0
+        underreported the real provider bill, since the provider may have
+        billed the failed generation.
+        """
 
         with self._lock:
             if not reservation.active:
                 return
-            charged = 0.0 if definitely_unbilled or not self.enforcing else reservation.reserved_usd
+            charged = 0.0 if definitely_unbilled else reservation.reserved_usd
             status = "rejected" if definitely_unbilled else "ambiguous_failure"
             self._finish_reservation_locked(
                 reservation,
