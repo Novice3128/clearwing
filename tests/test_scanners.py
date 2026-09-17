@@ -2,6 +2,7 @@ import errno
 import logging
 import os
 import socket
+import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1035,3 +1036,202 @@ class TestNvdApi20CriteriaShape:
 
         assert [v["cve"] for v in result] == ["CVE-2021-41773"]
         assert result[0]["match_quality"] == "version-verified"
+
+
+class TestCodexRound2Findings:
+    """Regressions for the Codex PR-55 second-round findings."""
+
+    @pytest.fixture
+    def scanner(self):
+        return VulnerabilityScanner()
+
+    def test_https_service_label_still_matches_apache_entries(self, scanner):
+        """P2: the port scanner labels 443 as HTTPS — product-bound local
+        entries must be selected by the resolved identity, not the label."""
+        vulns = scanner._check_local_db(
+            "HTTPS", version="2.4.49", banner="Server: Apache/2.4.49"
+        )
+        assert [v["cve"] for v in vulns] == ["CVE-2021-41773"]
+        assert vulns[0]["match_quality"] == "version-verified"
+
+    def test_apache_2249_does_not_claim_the_bypass_cve(self, scanner):
+        """P2: CVE-2021-42013 affects 2.4.50 only (the bypass of the fix)."""
+        vulns = scanner._check_local_db("HTTP", "", "Apache/2.4.49")
+        assert "CVE-2021-42013" not in [v["cve"] for v in vulns]
+
+        vulns = scanner._check_local_db("HTTP", "", "Apache/2.4.50")
+        assert sorted(v["cve"] for v in vulns) == ["CVE-2021-42013"]
+
+    @pytest.mark.asyncio
+    async def test_every_alias_spelling_is_queried(self, scanner):
+        """P1: NVD filters server-side, so an alias-only record needs its
+        own query — apache must ask for both http_server and httpd."""
+        urls: list[str] = []
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return {"vulnerabilities": []}
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                urls.append(url)
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("HTTP", "", "Apache/2.4.49")
+        await scanner._query_nvd("HTTP", identity)
+
+        assert len(urls) == 2
+        assert any("http_server" in u for u in urls)
+        assert any("httpd" in u for u in urls)
+
+    @pytest.mark.asyncio
+    async def test_versionless_path_ignores_non_vulnerable_criteria(self, scanner):
+        """P1: a product named only by an environment criterion (vulnerable
+        false) must not be upgraded to a heuristic finding."""
+        payload = {
+            "vulnerabilities": [
+                {
+                    "cve": {
+                        "id": "CVE-2022-44444",
+                        "descriptions": [{"value": "env-only mention"}],
+                        "metrics": {},
+                        "configurations": [
+                            {
+                                "nodes": [
+                                    {
+                                        "cpeMatch": [
+                                            {
+                                                "criteria": "cpe:2.3:a:proftpd:proftpd:*:*:*:*:*:*:*:*",
+                                                "vulnerable": False,
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+        class _FakeResponse:
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return payload
+
+        class _FakeGet:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                return _FakeGet()
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("FTP", "", "220 ProFTPD Server ready")
+        result = await scanner._query_nvd("FTP", identity)
+        assert result[0]["match_quality"] == "keyword-candidate"
+
+
+class TestReportFormatPartition:
+    """P2: HTML/Markdown must separate candidates like the text report."""
+
+    def _result(self):
+        from clearwing.core.engine import ScanResult
+
+        result = ScanResult(target="127.0.0.1")
+        result.vulnerabilities = [
+            {
+                "cve": "CVE-2021-41773",
+                "description": "confirmed",
+                "cvss": 9.8,
+                "port": 80,
+                "ports": [80],
+                "service": "HTTP",
+                "match_quality": "version-verified",
+            },
+            {
+                "cve": "CVE-2020-9999",
+                "description": "keyword noise",
+                "cvss": 5.0,
+                "port": 80,
+                "ports": [80],
+                "service": "HTTP",
+                "match_quality": "keyword-candidate",
+            },
+        ]
+        return result
+
+    def test_html_separates_candidates(self):
+        from clearwing.reporting.report_generator import ReportGenerator
+
+        html = ReportGenerator().generate(self._result(), "html")
+        findings_table = html.split("<h2>Vulnerabilities</h2>")[1].split("</table>")[0]
+        assert "CVE-2021-41773" in findings_table
+        assert "CVE-2020-9999" not in findings_table
+        assert "Unverified keyword candidates" in html
+
+    def test_markdown_separates_candidates(self):
+        from clearwing.reporting.report_generator import ReportGenerator
+
+        md = ReportGenerator().generate(self._result(), "markdown")
+        findings_section = md.split("## Vulnerabilities")[1].split(
+            "## Unverified keyword candidates"
+        )[0]
+        assert "CVE-2021-41773" in findings_section
+        assert "CVE-2020-9999" not in findings_section
+        # ... and the candidate is still listed, just separately.
+        candidates_section = md.split("## Unverified keyword candidates")[1]
+        assert "CVE-2020-9999" in candidates_section
+
+
+class TestDatabasePortsPersistence:
+    """P2: persistence must consume the deduplicated `ports` list."""
+
+    def test_cve_recorded_for_every_affected_port(self, tmp_path):
+        from clearwing.core.engine import ScanResult
+        from clearwing.data.database.models import Database
+
+        db = Database(str(tmp_path / "scan.db"))
+        result = ScanResult(target="127.0.0.1")
+        result.open_ports = [
+            {"port": 21, "protocol": "tcp", "state": "open", "service": "FTP"},
+            {"port": 2121, "protocol": "tcp", "state": "open", "service": "FTP"},
+        ]
+        result.vulnerabilities = [
+            {
+                "cve": "CVE-2015-3306",
+                "description": "ProFTPD mod_copy",
+                "cvss": 9.8,
+                "port": 21,
+                "ports": [21, 2121],
+                "service": "FTP",
+                "match_quality": "version-verified",
+            }
+        ]
+        db.save_scan_result(result)
+
+        with sqlite3.connect(db.db_path) as conn:
+            rows = conn.execute(
+                "SELECT port_id, cve_id FROM vulnerabilities"
+            ).fetchall()
+        assert len(rows) == 2
+        assert {r[1] for r in rows} == {"CVE-2015-3306"}

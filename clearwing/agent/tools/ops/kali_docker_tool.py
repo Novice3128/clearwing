@@ -38,13 +38,28 @@ def _artifacts_dir(session_id: str | None):
     return clearwing_home() / "kali" / scope / "artifacts"
 
 
-def _has_artifacts_mount(container) -> bool:
-    """True when the container carries the /artifacts bind mount."""
+def _has_artifacts_mount(container, expected_source: str | None = None) -> bool:
+    """True when the container carries a usable /artifacts bind mount.
+
+    A mount is only usable when it is a WRITABLE BIND from the artifact dir
+    this session computed — a named volume, a different host source (e.g.
+    CLEARWING_HOME changed between runs), or a read-only mount stores
+    outputs elsewhere or fails them outright, so promising persistence
+    would be wrong (Codex PR-55 r2).
+    """
     try:
         attrs = container.attrs or {}
         for mount in attrs.get("Mounts", []):
-            if mount.get("Destination") == ARTIFACTS_MOUNT:
-                return True
+            if mount.get("Destination") != ARTIFACTS_MOUNT:
+                continue
+            if mount.get("Type") != "bind":
+                return False
+            if mount.get("RW") is False:
+                return False
+            source = mount.get("Source")
+            if expected_source and source and str(source) != expected_source:
+                return False
+            return True
     except Exception:
         return False
     return False
@@ -77,7 +92,7 @@ def kali_setup() -> dict:
     # Check for existing container
     try:
         existing = client.containers.get(name)
-        mounted = _has_artifacts_mount(existing)
+        mounted = _has_artifacts_mount(existing, str(artifacts_dir))
         base = {
             "container_id": existing.id,
             "artifacts_dir": str(artifacts_dir),

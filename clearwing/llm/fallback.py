@@ -49,6 +49,19 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+# Imported lazily-by-name at module load: fallback.py lives beside native.py
+# and the client surface it mirrors (aask_text/aask_json post-processing)
+# comes from the same module.
+from genai_pyo3 import ChatMessage  # noqa: E402
+
+from clearwing.llm.native import (  # noqa: E402
+    _is_root_model_type,
+    _validate_schema_response,
+    extract_json_array,
+    extract_json_object,
+    response_text,
+)
+
 
 class FallbackChain:
     """Duck-typed stand-in for :class:`AsyncLLMClient` (issue #17).
@@ -104,6 +117,18 @@ class FallbackChain:
     @property
     def clients(self) -> list[AsyncLLMClient]:
         return [self.primary, *self.fallbacks]
+
+    @property
+    def context_budget_tokens(self) -> int | None:
+        """The primary's context budget (Codex PR-55 r2): the runtime picks
+        its summarizer threshold from this attribute, so a chain without it
+        silently fell back to the built-in default."""
+        return getattr(self.primary, "context_budget_tokens", None)
+
+    @property
+    def pricing(self):
+        """The primary's endpoint pricing, if any."""
+        return getattr(self.primary, "pricing", None)
 
     def set_retry_notice(self, callback: Callable[[str], None] | None) -> None:
         """Route per-client retry notices (and chain switch notices) to *callback*."""
@@ -195,6 +220,41 @@ class FallbackChain:
                     f"{getattr(clients[index + 1], 'model_name', '?')}"
                 )
         raise last_exc  # pragma: no cover
+
+    async def aask_text(self, **kwargs: Any):
+        """Non-streaming single-prompt call, with failover (Codex PR-55 r2).
+
+        OperatorAgent supervision and context summarization both call this
+        surface — without it a configured chain broke them outright.
+        """
+        return await self.achat(
+            messages=[ChatMessage("user", kwargs.pop("user", ""))],
+            **kwargs,
+        )
+
+    async def aask_json(self, **kwargs: Any):
+        """Single-prompt JSON call, with failover; mirrors the client's
+        post-processing so callers get identical parse semantics."""
+        expect = kwargs.pop("expect", "object")
+        schema_model = kwargs.pop("schema_model", None)
+        schema_name = kwargs.pop("schema_name", None)
+        schema_description = kwargs.pop("schema_description", None)
+        response = await self.achat(
+            messages=[ChatMessage("user", kwargs.pop("user", ""))],
+            response_schema=schema_model,
+            response_schema_name=schema_name,
+            response_schema_description=schema_description,
+            **kwargs,
+        )
+        text = response_text(response)
+        if schema_model is not None:
+            parsed_model = _validate_schema_response(schema_model, text)
+            if _is_root_model_type(schema_model):
+                return parsed_model.root, response
+            return parsed_model.model_dump(), response
+        if expect == "array":
+            return extract_json_array(text), response
+        return extract_json_object(text), response
 
     @staticmethod
     def _brief(exc: BaseException) -> str:

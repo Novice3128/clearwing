@@ -148,6 +148,23 @@ class ReportGenerator:
         return "\n".join(lines)
 
     @staticmethod
+    def _partition_vulnerabilities(vulnerabilities: list) -> tuple[list, list]:
+        """Split findings from unverified keyword candidates (issue #15).
+
+        Candidates are NVD keyword hits without product identity: they are
+        listed separately and never counted or rendered as findings.
+        Entries without a match_quality label predate the field and count
+        as findings.
+        """
+        candidates = [
+            v for v in vulnerabilities if v.get("match_quality") == "keyword-candidate"
+        ]
+        findings = [
+            v for v in vulnerabilities if v.get("match_quality") != "keyword-candidate"
+        ]
+        return findings, candidates
+
+    @staticmethod
     def _render_vulnerability_lines(lines: list, vulnerabilities: list) -> None:
         """Render the VULNERABILITIES section body (issue #15 semantics).
 
@@ -162,12 +179,9 @@ class ReportGenerator:
         def _flat(value) -> str:
             return " ".join(str(value or "N/A").split())
 
-        candidates = [
-            v for v in vulnerabilities if v.get("match_quality") == "keyword-candidate"
-        ]
-        findings = [
-            v for v in vulnerabilities if v.get("match_quality") != "keyword-candidate"
-        ]
+        findings, candidates = ReportGenerator._partition_vulnerabilities(
+            vulnerabilities
+        )
         suffix = f" (plus {len(candidates)} unverified keyword candidates)" if candidates else ""
         lines.append(f"  Findings: {len(findings)}{suffix}")
         for vuln in findings:
@@ -258,7 +272,13 @@ class ReportGenerator:
     <table>
         <tr><th>CVE</th><th>Description</th><th>Service</th><th>CVSS</th></tr>
 """
-        for vuln in scan_result.vulnerabilities:
+        # Issue #15: keyword candidates are NOT confirmed findings — every
+        # human-readable format must keep them out of the findings table,
+        # or an unverified hit is presented as a CVE (Codex PR-55 r2).
+        findings, candidates = self._partition_vulnerabilities(
+            scan_result.vulnerabilities
+        )
+        for vuln in findings:
             html += (
                 "        <tr>"
                 f"<td>{html_escape(str(vuln.get('cve', 'N/A')))}</td>"
@@ -270,7 +290,24 @@ class ReportGenerator:
 
         html += """
     </table>
-    
+"""
+        if candidates:
+            html += """
+    <h2>Unverified keyword candidates (NOT confirmed findings)</h2>
+    <table>
+        <tr><th>CVE</th><th>Description</th></tr>
+"""
+            for vuln in candidates:
+                html += (
+                    "        <tr>"
+                    f"<td>{html_escape(str(vuln.get('cve', 'N/A')))}</td>"
+                    f"<td>{html_escape(str(vuln.get('description', 'N/A')))}</td>"
+                    "</tr>\n"
+                )
+            html += """
+    </table>
+"""
+        html += """
     <h2>Exploits</h2>
     <table>
         <tr><th>Exploit</th><th>CVE</th><th>Status</th><th>Message</th></tr>
@@ -318,13 +355,28 @@ class ReportGenerator:
         md += "| CVE | Description | Service | CVSS |\n"
         md += "|-----|-------------|---------|------|\n"
 
-        for vuln in scan_result.vulnerabilities:
+        findings, candidates = self._partition_vulnerabilities(
+            scan_result.vulnerabilities
+        )
+        for vuln in findings:
             md += (
                 f"| {markdown_table_cell(vuln.get('cve', 'N/A'))} "
                 f"| {markdown_table_cell(vuln.get('description', 'N/A'))} "
                 f"| {markdown_table_cell(vuln.get('service', 'N/A'))} "
                 f"| {markdown_table_cell(vuln.get('cvss', 'N/A'))} |\n"
             )
+
+        if candidates:
+            # Issue #15: unverified keyword hits stay OUT of the findings
+            # table in every format (Codex PR-55 r2).
+            md += "\n## Unverified keyword candidates (NOT confirmed findings)\n\n"
+            md += "| CVE | Description |\n"
+            md += "|-----|-------------|\n"
+            for vuln in candidates:
+                md += (
+                    f"| {markdown_table_cell(vuln.get('cve', 'N/A'))} "
+                    f"| {markdown_table_cell(vuln.get('description', 'N/A'))} |\n"
+                )
 
         md += "\n## Exploits\n\n"
         md += "| Exploit | CVE | Success | Message |\n"

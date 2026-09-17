@@ -116,9 +116,16 @@ class Database:
 
                 port_id = cursor.lastrowid
 
-                # Insert vulnerabilities for this port
+                # Insert vulnerabilities for this port. A deduplicated CVE
+                # carries every affected port in `ports` (issue #15) while
+                # the compatibility `port` field holds only the first one —
+                # matching solely on `port` dropped the other service
+                # associations from persistent history (Codex PR-55 r2).
                 port_vulns = [
-                    v for v in scan_result.vulnerabilities if v.get("port") == port["port"]
+                    v
+                    for v in scan_result.vulnerabilities
+                    if port["port"]
+                    in (v.get("ports") or [v.get("port")])
                 ]
                 for vuln in port_vulns:
                     cursor.execute(

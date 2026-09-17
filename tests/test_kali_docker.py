@@ -170,7 +170,16 @@ class TestKaliArtifactsMount:
         existing.status = "running"
         existing.id = "existing-id"
         existing.short_id = "existing"
-        existing.attrs = {"Mounts": [{"Destination": "/artifacts"}]}
+        existing.attrs = {
+            "Mounts": [
+                {
+                    "Destination": "/artifacts",
+                    "Type": "bind",
+                    "RW": True,
+                    "Source": str(tmp_path / "kali" / "reuse-sess1" / "artifacts"),
+                }
+            ]
+        }
         containers = _FakeContainerAPI(existing=existing)
         _fake_docker(monkeypatch, containers)
 
@@ -270,3 +279,52 @@ class TestKaliInstallValidation:
         assert result["exit_code"] == 0
         cmd = container.exec_run.call_args[0][0]
         assert "nmap nikto" in cmd
+
+
+class TestArtifactsMountValidation:
+    """Codex PR-55 r2: a /artifacts mount only counts when it is a writable
+    bind from THIS session's artifact dir."""
+
+    def _mount(self, **overrides):
+        mount = {
+            "Destination": "/artifacts",
+            "Type": "bind",
+            "RW": True,
+            "Source": "/tmp/expected/artifacts",
+        }
+        mount.update(overrides)
+        return mount
+
+    def _container(self, mount):
+        container = MagicMock()
+        container.attrs = {"Mounts": [mount]}
+        return container
+
+    def test_writable_bind_from_expected_source_is_usable(self):
+        from clearwing.agent.tools.ops.kali_docker_tool import _has_artifacts_mount
+
+        assert _has_artifacts_mount(
+            self._container(self._mount()), "/tmp/expected/artifacts"
+        )
+
+    def test_named_volume_is_rejected(self):
+        from clearwing.agent.tools.ops.kali_docker_tool import _has_artifacts_mount
+
+        assert not _has_artifacts_mount(
+            self._container(self._mount(Type="volume")), "/tmp/expected/artifacts"
+        )
+
+    def test_read_only_mount_is_rejected(self):
+        from clearwing.agent.tools.ops.kali_docker_tool import _has_artifacts_mount
+
+        assert not _has_artifacts_mount(
+            self._container(self._mount(RW=False)), "/tmp/expected/artifacts"
+        )
+
+    def test_foreign_source_is_rejected(self):
+        from clearwing.agent.tools.ops.kali_docker_tool import _has_artifacts_mount
+
+        assert not _has_artifacts_mount(
+            self._container(self._mount(Source="/other/home/artifacts")),
+            "/tmp/expected/artifacts",
+        )
