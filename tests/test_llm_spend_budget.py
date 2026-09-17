@@ -919,3 +919,50 @@ def test_settle_failure_in_attempt_with_reservation_closes_it(tmp_path):
     closures = [event for event in events if event["event"] == "call_settled"]
     assert [event["status"] for event in closures] == ["ambiguous_failure"]
     assert ledger.spent_usd == pytest.approx(4.0)
+
+
+def test_unsettled_reservation_on_resume_is_charged_in_every_mode(tmp_path):
+    """Issue #47: an unsettled reservation (process died mid-flight) is an
+    ambiguous failure — the provider may have billed it — so the estimate
+    is charged even for a NON-enforcing ledger. The pre-fix replay gate
+    honored `budget_enforcing` and booked $0, underreporting the bill."""
+    ledger = SpendLedger(
+        limit_usd=0.0,  # non-enforcing / observability
+        session_id="resume-test",
+        repo_url="/tmp/repo",
+        output_dir=tmp_path,
+        input_price_per_million=0.0,
+        output_price_per_million=1_000_000.0,
+    )
+    client = AsyncLLMClient(
+        model_name="private-priced-model",
+        provider_name="anthropic",
+        api_key="test",
+    ).with_spend_ledger(ledger, stage="hunt")
+
+    reservation = client._reserve_spend_call(
+        messages=[ChatMessage("user", "x")], system="", tools=None, max_tokens=4
+    )
+    assert reservation is not None and reservation.active
+    # Simulate a crash: never settled, then a fresh ledger resumes the run.
+    del reservation
+
+    resumed = SpendLedger(
+        limit_usd=0.0,
+        session_id="resume-test",
+        repo_url="/tmp/repo",
+        output_dir=tmp_path,
+        input_price_per_million=0.0,
+        output_price_per_million=1_000_000.0,
+        resume=True,
+    )
+    events = [
+        json.loads(line)
+        for line in resumed.ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    recovered = [
+        e for e in events if e.get("status") == "recovered_ambiguous_failure"
+    ]
+    assert recovered, "the unsettled reservation must be replayed"
+    assert recovered[0]["cost_usd"] == pytest.approx(4.0)
+    assert resumed.spent_usd == pytest.approx(4.0)

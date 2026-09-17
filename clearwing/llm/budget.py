@@ -317,7 +317,11 @@ class SpendLedger:
             raise BudgetConfigurationError(
                 f"Cannot resume session {self.session_id!r}: spend ledger is corrupt"
             )
-        charged = reserved_usd if reservation.get("budget_enforcing", reserved_usd > 0) else 0.0
+        # An unsettled reservation is an AMBIGUOUS failure: the request was
+        # dispatched and the provider may have billed it, so the estimate is
+        # charged in every mode (issue #47 — the enforcing flag governs
+        # retry refusal, not accounting).
+        charged = reserved_usd
         event = {
             "event": "call_settled",
             "call_id": call_id,
