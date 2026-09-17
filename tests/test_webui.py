@@ -1611,3 +1611,163 @@ class TestSessionCostTeardown:
         # After the connection tears down, the entry is gone.
         assert CostTracker().session_total(started) == 0.0
         assert CostTracker().session_tokens(started) == (0, 0)
+
+
+class _EchoingPauseGraph(_FakeGraph):
+    """Issue #53 shape: the graph's own runtime echo (bus MESSAGE, a
+    200-char preview) is delivered by the pump while the turn is still
+    streaming, then the turn ends parked at an approval gate — pre-fix the
+    closing inline agent_message re-sent the same text verbatim."""
+
+    def __init__(self, text, pause_after=True, delay=0.25):
+        super().__init__(events=[{"messages": [_FakeAI(text)]}])
+        self.text = text
+        self.pause_after = pause_after
+        self.pending = False
+        self.delay = delay
+
+    def get_state(self, config):
+        from clearwing.agent.runtime import GraphStateSnapshot
+
+        return GraphStateSnapshot(
+            values={"messages": []},
+            next=("tools",) if self.pending else (),
+            tasks=[],
+        )
+
+    async def astream(self, input_msg, config, stream_mode="values"):
+        import asyncio
+
+        from clearwing.core.events import EventBus, EventType
+
+        EventBus().emit(
+            EventType.MESSAGE, {"content": self.text[:200], "type": "agent"}
+        )
+        await asyncio.sleep(self.delay)  # let the pump deliver the echo first
+        self.pending = self.pause_after
+        for ev in self.events:
+            yield ev
+
+
+class _EchoingResumeGraph(_EchoingPauseGraph):
+    """Approve-turn variant: the resume (ainvoke) echoes its new reply on
+    the bus and sleeps, so the echo is delivered before the turn ends."""
+
+    def __init__(self, first, resumed):
+        super().__init__(first)
+        self.resumed = resumed
+
+    async def ainvoke(self, input_data, config):
+        import asyncio
+
+        from clearwing.agent.runtime import GraphStateSnapshot
+        from clearwing.core.events import EventBus, EventType
+
+        EventBus().emit(
+            EventType.MESSAGE, {"content": self.resumed[:200], "type": "agent"}
+        )
+        await asyncio.sleep(0.25)
+        self.pending = False  # the resume parks nowhere: the turn ends "ok"
+        return GraphStateSnapshot(values={"messages": [_FakeAI(self.resumed)]})
+
+
+class TestDuplicateAgentFrameDedup:
+    def _collect(self, ws):
+        import json
+
+        agent_frames = []
+        complete = None
+        while True:
+            msg = json.loads(ws.receive_text())
+            if msg["type"] == "agent_message":
+                agent_frames.append(msg)
+            if msg["type"] == "complete":
+                complete = msg
+                break
+        return agent_frames, complete
+
+    def test_pause_turn_does_not_resend_delivered_echo(self, client):
+        text = "我將執行需要審批的掃描指令"  # < 200 chars: echo == full text
+        with patch(
+            "clearwing.ui.web.app.create_agent", lambda **kwargs: _EchoingPauseGraph(text)
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                frames, complete = self._collect(ws)
+
+        contents = [f["data"]["content"] for f in frames]
+        # Pre-fix the inline send duplicated the delivered echo verbatim.
+        assert contents.count(text) == 1
+        assert complete["data"]["status"] == "awaiting_approval"
+
+    def test_long_text_keeps_preview_and_full_frame(self, client):
+        full = "段落內容。" * 80  # 480 chars — the echo is a truncated preview
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _EchoingPauseGraph(full, pause_after=False),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                frames, complete = self._collect(ws)
+
+        contents = [f["data"]["content"] for f in frames]
+        assert contents.count(full) == 1  # authoritative full text delivered
+        assert contents.count(full[:200]) == 1  # truncated preview echo
+        assert complete["data"]["status"] == "ok"
+
+    def test_deduped_text_still_lands_in_report(self, client):
+        import json
+
+        text = "即將執行需審批的指令"
+        with patch(
+            "clearwing.ui.web.app.create_agent", lambda **kwargs: _EchoingPauseGraph(text)
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                while True:
+                    msg = json.loads(ws.receive_text())
+                    if msg["type"] == "complete":
+                        report_url = msg["data"]["report_url"]
+                        break
+
+        report = client.get(report_url, headers=AUTH).text
+        assert text in report  # transcript keeps what the WS frame skipped
+
+    def test_no_echo_turn_still_sends_inline(self, client):
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _AwaitingApprovalGraph(),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                frames, complete = self._collect(ws)
+
+        contents = [f["data"]["content"] for f in frames]
+        assert "I will run nmap" in contents
+        assert complete["data"]["status"] == "awaiting_approval"
+
+    def test_approve_resume_echo_not_resent(self, client):
+        import json
+
+        resumed = "審批已通過,繼續執行下一步"
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _EchoingResumeGraph("我將執行需要審批的掃描指令", resumed),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                # Turn 1 parks at the approval gate.
+                while True:
+                    if json.loads(ws.receive_text())["type"] == "complete":
+                        break
+                ws.send_json({"type": "approve", "approved": True})
+                frames, complete = self._collect(ws)
+
+        contents = [f["data"]["content"] for f in frames]
+        assert contents.count(resumed) == 1  # echo only, no inline repeat
+        assert complete["data"]["status"] == "ok"
