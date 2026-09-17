@@ -207,13 +207,27 @@ class FallbackChain:
             kwargs["on_text_delta"] = _counting_callback
 
         for index, client in enumerate(clients):
-            if index > 0 and deltas_emitted:
+            suppressed_this_member = index > 0 and deltas_emitted
+            if suppressed_this_member:
                 # Abandoned partial output already reached the consumer —
                 # never interleave a second answer into it.
                 kwargs["on_text_delta"] = None
             try:
                 response = await client.achat_stream(**kwargs)
                 self._record_served(client)
+                if suppressed_this_member and original_callback is not None:
+                    # The legacy interactive CLI prints ONLY what the delta
+                    # callback delivered (it discards the returned events),
+                    # so suppressed failover text would leave the user with
+                    # nothing but the abandoned fragment — emit the complete
+                    # response once (Codex PR-55 r5). Event/state consumers
+                    # keep the authoritative response object either way.
+                    try:
+                        text = response_text(response)
+                    except Exception:
+                        text = ""
+                    if text:
+                        original_callback(text)
                 return response
             except Exception as exc:
                 # Cancellation must never fail over (BaseException is not

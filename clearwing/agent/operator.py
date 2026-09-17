@@ -450,7 +450,15 @@ class OperatorAgent:
             target=self.config.target,
             status=status,
             turns=self._turns,
-            findings=sv.get("vulnerabilities", [])
+            # Issue #15: keyword-candidate entries are unverified NVD
+            # description-text hits — presenting them as confirmed operator
+            # findings (count + descriptions in the `operate` CLI) inflates
+            # the report exactly like the CI path did (Codex PR-55 r5).
+            findings=[
+                v
+                for v in sv.get("vulnerabilities", [])
+                if v.get("match_quality") != "keyword-candidate"
+            ]
             + [
                 {
                     "description": f"Exploitable: {e.get('vulnerability', '?')}",

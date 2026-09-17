@@ -1506,3 +1506,90 @@ class TestCodexRound4Findings:
         # The name-first form keeps working.
         identity = scanner._resolve_identity("MySQL", "", "mariadb  Ver 10.11.6")
         assert identity is not None and identity.version == "10.11.6"
+
+
+class TestCodexRound5Findings:
+    """Regressions for the Codex PR-55 fifth-round findings."""
+
+    @pytest.fixture
+    def scanner(self):
+        return VulnerabilityScanner()
+
+    @pytest.mark.asyncio
+    async def test_pagination_continues_past_a_fully_filtered_page(self, scanner):
+        """P1: termination must use the RAW page count, not the filtered
+        entries — a page whose records all fail the client-side check is
+        not the end of the result set."""
+        fetched_starts: list[int] = []
+
+        def _item(n, cpe_product):
+            return {
+                "cve": {
+                    "id": f"CVE-2021-{n}",
+                    "descriptions": [{"value": f"d{n}"}],
+                    "metrics": {},
+                    "configurations": [
+                        {
+                            "nodes": [
+                                {
+                                    "cpeMatch": [
+                                        {
+                                            "criteria": f"cpe:2.3:a:x:{cpe_product}:*:*:*:*:*:*:*:*",
+                                            "vulnerable": True,
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ],
+                }
+            }
+
+        class _FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return self._payload
+
+        class _FakeGet:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def __aenter__(self):
+                return _FakeResponse(self._payload)
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _FakeSession:
+            def get(self, url, timeout=None):
+                from urllib.parse import parse_qs, urlparse
+
+                start = int(parse_qs(urlparse(url).query).get("startIndex", ["0"])[0])
+                fetched_starts.append(start)
+                if start == 0:
+                    # Page 1: three records, NONE naming apache → filtered
+                    # out entirely.
+                    batch = [_item(n, "otherproduct") for n in range(3)]
+                else:
+                    # Page 2: one verified record.
+                    batch = [_item(99, "http_server")]
+                # totalResults beyond one page so a second page exists.
+                return _FakeGet({"totalResults": 250, "vulnerabilities": batch})
+
+        scanner.session = _FakeSession()
+        identity = scanner._resolve_identity("HTTP", "", "Apache/2.4.49")
+        result = await scanner._query_nvd("HTTP", identity)
+
+        # Pagination did NOT stop at the fully-filtered first page. Two
+        # alias spellings are queried (http_server + httpd), each paging
+        # past its filtered first page.
+        assert fetched_starts == [0, 200, 0, 200]
+        # Dedup across the alias queries keeps one entry.
+        assert [v["cve"] for v in result] == ["CVE-2021-99"]
+        assert result[0]["match_quality"] == "version-verified"

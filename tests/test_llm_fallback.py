@@ -460,6 +460,10 @@ class TestChainContextBudgetAndDeltaPolicy:
                     callback("partial primary text")
                 raise RuntimeError("stream died")
 
+        class _FakeResponse:
+            first_text = "fallback answer"
+            texts = ["fallback answer"]
+
         class _Backup:
             model_name = "backup"
             provider_name = "openai"
@@ -468,7 +472,7 @@ class TestChainContextBudgetAndDeltaPolicy:
                 callback = kwargs.get("on_text_delta")
                 if callback is not None:
                     callback("fallback text")
-                return "fallback answer"
+                return _FakeResponse()
 
         chain = FallbackChain(_PartialThenFail(), [_Backup()])
         notices: list[str] = []
@@ -476,11 +480,12 @@ class TestChainContextBudgetAndDeltaPolicy:
 
         result = asyncio.run(chain.achat_stream(messages=[], on_text_delta=emitted.append))
 
-        assert result == "fallback answer"
-        # Only the primary's partial text reached the consumer; the
-        # fallback's live deltas were suppressed (its text arrives via the
-        # returned response) and the notice says so.
-        assert emitted == ["partial primary text"]
+        assert result.first_text == "fallback answer"
+        # The primary's partial text reached the consumer live; the
+        # fallback's PER-DELTA output was suppressed, and its COMPLETE
+        # answer was emitted once at the end (Codex PR-55 r5: the legacy
+        # CLI prints only callback-delivered text).
+        assert emitted == ["partial primary text", "fallback answer"]
         assert any("abandoned" in n for n in notices)
 
     def test_healthy_primary_streams_live(self):
