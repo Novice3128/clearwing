@@ -261,8 +261,15 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
 
 # ------------------------------------------------------ baseline diff -----
 
-def previous_full(run_dir: Path) -> dict | None:
-    cands = sorted(d for d in RESULTS.glob("*-full") if d.is_dir() and d != run_dir)
+def previous_run(run_dir: Path, tier_name: str) -> dict | None:
+    """SAME-TIER previous baseline only. A quick run trending against a
+    full baseline is apples-to-oranges (226s vs 1282s = instant false
+    REGRESSION — caught live 2026-09-18 23:19); trend is a drift detector
+    within one tier (SPEC §4), and partial runs are suppressed upstream."""
+    tier = tier_name if tier_name != "re-analyze" else run_dir.name.rsplit("-", 1)[-1]
+    tier = tier.replace("-partial", "")
+    cands = sorted(d for d in RESULTS.glob(f"*-{tier}")
+                   if d.is_dir() and d != run_dir and "-partial" not in d.name)
     if not cands:
         return None
     m = cands[-1] / "ledger.json"
@@ -359,7 +366,7 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
                           "detail": "partial run (--only) — trend gates suppressed "
                           "(subset vs whole-tier baseline is not comparable)"})
     else:
-        all_gates.extend(trend_gate(ledger, previous_full(run_dir)))
+        all_gates.extend(trend_gate(ledger, previous_run(run_dir, tier_name)))
     # frame-type census: NEW frame types from product features become VISIBLE here
     census: dict[str, int] = {}
     for sc in scenarios:
@@ -396,6 +403,10 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         "full": "full PASS is one of the two consecutive passes required for release, "
                 "plus a deep-cold sample (SPEC §4).",
     }.get(tier_name, "informational tier — no release authority.")
+    if overall == "REGRESSION":
+        verdict_line = ("REGRESSION = same-tier trend band breach (duration/cost vs "
+                        "previous run of THIS tier, ±30%) — investigate before the "
+                        "next run; no release authority. " + verdict_line)
     if partial:
         verdict_line = "PARTIAL run (--only) — no tier-level authority; excluded from baselines."
     lines = [

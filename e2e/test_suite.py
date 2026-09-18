@@ -347,8 +347,8 @@ def test_trend_breach_yields_regression_not_pass(monkeypatch, tmp_path):
     """Codex r1 P2: failed trend gates never reached the verdict — the
     SPEC's REGRESSION outcome did not exist in code."""
     monkeypatch.setattr(analyze, "RESULTS", tmp_path)
-    monkeypatch.setattr(analyze, "previous_full",
-                        lambda run_dir: {"seconds": 100, "cost_usd_product": 1.0})
+    monkeypatch.setattr(analyze, "previous_run",
+                        lambda run_dir, tier: {"seconds": 100, "cost_usd_product": 1.0})
     d = _write_min_run(tmp_path, "20260102-000000-full")
     m = json.loads((d / "manifest.json").read_text())
     m[0]["summary"]["seconds"] = 300               # +200% >> ±30% band
@@ -669,8 +669,8 @@ def test_partial_run_trend_suppressed(monkeypatch, tmp_path):
     """G7: --only subset vs whole-tier baseline is apples-to-oranges — the
     2026-09-18 n=2 run took 2 spurious trend FAILs from it."""
     monkeypatch.setattr(analyze, "RESULTS", tmp_path)
-    monkeypatch.setattr(analyze, "previous_full",
-                        lambda run_dir: {"seconds": 1282, "cost_usd_product": 1.018})
+    monkeypatch.setattr(analyze, "previous_run",
+                        lambda run_dir, tier: {"seconds": 1282, "cost_usd_product": 1.018})
     d = _write_min_run(tmp_path, "20260101-000000-full-partial")
     m = json.loads((d / "manifest.json").read_text())
     m[0]["summary"]["seconds"] = 415
