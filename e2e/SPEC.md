@@ -41,7 +41,7 @@
 
 ## 4. 判定門檻（三類；suite.yaml `thresholds`）
 
-- **硬門（任一觸發＝FAIL）**：相鄰重複 agent_message 對>0；終態 complete 後遲到幀>0（**終幀後排水窗 `late_drain_s`=5s 內觀測**）；審批閉包破；**終態 complete 落在未執行審批之上（D1/#29 偵測器）**；**快取前綴中位數 ≥90%**（per-call 穩定前綴口徑：成長型 call〔>20%〕與 <5k 輔助上下文排除；聚合值僅報告欄）＋**degenerate-output**（session 輸出 <50 token 或 >10k-in/0-cache call 回 <10 token）；**對帳差>0.5% 或 audit 缺記 llm_call**；**有 metered cost_update 而 audit 檔缺席（audit-present）**；場景 `expect:` 全部鍵（approvals 下限/cancelled_turn/watchdog 觸發/complete_status/errors/**chaos_hits 注入數下限**/**graceful**）；flag faces >15（同代碼實測波動 8-14，基線 9 僅史料）；**清理斷言失敗**（容器殘留/埠佔用/8899 pid 變/金鑰掃命中＝cleanup-\* 硬門）。`skipped` 場景不計 FAIL（severity=skip）。
+- **硬門（任一觸發＝FAIL）**：相鄰重複 agent_message 對>0；終態 complete 後遲到幀>0（**終幀後排水窗 `late_drain_s`=5s 內觀測**）；審批閉包破；**終態 complete 落在未執行審批之上（D1/#29 偵測器）**；**快取前綴中位數 ≥90%**（per-call 穩定前綴口徑：成長型 call〔>20%〕與 <5k 輔助上下文排除；聚合值僅報告欄）＋**degenerate-output**（>10k-in 且 0-cache 的 call 回 <10 token——call 簽名口徑；「簡短但全快取」的暖召回不觸發）；**對帳差>0.5% 或 audit 缺記 llm_call**；**有 metered cost_update 而 audit 檔缺席（audit-present）**；場景 `expect:` 全部鍵（approvals 下限/cancelled_turn/watchdog 觸發/complete_status/errors/**chaos_hits 注入數下限**/**graceful**）；flag faces >15（同代碼實測波動 8-14，基線 9 僅史料）；**清理斷言失敗**（容器殘留/埠佔用/8899 pid 變/金鑰掃命中＝cleanup-\* 硬門）。`skipped` 場景不計 FAIL（severity=skip）。
 - **比例門**：audit×PRICING 對帳 ≤0.5%；HUD≡報告（頁面渲染，精確到分）。（cache 比例門已由 per-call 前綴中位數硬門取代，見上；聚合值僅報告欄。）
 - **趨勢門**：時長/成本 vs 前次 Full ±30% 帶（首輪建立基線）；**失敗＝判定 REGRESSION（非 PASS）**。
 - **判定詞彙**：PASS/FAIL/REGRESSION/SKIPPED＋每判定必附限定欄（n=、warm/cold、scope、口徑）。Quick PASS 僅授權「可併」＋免責聲明（n=1、協議面）；**發版＝Full 連續 2 次通過＋Deep-cold ≥1 樣本**。

@@ -887,10 +887,16 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
         _aside_copy(Path.home() / ".clearwing", post)
         diffs = []
         for name in ASIDE_FILES:
-            if (pre / name).exists() and (post / name).exists():
+            was, now = (pre / name).exists(), (post / name).exists()
+            if was and now:
                 pre_b, post_b = (pre / name).read_bytes(), (post / name).read_bytes()
                 if pre_b != post_b:
                     diffs.append(f"{name}:{len(pre_b)}->{len(post_b)}B")
+            elif now and not was:
+                diffs.append(f"{name}:+CREATED")       # appeared during the run —
+            elif was and not now:
+                diffs.append(f"{name}:-DELETED")       # a mutation the old
+        # pre∩post-only compare silently missed (Codex #67 r2)
         out.append(("memory-aside-diff-recorded", True,
                     f"changed: {diffs or 'none'} (control copies in state/aside-*)"))
     # P3.2 post-run target-state comparison vs pre-state.json snapshot.
@@ -1011,6 +1017,40 @@ def dispatch(sc: dict, ctx: dict) -> dict:
 # ---------------------------------------------------- adjudication layer ---
 
 ADJ_STATUS = "<!-- adjudication-status: {} -->"
+ADJ_VERDICTS = ("PASS", "FAIL", "REGRESSION", "MIXED")
+
+
+def _adj_override_rows(text: str) -> list[str]:
+    """Data rows of the overridden-gates table (non-header, pipe rows)."""
+    m = re.search(r"## overridden gates[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
+    rows = []
+    for line in (m.group(1) if m else "").splitlines():
+        s = line.strip()
+        if s.startswith("|") and not set(s) <= {"|", "-", " ", ":"} and "---" not in s \
+                and not s.startswith("| gate") and not s.startswith("| run "):
+            rows.append(s)
+    return rows
+
+
+def _adj_reviewed_hash(dirs: list[Path]) -> str:
+    """Content hash binding a FINAL adjudication to the exact machine
+    artifacts it reviewed (Codex #67 r2 P1): report/gates/ledger of every
+    indexed run dir. A post-review `analyze` re-render or any artifact
+    change invalidates the stamp and export refuses."""
+    import hashlib
+    h = hashlib.sha256()
+    for d in dirs:
+        for name in ("report.md", "gates.json", "ledger.json"):
+            f = Path(d) / name
+            h.update(name.encode())
+            h.update(f.read_bytes() if f.exists() else b"<absent>")
+    return h.hexdigest()[:16]
+
+
+def _adj_indexed_dirs(text: str) -> list[Path]:
+    """Run dirs recorded in the adjudication's run index (backtick paths)."""
+    m = re.search(r"## run index.*?(?=\n## )", text, re.S)
+    return [Path(x) for x in re.findall(r"`([^`]+)`", m.group(0))] if m else []
 
 
 def _adj_status(text: str) -> str | None:
@@ -1096,8 +1136,21 @@ def cmd_adjudicate(args) -> None:
         if not mv or not mv.group(1).strip():
             die("final verdict line is empty — set `verdict: PASS|FAIL|REGRESSION|MIXED` "
                 "in the adjudication (export quotes THIS value, not report.md)")
-        adj.write_text(text.replace(ADJ_STATUS.format("DRAFT"), ADJ_STATUS.format("FINAL")))
-        log(f"adjudication FINAL: {adj} verdict={mv.group(1).strip()}")
+        verdict = mv.group(1).strip()
+        if verdict not in ADJ_VERDICTS:
+            die(f"verdict {verdict!r} not in {ADJ_VERDICTS} (Codex #67 r2)")
+        facts = [_run_dir_facts(d) for d in dirs]
+        machine = sorted({f["verdict"] for f in facts if f["verdict"] != "?"})
+        flipped = machine and verdict not in machine and not (len(machine) > 1)
+        if flipped and not _adj_override_rows(text):
+            die(f"final verdict {verdict} flips the machine verdict {machine} but the "
+                "overridden-gates table is EMPTY — a flip must carry its 論據 rows "
+                "(gate | run/scenario | conclusion | evidence | limits)")
+        stamp_dirs = _adj_indexed_dirs(text) or dirs   # same set export will use
+        stamp = (f"<!-- reviewed-hash: {_adj_reviewed_hash(stamp_dirs)} -->")
+        adj.write_text(text.replace(ADJ_STATUS.format("DRAFT"),
+                                    ADJ_STATUS.format("FINAL") + "\n" + stamp))
+        log(f"adjudication FINAL: {adj} verdict={verdict} reviewed-hash bound")
         return
 
     if adj.exists():
@@ -1113,6 +1166,14 @@ def cmd_adjudicate(args) -> None:
         if re.search(r"^verdict:[ \t]*\S", existing, re.M):
             die(f"{adj} already carries a human final verdict — regenerating would "
                 "destroy it; delete it consciously first (SPEC §2.7)")
+        if _adj_override_rows(existing):
+            die(f"{adj} already carries human override rows — regenerating would "
+                "destroy them; delete it consciously first (SPEC §2.7)")
+        lm = re.search(r"## limits[^\n]*\n(.*?)(?=\n## |\Z)", existing, re.S)
+        lbody = (lm.group(1) if lm else "").strip()
+        if lbody and lbody != "-":
+            die(f"{adj} already carries human limits — regenerating would "
+                "destroy them; delete it consciously first (SPEC §2.7)")
     lines = [
         "# cw-e2e adjudication — round " + time.strftime("%Y-%m-%d %H:%M"), "",
         ADJ_STATUS.format("DRAFT"), "",
@@ -1160,22 +1221,30 @@ def cmd_export(args) -> None:
     if not adj.exists():
         die(f"no adjudication.md in {d} — run `cw-e2e adjudicate` and complete the "
             "review record first (SPEC §9 hard rule: 對外開單前必複審)")
-    if _adj_status(adj.read_text()) != "FINAL":
+    text = adj.read_text()
+    if _adj_status(text) != "FINAL":
         die("adjudication is still DRAFT — finalize it (non-empty review record "
             "required) before exporting external-facing content")
-    facts = _run_dir_facts(d)
-    mv = re.search(r"^verdict:[ \t]*(\S+)", adj.read_text(), re.M)
-    final_verdict = mv.group(1).strip() if mv else facts["verdict"]
-    machine_note = "" if final_verdict == facts["verdict"] else \
-        f" (machine verdict was {facts['verdict']} — adjudicated; see overrides)"
+    indexed = _adj_indexed_dirs(text) or [d]
+    hm = re.search(r"<!-- reviewed-hash: ([0-9a-f]+) -->", text)
+    if hm and hm.group(1) != _adj_reviewed_hash(indexed):
+        die("reviewed artifacts changed since finalize (analyze re-run or "
+            "report/gates/ledger mutation) — re-review and re-finalize; export "
+            "refuses to mix an old verdict with fresh machine facts")
+    all_facts = [_run_dir_facts(x) for x in indexed]
+    total_cost = round(sum(f["cost"] or 0 for f in all_facts), 4)
+    machine = sorted({f["verdict"] for f in all_facts if f["verdict"] != "?"})
+    mv = re.search(r"^verdict:[ \t]*(\S+)", text, re.M)
+    final_verdict = mv.group(1).strip() if mv else "MIXED"
+    machine_note = "" if final_verdict in machine or not machine else \
+        f" (machine verdict was {'/'.join(machine)} — adjudicated; see overrides)"
     out = [f"cw-e2e round summary (auto-export {time.strftime('%F %T')} — "
            f"adjudicated, review on record)", "",
-           f"- verdict: **{final_verdict}**{machine_note} · ${facts['cost']} · "
-           f"run dir `{facts['path']}`"]
-    g = json.loads((d / "gates.json").read_text()) if (d / "gates.json").exists() else []
-    failed = [x["gate"] for x in g if not x["pass"]]
-    out.append(f"- failed gates: {', '.join(failed) or 'none'}"
-               + (" (adjudicated — see adjudication.md overrides)" if failed else ""))
+           f"- verdict: **{final_verdict}**{machine_note} · round ${total_cost} · "
+           f"{len(all_facts)} run dir(s)"]
+    for f in all_facts:
+        out.append(f"  - `{f['path']}` — {f['verdict']} · ${f['cost']} · "
+                   + (f"failed: {', '.join(f['failed_gates'])}" if f["failed_gates"] else "clean"))
     if (d / "r3-manual.md").exists() and not (d / "r3-done").exists():
         out.append("- ⚠️ R3 人工抽核未完成（r3-manual.md 待填、無 r3-done）——"
                    "發版級宣稱（Full×2＋deep-cold）不應引用本 run")
@@ -1240,9 +1309,22 @@ def cmd_run(args) -> None:
                                                "expect": sc.get("expect")})
                 except Exception as e:  # noqa: BLE001 — one scenario must not kill the run
                     log(f"  -> scenario CRASHED: {type(e).__name__}: {e}")
-                    ctx["results"].append({"name": sc["name"],
-                                           "summary": {"type": "crashed", "status": "crashed",
-                                                       "error": f"{type(e).__name__}: {e}"},
+                    crashed = {"type": "crashed", "status": "crashed",
+                               "error": f"{type(e).__name__}: {e}"}
+                    # spend already metered before the crash must not vanish
+                    # from the ledger (Codex #67 r2): recover the running
+                    # total from the frames log the driver managed to write
+                    fl = run_dir / "scenarios" / f"{sc['name']}.frames.jsonl"
+                    if fl.exists():
+                        try:
+                            import re as _re2
+                            costs = [float(m) for m in _re2.findall(
+                                r'"total_cost_usd":\s*([0-9.]+)', fl.read_text(errors="ignore"))]
+                            if costs:
+                                crashed["cost_usd_product"] = max(costs)
+                        except (OSError, ValueError):
+                            pass
+                    ctx["results"].append({"name": sc["name"], "summary": crashed,
                                            "expect": sc.get("expect")})
                 (run_dir / "manifest.json").write_text(
                     json.dumps(ctx["results"], ensure_ascii=False, indent=1, default=str))

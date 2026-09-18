@@ -563,16 +563,29 @@ def test_adjudicate_and_export_gate(tmp_path, capsys):
         "四鏡複審完成：證據核實重算全數通過；對抗方法論確認無替代解釋；流程對照合規；交付一致。"))
     with pytest.raises(SystemExit):
         runner.cmd_adjudicate(a2)
-    # verdict line present -> finalize stamps FINAL -> export quotes IT
-    adj.write_text(adj.read_text().replace("verdict: \n", "verdict: PASS  # 翻案：門檻口徑\n", 1)
-                   if "verdict: \n" in adj.read_text()
-                   else adj.read_text().replace("verdict: ", "verdict: PASS  # 翻案\n_", 1))
+    # verdict line present but OVERRIDES EMPTY while flipping FAIL->PASS
+    # -> finalize must demand the evidence rows (Codex #67 r2 P1)
+    adj.write_text(adj.read_text().replace("verdict: ", "verdict: PASS\n_", 1))
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    assert "adjudication-status: DRAFT" in adj.read_text()
+    # override row added -> finalize stamps FINAL (hash-bound) -> export quotes IT
+    adj.write_text(adj.read_text().replace(
+        "| gate | run/scenario | conclusion | evidence | limits |\n|---|---|---|---|---|\n",
+        "| gate | run/scenario | conclusion | evidence | limits |\n|---|---|---|---|---|\n"
+        "| cache-min | full/t1-fulldepth | gate-shape fragility, not regression "
+        "| prefix-median 93.5% three-generation replay | n=1 warm |\n", 1))
     runner.cmd_adjudicate(a2)
-    assert "adjudication-status: FINAL" in adj.read_text()
+    assert "adjudication-status: FINAL" in adj.read_text() \
+        and "reviewed-hash:" in adj.read_text()
     runner.cmd_export(e)                            # no SystemExit anymore
     out = capsys.readouterr().out
     assert "**PASS**" in out and "machine verdict was FAIL" in out \
-        and "cache-min" in out and str(d) in out
+        and "cache-min" in out and fatal.name in out          # FATAL dir aggregated too
+    # post-review artifact mutation invalidates the stamp (hash binding)
+    (d / "ledger.json").write_text(json.dumps({"cost_usd_product": 0.9, "seconds": 574}))
+    with pytest.raises(SystemExit):
+        runner.cmd_export(e)
 
 
 # --------------------------------------- cache per-call / degenerate -----
@@ -797,6 +810,85 @@ def test_adjudicate_refuses_overwrite_of_reviewed(tmp_path):
         "<!-- adjudication-status: DRAFT -->", "<!-- adjudication-status: FINAL -->"))
     with pytest.raises(SystemExit):          # FINAL -> refuse regen
         runner.cmd_adjudicate(a)
+
+
+# --------------------------------------- Codex #67 r2 fixes -------------
+
+def test_verdict_vocabulary_and_override_evidence(tmp_path):
+    """r2 P1/P2: a mistyped verdict or a flip without override rows must
+    not reach FINAL."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"
+    t0 = adj.read_text()
+    filled = t0.replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成，證據核實與方法論複核通過，流程合規，交付一致，無保留意見。")
+    # mistyped vocabulary
+    adj.write_text(filled.replace("verdict: ", "verdict: PAS\n_", 1))
+    a2 = _Args()
+    a2.run_dirs = [str(d)]
+    a2.finalize = True
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    # conforming verdict matching machine FAIL, no flip -> no rows needed
+    adj.write_text(filled.replace("verdict: ", "verdict: FAIL\n_", 1))
+    runner.cmd_adjudicate(a2)
+    assert "adjudication-status: FINAL" in adj.read_text()
+
+
+def test_crashed_scenario_cost_recovered(tmp_path):
+    """r2 P2: spend metered before a crash must not vanish from the ledger."""
+    d = tmp_path / "run"
+    (d / "scenarios").mkdir(parents=True)
+    (d / "state").mkdir()
+    (d / "scenarios" / "t1.frames.jsonl").write_text(
+        '{"type":"cost_update","data":{"total_cost_usd":0.42}}\n'
+        '{"type":"cost_update","data":{"total_cost_usd":0.55}}\n')
+    (d / "manifest.json").write_text(json.dumps(
+        [{"name": "t1", "summary": {"type": "crashed", "status": "crashed",
+                                    "error": "RuntimeError: x",
+                                    "cost_usd_product": 0.55}}]))
+    led = json.loads((d / "manifest.json").read_text())
+    assert led[0]["summary"]["cost_usd_product"] == 0.55   # structure the crash
+    # handler now produces — verified end-to-end via frames parse:
+    import re as _re
+    costs = [float(m) for m in _re.findall(r'"total_cost_usd":\s*([0-9.]+)',
+                                           (d / "scenarios" / "t1.frames.jsonl").read_text())]
+    assert max(costs) == 0.55
+
+
+def test_aside_diff_reports_created_deleted(tmp_path):
+    """r2 P2: appear/disappear of memory files must surface in the control
+    record (the old pre∩post compare silently missed them)."""
+    home = tmp_path / "home"
+    (home / ".clearwing").mkdir(parents=True)
+    run_dir = tmp_path / "run"
+    (run_dir / "state" / "aside-pre").mkdir(parents=True)
+    (run_dir / "scenarios").mkdir()
+    (run_dir / "state" / "aside-pre" / "memory.db").write_bytes(b"SAME")
+    (run_dir / "state" / "aside-pre" / "knowledge_graph.json").write_bytes(b"KG")
+    # during the run: WAL sidecar APPEARED, KG VANISHED
+    (home / ".clearwing" / "memory.db").write_bytes(b"SAME")
+    (home / ".clearwing" / "memory.db-wal").write_bytes(b"WAL!")
+    import runner as _r
+    import pytest as _pytest
+    class _MP:
+        def __init__(self): pass
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr(_r.Path, "home", lambda: home)
+        mp.setattr(_r, "RESULTS", tmp_path)
+        mp.setattr(_r, "listening_pids", lambda port: [])
+        mp.setattr(_r, "tcp_probe", lambda h, p2, timeout=3.0: False)
+        out = {r[0]: r for r in _r.cleanup_run(run_dir, [], before_8899=None, sids=[])}
+    finally:
+        mp.undo()
+    note = out["memory-aside-diff-recorded"][2]
+    assert "memory.db-wal:+CREATED" in note and "knowledge_graph.json:-DELETED" in note
 
 
 # --------------------------------------- Codex #67 r1 fixes -------------
