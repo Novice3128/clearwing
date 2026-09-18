@@ -25,7 +25,21 @@ FIFO queue and one writer coroutine:
 - a terminal frame whose flush handshake was cancelled by `stop` is
   skipped by the writer — the client's first terminal frame is the
   authoritative `stopped`, never the cancelled turn's stale
-  agent_message/complete (Codex PR-62 r3).
+  agent_message/complete (Codex PR-62 r3);
+- a terminal frame gets exactly ONE send attempt (Codex PR-62 r4): a
+  failed attempt discards the entry, so `_send_frame`'s False is a hard
+  guarantee the frame never reaches the wire — a transport recovering
+  after the failure cannot deliver a stale terminal frame;
+- a failed send no longer sweeps pending flush handshakes (Codex PR-62
+  r4): a waiter queued behind a stalled BUS frame stays pending until
+  the transport recovers (the FIFO delivers everything and the turn ends
+  with its `complete`) or no progress is possible at all (writer death,
+  dead socket);
+- an in-turn cost frame with NO session_id keeps the legacy
+  accumulation on session-bound connections too (Codex PR-62 r4): its
+  spend was never booked in the tracker, so the snapshot rewrite would
+  silently drop it from the displayed totals — best-effort display, the
+  tracker stays authoritative.
 """
 
 from __future__ import annotations
@@ -969,13 +983,17 @@ class TestWriterDeathWithoutWaiters:
 
 
 class TestCancelledTerminalFrameResidue:
-    """Codex PR-62 r3 (Finding 1): a terminal frame whose flush handshake
-    was cancelled by `stop` must never reach the wire. The turn parks on
-    `await fut` while the writer sits in a send-retry backoff; the stop
-    cancels the turn task, which cancels the awaited future — the entry
-    stays in the queue, and the writer must SKIP it instead of delivering
-    a stale agent_message/complete ahead of the authoritative
-    `stopped` + `complete(status=stopped)` handshake."""
+    """Codex PR-62 r3 (Finding 1), r4 shape: a terminal entry whose flush
+    handshake was cancelled by `stop` must never reach the wire. The turn
+    passes its flush (transport healthy); then a bus echo lands in the
+    FIFO BETWEEN the flush and the turn's inline agent_message, the
+    transport congests, and the writer stalls on that bus frame's retry
+    backoff while the turn parks on the inline handshake. Stop cancels the
+    turn task — the parked handshake is cancelled, its entry stranded in
+    the queue — and only then does the transport recover: the stalled echo
+    goes out, the cancelled entry is SKIPPED, and the client's first
+    terminal frame is the authoritative `stopped` +
+    `complete(status=stopped)` handshake."""
 
     def test_stale_terminal_frame_skipped_after_stop_cancels_flush(
         self, client, monkeypatch
@@ -986,26 +1004,41 @@ class TestCancelledTerminalFrameResidue:
 
         from clearwing.ui.web import app as app_module
 
-        # A wide retry interval: the writer's next failed-attempt sweep
-        # (which resolves every pending handshake False and would end the
-        # turn EARLY instead of stranding a cancelled entry) must stay a
-        # safe distance past the stop's round trip.
+        # A wide retry interval: the writer's next bus-frame retry attempt
+        # must stay a safe distance past the stop's round trip, so the
+        # writer is still stalled (and the turn still parked on its
+        # handshake) when the stop cancels the turn task.
         monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 1.0)
 
-        # Turn-side anchor: add_agent records the reply text immediately
-        # BEFORE the dedup gate and the inline agent_message enqueue — the
-        # turn is parked on that frame's flush handshake one loop slot
-        # later. Stop-side anchor: the stop handler records the operator
-        # stop in the transcript AFTER the cancelled turn task was joined
-        # and BEFORE enqueueing `stopped`.
-        parked = threading.Event()
-        stopped_recorded = threading.Event()
+        # Turn-side anchor with a deterministic hand-off: add_agent fires
+        # right after the flush resolved and right before the dedup gate
+        # and the inline agent_message enqueue. While the turn is parked
+        # HERE (blocking the loop thread), the test congests the transport
+        # and emits a second bus echo — its call_soon_threadsafe enqueue is
+        # scheduled on the loop BEFORE the turn's post-sleep(0) resume, so
+        # the echo provably enters the FIFO ahead of the inline frame.
+        flushed = threading.Event()
+        echo_scheduled = threading.Event()
         real_add_agent = app_module.SessionTranscript.add_agent
-        real_add_error = app_module.SessionTranscript.add_error
 
-        def signaling_add_agent(transcript_self, content):
+        def handoff_add_agent(transcript_self, content):
             real_add_agent(transcript_self, content)
-            parked.set()
+            flushed.set()
+            # Block the loop thread until the test thread has congested
+            # the transport and scheduled the second echo's enqueue.
+            assert echo_scheduled.wait(timeout=10), (
+                "test thread never scheduled the second echo"
+            )
+
+        monkeypatch.setattr(
+            app_module.SessionTranscript, "add_agent", handoff_add_agent
+        )
+
+        # Stop-side anchor: the stop handler records the operator stop in
+        # the transcript AFTER the cancelled turn task was joined and
+        # BEFORE enqueueing `stopped`.
+        stopped_recorded = threading.Event()
+        real_add_error = app_module.SessionTranscript.add_error
 
         def signaling_add_error(transcript_self, message):
             real_add_error(transcript_self, message)
@@ -1013,14 +1046,11 @@ class TestCancelledTerminalFrameResidue:
                 stopped_recorded.set()
 
         monkeypatch.setattr(
-            app_module.SessionTranscript, "add_agent", signaling_add_agent
-        )
-        monkeypatch.setattr(
             app_module.SessionTranscript, "add_error", signaling_add_error
         )
 
         # Congestion, then recovery: every send fails while the flag is
-        # down (the writer sits in its retry backoff on the echo frame)
+        # down (the writer sits in its retry backoff on the second echo)
         # and succeeds again once it flips back up.
         real_send_text = FastAPIWebSocket.send_text
         congested = {"now": False}
@@ -1032,7 +1062,7 @@ class TestCancelledTerminalFrameResidue:
 
         monkeypatch.setattr(FastAPIWebSocket, "send_text", congested_send_text)
 
-        # > 200 chars: the bus echo is a 200-char preview that never
+        # > 200 chars: the pre-flush echo is a 200-char preview that never
         # equals the full text, so the dedup gate cannot suppress the
         # inline send the turn parks on.
         text = "stale-terminal-frame-probe " * 40
@@ -1044,14 +1074,18 @@ class TestCancelledTerminalFrameResidue:
                 ws.send_json({"type": "start", "target": "10.0.0.9"})
                 assert ws.receive_json()["type"] == "started"
 
-                congested["now"] = True
                 ws.send_json({"type": "message", "content": "run"})
-                assert parked.wait(timeout=10), (
-                    "turn never reached its inline agent_message enqueue"
+                assert flushed.wait(timeout=10), (
+                    "turn never passed its flush handshake"
                 )
-                # Stop NOW — inside the retry window, with the turn parked
-                # on the inline frame's flush handshake and the stale
-                # entry already queued behind the stuck echo.
+                # Congest the transport, then schedule a bus echo that
+                # will stall the writer AHEAD of the turn's inline frame.
+                congested["now"] = True
+                _emit_message("second-echo-before-inline", "agent")
+                echo_scheduled.set()
+
+                # Stop inside the backoff window: the turn is parked on
+                # the inline handshake, the writer on the stalled echo.
                 ws.send_json({"type": "stop"})
                 # Once the stop is recorded the turn task has been
                 # cancelled and joined: its handshake future is cancelled
@@ -1081,16 +1115,258 @@ class TestCancelledTerminalFrameResidue:
         contents = [
             f["data"]["content"] for f in frames if f["type"] == "agent_message"
         ]
-        # The stale inline agent_message was skipped with its cancelled
-        # handshake; only the echo's 200-char preview was delivered.
+        # The pre-flush echo was already delivered (healthy transport) and
+        # the stalled second echo goes out after recovery; the cancelled
+        # inline agent_message is skipped — the full text never lands.
         assert text not in contents
         assert text[:200] in contents
+        assert "second-echo-before-inline" in contents
         # The handshake completes as stopped, and no complete frame ever
         # claims status ok.
         assert frames[-1]["data"]["status"] == "stopped"
         assert all(
             f["data"].get("status") != "ok" for f in frames if f["type"] == "complete"
         )
+
+
+class TestTerminalFrameSingleAttempt:
+    """Codex PR-62 r4 (P1): a terminal frame gets exactly ONE send
+    attempt. When that attempt fails the writer DISCARDS the entry and
+    resolves the handshake False — so a transport that recovers afterwards
+    can never deliver the frame the caller already gave up on. Pre-fix the
+    writer kept retrying the failed terminal frame in the background and
+    delivered it once the transport recovered, out of order with the stop
+    handshake that had already closed the turn."""
+
+    def test_failed_terminal_frame_never_sent_after_recovery(
+        self, client, monkeypatch
+    ):
+        import threading
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.05)
+
+        # Anchor on the transport itself: the patched send_text records
+        # the first RAISED attempt, so the test knows the terminal frame's
+        # one attempt already failed before it flips the transport back on.
+        real_send_text = FastAPIWebSocket.send_text
+        congested = {"now": False}
+        failed_attempt = threading.Event()
+
+        async def congested_send_text(self_ws, data):
+            if congested["now"]:
+                failed_attempt.set()
+                raise RuntimeError("simulated send congestion")
+            return await real_send_text(self_ws, data)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", congested_send_text)
+
+        # No bus echo: the queue is empty at flush time, so the turn sails
+        # through `_flush_writer` (the sentinel resolves without a send)
+        # and parks on the inline agent_message's own handshake — THAT
+        # frame is the one the writer attempts (and fails) while
+        # congested. The heartbeat's first frame is +10s away, so nothing
+        # else can be the failed send.
+        class _SilentGraph:
+            def get_state(self, config):
+                del config
+                return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+
+            async def astream(self, input_msg, config, stream_mode="values"):
+                del input_msg, config, stream_mode
+                yield {"messages": [_AI("silent turn output")]}
+
+        with patch(
+            "clearwing.ui.web.app.create_agent", lambda **kwargs: _SilentGraph()
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                assert ws.receive_json()["type"] == "started"
+
+                congested["now"] = True
+                ws.send_json({"type": "message", "content": "run"})
+                # The writer attempted (and failed) the turn's terminal
+                # agent_message exactly once; the turn saw the hard False
+                # and returned without ever enqueueing a complete.
+                assert failed_attempt.wait(timeout=10)
+
+                # The stop arrives AFTER the failed attempt, and only now
+                # does the transport recover — the discarded frame must
+                # still never be sent.
+                congested["now"] = False
+                ws.send_json({"type": "stop"})
+
+                frames = []
+                while True:
+                    frame = _receive_json_with_timeout(ws)
+                    frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+        types = [f["type"] for f in frames]
+        # Nothing but the stop handshake: the discarded agent_message is
+        # never delivered — pre-fix it was retried in the background and
+        # arrived as a stale terminal frame after (or before) the
+        # authoritative stopped/complete.
+        assert types[0] == "stopped"
+        assert "agent_message" not in types
+        assert frames[-1]["type"] == "complete"
+        assert frames[-1]["data"]["status"] == "stopped"
+
+
+class TestStalledBusFrameKeepsLaterWaitersPending:
+    """Codex PR-62 r4 (P2): a waiter queued behind a BUS frame stalled in
+    its retry backoff must STAY pending. The old failed-send sweep
+    resolved it False, the turn returned without sending `complete`, and
+    the frames still went out once the transport recovered — the client
+    sat waiting for a complete that never came. On recovery the FIFO
+    delivers everything and the turn ends normally with complete(ok)."""
+
+    def test_recovery_delivers_fifo_and_turn_completes(self, client, monkeypatch):
+        import threading
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.05)
+
+        # Congestion lifts only after the stalled echo has failed a SECOND
+        # attempt: with a single failure the pre-fix sweep of the flush
+        # sentinel might not have reached the inline handshake yet, and
+        # the recovered retry would deliver everything before the turn
+        # gave up — a false pass on the old code. Two failed attempts
+        # guarantee the old sweep already failed BOTH the sentinel and the
+        # inline handshake parked behind it.
+        real_send_text = FastAPIWebSocket.send_text
+        congested = {"now": False}
+        failures = {"n": 0}
+        second_failure = threading.Event()
+
+        async def congested_send_text(self_ws, data):
+            if congested["now"]:
+                failures["n"] += 1
+                if failures["n"] >= 2:
+                    second_failure.set()
+                raise RuntimeError("simulated send congestion")
+            return await real_send_text(self_ws, data)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", congested_send_text)
+
+        text = "fifo-recovery-probe " * 30  # > 200 chars: echo is a preview
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _EchoThenFinishGraph(text),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                assert ws.receive_json()["type"] == "started"
+
+                congested["now"] = True
+                ws.send_json({"type": "message", "content": "run"})
+                # The echo (bus frame, no handshake) is stalled in the
+                # writer's retry backoff; the turn's flush sentinel and
+                # then its inline handshake queue up behind it and stay
+                # PENDING (no sweep).
+                assert second_failure.wait(timeout=10)
+                congested["now"] = False
+
+                # Recovery: the FIFO delivers the echo, the flush resolves,
+                # the inline full text goes out, and the turn ends with
+                # complete(ok) — pre-fix the client hung here with no
+                # complete ever arriving.
+                frames = []
+                while True:
+                    frame = _receive_json_with_timeout(ws)
+                    frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+                # The connection is fully healthy afterwards — a clean
+                # stop handshake round-trips on the same socket.
+                ws.send_json({"type": "stop"})
+                assert ws.receive_json()["type"] == "stopped"
+                assert ws.receive_json()["type"] == "complete"
+
+        contents = [
+            f["data"]["content"] for f in frames if f["type"] == "agent_message"
+        ]
+        assert text[:200] in contents  # the stalled echo went out
+        assert text in contents  # the full inline text followed in FIFO order
+        assert frames[-1]["data"]["status"] == "ok"
+
+
+class TestLegacyUnmarkedCostFrame:
+    """Codex PR-62 r4 (P2): an in-turn cost frame with NO session_id (a
+    legacy emitter) carries spend the tracker never booked — no bucket
+    holds it. On a session-bound connection the adapter must still count
+    it into the DISPLAYED totals (the legacy in-turn accumulation) instead
+    of rewriting it to the tracker water level that lacks it. The
+    accumulation is best-effort display only: the next scoped frame's
+    tracker snapshot stays authoritative and does not include the unbooked
+    legacy spend."""
+
+    def test_in_turn_unmarked_frame_counted_then_scoped_snapshot(self, client):
+        from clearwing.observability.telemetry import CostTracker
+
+        class _LegacyThenScopedGraph:
+            def __init__(self, **kwargs):
+                self.session_id = kwargs.get("session_id")
+
+            def get_state(self, config):
+                del config
+                return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+
+            async def astream(self, input_msg, config, stream_mode="values"):
+                del input_msg, config, stream_mode
+                # Legacy shape: no session_id, nothing booked in the
+                # tracker — the spend exists only in the frame's fields.
+                _emit_cost(
+                    {
+                        "input_tokens": 11,
+                        "output_tokens": 4,
+                        "cost": 0.003,
+                        "total_cost_usd": 777.0,  # the emitter's process-global lie
+                        "total_tokens": 777000,
+                        "model": "fake-model",
+                        "provider": "openai",
+                        "elapsed_ms": 0,
+                    }
+                )
+                # Scoped shape: a real booking under this session's id
+                # (record_llm_call emits its frame itself).
+                CostTracker().record_llm_call(
+                    500, 50, "fake-model", session_id=self.session_id
+                )
+                yield {"messages": [_AI("done")]}
+
+        with patch(
+            "clearwing.ui.web.app.create_agent", _LegacyThenScopedGraph
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                assert ws.receive_json()["type"] == "started"
+                ws.send_json({"type": "message", "content": "run"})
+                cost_frames = []
+                while True:
+                    frame = json.loads(ws.receive_text())
+                    if frame["type"] == "cost_update":
+                        cost_frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+        assert len(cost_frames) == 2
+        legacy, scoped = (f["data"] for f in cost_frames)
+        # The unmarked in-turn frame's spend IS counted into the display —
+        # pre-fix the snapshot branch rewrote it to the (empty) tracker
+        # bucket and the spend vanished from the wire.
+        assert legacy["total_cost_usd"] == pytest.approx(0.003)
+        assert legacy["total_tokens"] == 15
+        # The next scoped frame is tracker-authoritative: the booked call
+        # only — the legacy spend is not in any bucket and does not ride
+        # along (best-effort display; the tracker stays authoritative).
+        booked_cost = CostTracker.estimate_cost(500, 50, "fake-model")
+        assert scoped["total_cost_usd"] == pytest.approx(booked_cost)
+        assert scoped["total_tokens"] == 550
 
 
 class TestSessionSnapshotAtomicity:

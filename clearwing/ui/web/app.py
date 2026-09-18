@@ -574,9 +574,12 @@ def create_app():
         #   were actually DELIVERED, never merely enqueued;
         # - `fut` (optional) is the enqueue-side flush handshake: it
         #   resolves True once the writer has sent the entry (or, for a
-        #   sentinel, everything before it), and False as soon as a send
-        #   attempt fails — the same single-strike signal the old inline
-        #   `_safe_send` callers used to detect a gone client.
+        #   sentinel, everything before it), and False when its single
+        #   send attempt failed or the writer died — the same
+        #   single-strike signal the old inline `_safe_send` callers used
+        #   to detect a gone client, upgraded to a hard "this frame will
+        #   never be sent" guarantee (Codex PR-62 r4: a failed terminal
+        #   entry is discarded, never retried).
         outbound_queue: asyncio.Queue = asyncio.Queue()
         # The single writer task (created after the handler's helpers are
         # defined, before the receive loop starts). _send_frame and
@@ -585,12 +588,18 @@ def create_app():
         # handshakes must fail fast instead of parking forever (the
         # done-callback only drains futures that were pending at death).
         writer_task: asyncio.Task | None = None
-        # Flush futures currently pending in the queue. The writer resolves
-        # them all False the moment a send attempt fails: they provably
-        # cannot be delivered until the stuck frame goes out, and without
-        # this an enqueue-side `await fut` could hang forever on a dead
-        # socket (the receive loop would never return to receive_text to
-        # notice the disconnect).
+        # Flush futures currently pending in the queue. A pending waiter is
+        # failed ONLY when no further progress is possible: the writer died
+        # (`_writer_died` resolves them False) or was already done (the
+        # fast-fail guards in `_send_frame`/`_flush_writer`). A send failure
+        # does NOT sweep them (Codex PR-62 r4): a waiter queued behind a
+        # stalled BUS frame stays pending — the transport may recover and
+        # the FIFO still delivers it, whereas resolving it False early ended
+        # its turn without a `complete` while the frames still went out
+        # afterwards, leaving the client hanging. A genuinely dead socket
+        # cannot park a waiter forever either: the receive loop's disconnect
+        # path cancels the turn task, turning the parked `await fut` into a
+        # CancelledError.
         flush_futures: set[asyncio.Future] = set()
         transcript: SessionTranscript | None = None
         session_id: str | None = None
@@ -644,8 +653,11 @@ def create_app():
             session are scoped here — a mismatching id (another webui
             session, a standalone hunt's sh-* id) is dropped so concurrent
             sessions never swallow each other's spend. Emissions without a
-            session id (older callers) keep the transitional behaviour and
-            still accumulate while this turn runs.
+            session id (older callers) keep the transitional accumulation
+            behaviour while this turn runs — keyed on the FRAME's origin
+            (Codex PR-62 r4): such spend was never booked under the
+            tracker, so on a session-bound connection too the snapshot
+            rewrite would silently drop it from the displayed totals.
 
             Totals are TRACKER-AUTHORITATIVE (Codex PR-62 r3): the runtime
             books every call under the tracker's lock BEFORE emitting its
@@ -657,18 +669,27 @@ def create_app():
             boundary could not double-count a call an out-of-turn frame
             already captured (the r2 rebase race), and whatever order the
             handlers run in, the wire totals are rewritten to the same
-            authoritative water level. A sessionless (None) id keeps the
-            legacy in-turn ``+=`` transitional semantics — the tracker has
-            no bucket to read there (out-of-turn it snapshots to zero,
-            the accepted r1 behaviour).
+            authoritative water level. An UNMARKED (None-origin) frame
+            keeps the legacy in-turn ``+=`` transitional semantics — the
+            tracker has no bucket holding that spend (out-of-turn it
+            snapshots back to the water level, the accepted r1 behaviour),
+            and the accumulation is best-effort display only: the next
+            scoped frame's snapshot assignment re-reads the tracker and
+            does not include unbooked legacy spend. The tracker stays
+            authoritative.
             """
             origin = data.get("session_id")
             if origin is not None and origin != session_id:
                 return None
             scoped = dict(data)
-            if session_id is None and turn_state["active"]:
-                # Legacy no-id transition: accumulate the frame's own
-                # per-call fields while this turn runs (unchanged).
+            if origin is None and turn_state["active"]:
+                # Legacy UNMARKED emitter (origin None) while this turn
+                # runs: the spend was never booked in the tracker, so the
+                # snapshot branch below would rewrite the display to a
+                # water level that lacks it — accumulate the frame's own
+                # per-call fields instead (best-effort display; see
+                # docstring). This also covers a pre-start connection
+                # (session_id None), where no turn can run anyway.
                 call_cost = data.get("cost")
                 per_call_tokens = (data.get("input_tokens") or 0) + (
                     data.get("output_tokens") or 0
@@ -683,8 +704,10 @@ def create_app():
             # One locked snapshot, not two independent reads: a booking
             # landing between separate session_total and session_tokens
             # calls would yield a frame whose tokens include a call its
-            # cost does not (Codex PR-62 r1). For a None id out of turn
-            # this is (0, 0, 0) — the accepted r1 behaviour.
+            # cost does not (Codex PR-62 r1). An unmarked (None-origin)
+            # frame OUT of turn lands here too: the snapshot is the
+            # connection's tracker water level — (0, 0, 0) on a pre-start
+            # connection, the accepted r1 behaviour.
             scoped_cost, in_tokens, out_tokens = telemetry.CostTracker().session_snapshot(
                 session_id
             )
@@ -928,11 +951,16 @@ def create_app():
             Returns True when the writer sent it (every frame enqueued
             earlier went out first — FIFO, single writer, so a `complete`
             can never overtake queued bus frames again, issue #45). Returns
-            False on the frame's first failed send attempt — the same
+            False when the frame will NEVER reach the wire: its single send
+            attempt failed, or the writer is already gone — the same
             single-strike "client is gone" signal the old inline
-            `_safe_send` gave its callers. The writer keeps retrying the
-            frame in the background, but a False here means teardown is
-            imminent.
+            `_safe_send` gave its callers (Codex PR-62 r4: a failed
+            terminal frame is discarded, never retried, so False is a hard
+            guarantee the frame never goes out, not merely "teardown
+            imminent"). A waiter queued behind a stalled BUS frame stays
+            pending here until the transport recovers (FIFO still
+            delivers), the writer dies (`_writer_died`), or the socket
+            goes away (disconnect-path cancellation).
             """
             # Yield once before entering the FIFO: a bus event emitted just
             # before the turn ended (a late worker-thread booking) reaches
@@ -963,9 +991,16 @@ def create_app():
             Replaces the old `_drain_events` tail flushes (#53): a sentinel
             sits in the same FIFO queue, so the writer only reaches it after
             every earlier frame was actually sent (and noted for the dedup
-            gate). If a send is failing, the writer resolves the sentinel
-            False on its next failed attempt rather than parking here
-            forever.
+            gate). While an earlier BUS frame is stalled in its retry
+            backoff the sentinel simply stays PENDING (Codex PR-62 r4): on
+            recovery the FIFO delivers everything and it resolves True,
+            whereas failing it early ended the turn without a `complete`
+            while its frames still went out later, leaving the client
+            hanging. No-progress outcomes cannot park here forever: a dead
+            writer is failed by `_writer_died` (or the done() fast-fail
+            below), and a dead socket is reaped by the receive loop's
+            disconnect path, whose turn-task cancellation raises
+            CancelledError in this await.
             """
             if writer_task is None or writer_task.done():
                 # Same fast-fail as _send_frame: a dead writer never
@@ -1017,12 +1052,23 @@ def create_app():
             # websocket.send for the whole connection, so frames leave in
             # FIFO order — a terminal frame enqueued last can never be
             # overtaken by an older queued frame the way the old inline
-            # one-shot sends could deliver after `complete`. A failed send
-            # is retried after a short backoff (issue #11): pre-serialization
-            # at enqueue removed the deterministic failure class, so only
-            # transient/disconnect failures remain, and a genuinely dead
-            # connection is reaped by the receive loop's disconnect path,
-            # which cancels this task.
+            # one-shot sends could deliver after `complete`.
+            #
+            # Retry policy is per entry class (Codex PR-62 r4):
+            # - fut-LESS entries (bus events, llm_progress heartbeats)
+            #   retry indefinitely with a short backoff (issue #11):
+            #   pre-serialization at enqueue removed the deterministic
+            #   failure class, so only transient failures remain, and a
+            #   genuinely dead connection is reaped by the receive loop's
+            #   disconnect path, which cancels this task.
+            # - fut-carrying entries (terminal frames) get exactly ONE
+            #   send attempt — the old inline `_safe_send` single-shot
+            #   semantics. A failed attempt resolves the handshake False
+            #   and DISCARDS the entry: False is a hard guarantee that the
+            #   frame never reaches the wire, so a transport recovering
+            #   later can never deliver a terminal frame its caller
+            #   already gave up on (the PR-62 r4 P1: the retry loop kept
+            #   sending it after the caller tore down).
             while True:
                 text, payload, fut = await outbound_queue.get()
                 if fut is not None and fut.cancelled():
@@ -1050,20 +1096,30 @@ def create_app():
                     if not fut.done():
                         fut.set_result(True)
                     continue
-                while not await _safe_send_text(text):
-                    # A send failure — this frame's own flush handshake (if
-                    # any) and every handshake queued behind it cannot be
-                    # delivered until this frame goes out, so report the
-                    # single-strike False the old inline sends gave their
-                    # callers instead of parking the enqueue side forever
-                    # on a dead socket.
-                    for pending in flush_futures:
-                        if not pending.done():
-                            pending.set_result(False)
-                    await asyncio.sleep(_PUMP_SEND_RETRY_SECONDS)
-                _note_delivered_frame(payload)
-                if fut is not None and not fut.done():
-                    fut.set_result(True)
+                if fut is None:
+                    # Bus event / heartbeat: unlimited retry + backoff.
+                    # Never sweep pending handshakes on failure (Codex
+                    # PR-62 r4): a waiter queued behind this frame stays
+                    # PENDING — on recovery the FIFO still delivers it,
+                    # whereas failing it early ended its turn without a
+                    # `complete` while the frames still went out
+                    # afterwards, leaving the client hanging. No further
+                    # progress is possible only when the writer itself
+                    # dies (`_writer_died` fails the waiters) or the
+                    # socket goes away (the receive loop's disconnect
+                    # path cancels the parked turn task, turning `await
+                    # fut` into CancelledError).
+                    while not await _safe_send_text(text):
+                        await asyncio.sleep(_PUMP_SEND_RETRY_SECONDS)
+                    _note_delivered_frame(payload)
+                    continue
+                # Terminal frame: ONE attempt, then resolve and discard.
+                if await _safe_send_text(text):
+                    _note_delivered_frame(payload)
+                    if not fut.done():
+                        fut.set_result(True)
+                elif not fut.done():
+                    fut.set_result(False)
 
         async def _llm_progress_heartbeat() -> None:
             # Issue #4: a turn against a slow or flaky endpoint used to be a
