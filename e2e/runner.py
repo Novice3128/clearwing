@@ -828,7 +828,9 @@ def scenario_hud(sc: dict, run_dir: Path, ws_url: str, keyfile: Path) -> dict:
     match = all(v is not None for v in (hc, rc, ht, rt)) and hc > 0 and rc > 0 \
         and abs(hc - rc) <= max(0.01 * rc, 1e-4) and abs(ht - rt) <= max(0.01 * rt, 1)
     result = {"type": "hud", "session_id": sid, "hud_cost": hud_cost, "hud_tokens": hud_tokens,
-              "report_cost": rep_cost, "report_tokens": rep_tokens, "pass": bool(match)}
+              "report_cost": rep_cost, "report_tokens": rep_tokens, "pass": bool(match),
+              # ledger-visible spend: the HUD turn billed real tokens (Codex #67 r6)
+              "cost_usd_product": hc, "seconds": 0}
     (run_dir / "scenarios" / "hud-proof.json").write_text(json.dumps(result, indent=1))
     log(f"  -> HUD footer {hud_cost}/{hud_tokens} vs report {rep_cost}/{rep_tokens} match={match}")
     return result
@@ -1075,6 +1077,17 @@ def _adj_reviewed_hash(dirs: list[Path]) -> str:
     return h.hexdigest()[:16]
 
 
+def _adj_final_verdict(text: str) -> str | None:
+    """Verdict parsed ONLY from the '## final verdict' section — a
+    verdict-looking line quoted elsewhere must not be picked up
+    (Codex #67 r6 P1)."""
+    m = re.search(r"## final verdict[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
+    if not m:
+        return None
+    mv = re.search(r"^verdict:[ \t]*(\S+)", m.group(1), re.M)
+    return mv.group(1) if mv else None
+
+
 def _adj_indexed_dirs(text: str) -> list[Path]:
     """Run dirs recorded in the adjudication's run index (backtick paths)."""
     m = re.search(r"## run index.*?(?=\n## )", text, re.S)
@@ -1101,7 +1114,8 @@ def _run_dir_facts(d: Path) -> dict:
         facts["r3_pending"] = True   # collision-suffixed …-full-1 counts (Codex #67 r1)
     rp = d / "report.md"
     if rp.exists():
-        m = _re.search(r"— (PASS|FAIL|REGRESSION|SKIPPED)", rp.read_text().splitlines()[0])
+        first = (rp.read_text().splitlines() or [""])[0]   # empty-report safe
+        m = _re.search(r"— (PASS|FAIL|REGRESSION|SKIPPED)", first)
         if m:
             facts["verdict"] = m.group(1)
     try:
@@ -1160,13 +1174,19 @@ def cmd_adjudicate(args) -> None:
         if len(body) < 30:
             die("review-record section is empty/too short — the four-lens review "
                 "(REVIEW.md) must be pasted before finalize (SPEC §9 hard rule)")
-        mv = re.search(r"^verdict:[ \t]*(\S+)", text, re.M)
-        if not mv or not mv.group(1).strip():
+        verdict = _adj_final_verdict(text)
+        if not verdict:
             die("final verdict line is empty — set `verdict: PASS|FAIL|REGRESSION|MIXED` "
-                "in the adjudication (export quotes THIS value, not report.md)")
-        verdict = mv.group(1).strip()
+                "in the '## final verdict' section (export quotes THIS value)")
         if verdict not in ADJ_VERDICTS:
             die(f"verdict {verdict!r} not in {ADJ_VERDICTS} (Codex #67 r2)")
+        ih_now = __import__("hashlib").sha256(
+            "|".join(str(x) for x in (_adj_indexed_dirs(text) or dirs)).encode()
+        ).hexdigest()[:16]
+        ih_orig = re.search(r"<!-- index-hash: ([0-9a-f]+) -->", text)
+        if ih_orig and ih_orig.group(1) != ih_now:
+            die("run index was edited after the draft (dropped/added runs?) — the "
+                "adjudication no longer covers what it claims; regenerate consciously")
         idx_dirs = _adj_indexed_dirs(text) or dirs
         facts = [_run_dir_facts(x) for x in idx_dirs]   # the ROUND, not the
         machine = sorted({f["verdict"] for f in facts if f["verdict"] != "?"})  # CLI arg
@@ -1200,7 +1220,7 @@ def cmd_adjudicate(args) -> None:
         if len(re.sub(r"[\s#|>*-]", "", body)) >= 30:
             die(f"{adj} already carries a human review record — regenerating would "
                 "destroy it; delete it consciously first (SPEC §2.7)")
-        if re.search(r"^verdict:[ \t]*\S", existing, re.M):
+        if _adj_final_verdict(existing):
             die(f"{adj} already carries a human final verdict — regenerating would "
                 "destroy it; delete it consciously first (SPEC §2.7)")
         if _adj_override_rows(existing):
@@ -1214,6 +1234,10 @@ def cmd_adjudicate(args) -> None:
     lines = [
         "# cw-e2e adjudication — round " + time.strftime("%Y-%m-%d %H:%M"), "",
         ADJ_STATUS.format("DRAFT"), "",
+        # index bound at DRAFT time: finalize refuses if the run list was
+        # hand-edited (dropping a run would dodge its gates AND its spend)
+        f"<!-- index-hash: {__import__('hashlib').sha256('|'.join(str(x) for x in dirs).encode()).hexdigest()[:16]} -->",
+        "",
         "## run index (ALL run dirs of this round, incl. FATAL attempts)", "",
     ]
     total_cost = 0.0
@@ -1274,8 +1298,7 @@ def cmd_export(args) -> None:
     all_facts = [_run_dir_facts(x) for x in indexed]
     total_cost = round(sum(f["cost"] or 0 for f in all_facts), 4)
     machine = sorted({f["verdict"] for f in all_facts if f["verdict"] != "?"})
-    mv = re.search(r"^verdict:[ \t]*(\S+)", text, re.M)
-    final_verdict = mv.group(1).strip() if mv else "MIXED"
+    final_verdict = _adj_final_verdict(text) or "MIXED"
     machine_note = "" if final_verdict in machine or not machine else \
         f" (machine verdict was {'/'.join(machine)} — adjudicated; see overrides)"
     out = [f"cw-e2e round summary (auto-export {time.strftime('%F %T')} — "
@@ -1299,16 +1322,23 @@ def cmd_export(args) -> None:
 def _budget_precheck(tier: dict, only: str | None) -> None:
     """Enforce the program cap BEFORE spending (Codex #67 r3): the cleanup
     ledger check comes too late for a run that starts at $699."""
-    try:
-        led_p = RESULTS / "budget-ledger.json"
-        spent = json.loads(led_p.read_text()).get("total_usd", 0) if led_p.exists() else 0
-    except (OSError, ValueError):
+    cap = 700
+    led_p = RESULTS / "budget-ledger.json"
+    if led_p.exists():
+        try:
+            led = json.loads(led_p.read_text())
+            spent, cap = led.get("total_usd", 0), led.get("cap_usd", 700)
+        except (OSError, ValueError):
+            die(f"budget ledger unreadable: {led_p} — fail-closed; fix or remove "
+                "the ledger before running (Codex #67 r6)")
+    else:
         spent = 0
-    est = sum(cost_cap_of(sc, tier) for sc in tier["scenarios"]
-              if not only or sc["name"] == only)
-    if spent + est > 700:
+    # repeats multiply their cap (t3-warm-chain ×3 counted ONCE undercounts)
+    est = sum(cost_cap_of(sc, tier) * int(sc.get("repeat", 1))
+              for sc in tier["scenarios"] if not only or sc["name"] == only)
+    if spent + est > cap:
         die(f"budget pre-check: cumulative ${spent:.2f} + this run's cap ceiling "
-            f"${est:.2f} would exceed the $700 program cap — reduce scope or get "
+            f"${est:.2f} would exceed the ${cap} program cap — reduce scope or get "
             "the cap raised (ledger: e2e/results/budget-ledger.json)")
 
 
@@ -1335,6 +1365,14 @@ def cmd_run(args) -> None:
         run_dir = new_run_dir(tier_name + ("-partial" if args.only else ""))
         log(f"run dir: {run_dir}")
         ver = verify(run_dir, strict=not args.force)
+        if args.force:
+            forced = [c for c in ver.get("checks", []) if not c[1]]
+            (run_dir / "state" / "forced-gates.json").write_text(json.dumps(
+                {"forced": forced,
+                 "rationale": "OPERATOR: fill in why each forced gate was overridden"},
+                indent=1, ensure_ascii=False))
+            log(f"forced gates persisted ({len(forced)}) — fill the rationale slot "
+                "in state/forced-gates.json")
         ctx = {"run_dir": run_dir, "tier": tier, "ws_url": ws_from_base(SUITE["webui"]["live"]),
                "keyfile": keyfile, "home": None, "results": [], "containers": [], "sids": [], "last_sid": None}
         spawn = None

@@ -173,7 +173,12 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
         add("cache-nonzero", cache_pct > 1, f"cache={cache_pct:.1f}% (aggregate, shape-dependent)")
     if audit and audit.get("calls"):
         med = cache_prefix_median(audit["calls"])
-        if med is not None:
+        if med is None:
+            add("cache-prefix-samples", True,
+                f"stable-prefix samples <2 across {audit['llm_calls']} calls — "
+                "median unavailable (informational; short sessions)",
+                sev="trend")
+        else:
             add("cache-prefix-median",
                 med >= SUITE["thresholds"]["hard"].get("cache_prefix_median_min", 90),
                 f"prefix-median={med:.1f}% want>="
