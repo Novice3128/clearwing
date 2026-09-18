@@ -1566,6 +1566,51 @@ class NativeHunter:
 
     @tracer.agent(name="sourcehunt.hunter")
     async def arun(self) -> HunterRunResult:
+        """Run the hunt, reclaiming the standalone bookkeeping id on exit.
+
+        Session audit/cost attribution (#61): the ambient session (operator
+        job / webui turn that spawned this hunt) keeps ONE shared trail per
+        session; standalone hunts mint their own execution id — a fresh
+        suffix when the ctx id is deterministic and REUSED across
+        runs/restarts (exploit-{finding_id}, elaborate-{finding_id}), so
+        each execution's audit rows and tracker bucket stay reconcilable
+        instead of appending a new run onto a stale audit.jsonl (Codex
+        PR-63 r1).
+
+        Codex PR-63 r3 (P2): that minted suffixed id also keys a bucket in
+        the process-global ``CostTracker`` — without reclamation, every
+        standalone execution in a long-lived process leaks one
+        ``_session_totals``/``_session_tokens`` entry forever. The bucket
+        is dropped in a ``finally`` covering EVERY exit path (returns,
+        halts, cancellation, exceptions); only the id WE minted is
+        forgotten — an ambient id's lifecycle belongs to its parent
+        session (operator job / webui socket teardown already owns it).
+        Emitted COST_UPDATE frames carry their values at emit time and the
+        audit.jsonl trail is disk-persistent, so both survive the forget;
+        ``HunterRunResult`` totals come from local counters, not the
+        tracker bucket. Cleanup itself must never raise (a failed
+        reclamation is logged, not propagated) — a broken ``finally``
+        would mask the hunt's real result or exception.
+        """
+        ambient_session = current_session_id()
+        if ambient_session:
+            book_session_id: str = ambient_session
+        else:
+            book_session_id = f"{self.ctx.session_id}-{uuid.uuid4().hex[:8]}"
+        try:
+            return await self._arun(book_session_id)
+        finally:
+            if not ambient_session:
+                try:
+                    CostTracker().forget_session(book_session_id)
+                except Exception:  # cleanup must never mask the run's outcome
+                    logger.warning(
+                        "Failed to reclaim standalone hunter cost bucket %s",
+                        book_session_id,
+                        exc_info=True,
+                    )
+
+    async def _arun(self, book_session_id: str) -> HunterRunResult:
         user_msg = (
             self.initial_user_message
             or f"Hunt for vulnerabilities in {self.ctx.file_path or 'unknown'}."
@@ -1577,27 +1622,13 @@ class NativeHunter:
             initial_messages=messages,
             tools=self.tools,
         )
-        # Session audit trail (#61), same attribution source as the cost
-        # records below: the ambient session (operator job / webui turn
-        # that spawned this hunt) keeps ONE shared trail per session;
-        # standalone hunts fall back to their own execution id — with a
-        # fresh suffix when the ctx id is deterministic and REUSED across
-        # runs/restarts (exploit-{finding_id}, elaborate-{finding_id}),
-        # so each execution's audit rows and tracker bucket stay
-        # reconcilable instead of appending a new run onto a stale
-        # audit.jsonl (Codex PR-63 r1). Hunters run in-process (asyncio
-        # tasks), so the jsonl appends land in the same file the spawning
-        # session writes — AuditLogger's lock is PER-INSTANCE (it
-        # serializes appends through one logger, not across loggers);
-        # cross-instance safety comes from every hunter appending from the
-        # same event loop's synchronous segments plus a single
-        # ``write()`` per append under open("a") (O_APPEND), which the
-        # kernel positions atomically.
-        ambient_session = current_session_id()
-        if ambient_session:
-            book_session_id: str = ambient_session
-        else:
-            book_session_id = f"{self.ctx.session_id}-{uuid.uuid4().hex[:8]}"
+        # Hunters run in-process (asyncio tasks), so the jsonl appends land
+        # in the same file the spawning session writes — AuditLogger's lock
+        # is PER-INSTANCE (it serializes appends through one logger, not
+        # across loggers); cross-instance safety comes from every hunter
+        # appending from the same event loop's synchronous segments plus a
+        # single ``write()`` per append under open("a") (O_APPEND), which
+        # the kernel positions atomically.
         audit_logger = init_session_audit_logger(book_session_id)
         total_input_tokens = 0
         total_output_tokens = 0

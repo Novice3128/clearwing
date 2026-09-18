@@ -88,6 +88,66 @@ class TestHeaderTextParsing:
         assert parse_retry_after_seconds("wait 5") is None
 
 
+class TestCleanNumberTail:
+    """Codex PR-63 r3 (P2): a parsed number must END cleanly.
+
+    The old seconds pattern matched any digit run after the header name:
+    ``retry-after: 5 minutes`` half-matched as 5 s and ``retry-after: 1e3``
+    as 1 s — premature retries that re-hit a rate-limited upstream. After
+    an optional glued ms/s unit, no alphanumeric/dot may touch the number
+    and none may follow intervening whitespace. The same guard now covers
+    the ms header/suffix patterns, and the legacy unit can no longer eat
+    the first letter of a longer word ("wait 5 seconds" is not "wait 5s").
+    """
+
+    def test_glued_unit_is_consumed(self):
+        assert parse_retry_after_seconds("retry-after: 30s") == 30.0
+        assert parse_retry_after_seconds("retry-after: 2.500s") == 2.5
+
+    def test_fractional_seconds(self):
+        assert parse_retry_after_seconds("retry-after: 0.5") == 0.5
+
+    def test_unit_word_after_number_is_rejected(self):
+        assert parse_retry_after_seconds("retry-after: 5 minutes") is None
+        assert parse_retry_after_seconds("retry-after: 30 seconds") is None
+        assert parse_retry_after_seconds("HTTP 429: retry-after: 10 minutes, cool down") is None
+
+    def test_scientific_notation_is_rejected(self):
+        assert parse_retry_after_seconds("retry-after: 1e3") is None
+        assert parse_retry_after_seconds("retry-after: 2.5e2") is None
+
+    def test_dotted_garbage_is_rejected(self):
+        # A second dot cannot be part of the number — "1.5.2" is not 1.5 s.
+        assert parse_retry_after_seconds("retry-after: 1.5.2") is None
+
+    def test_trailing_punctuation_still_parses(self):
+        # Punctuation is fine; only alnum-after-whitespace (a word) and
+        # glued alnum/dot (scientific/dotted garbage) reject.
+        assert parse_retry_after_seconds("retry-after: 30, server says slow") == 30.0
+        assert parse_retry_after_seconds("HTTP 503 (retry-after: 20)") == 20.0
+
+    def test_ms_header_gets_the_same_guard(self):
+        assert parse_retry_after_seconds("retry-after-ms: 1e3") is None
+        assert parse_retry_after_seconds("retry-after-ms: 500x") is None
+        # The plain pass-through case is unchanged.
+        assert parse_retry_after_seconds("retry-after-ms: 500") == 0.5
+
+    def test_ms_unit_suffix_gets_the_same_guard(self):
+        assert parse_retry_after_seconds("retry-after: 500 msx") is None
+        # The plain pass-through case is unchanged.
+        assert parse_retry_after_seconds("retry-after: 500 ms") == 0.5
+
+    def test_legacy_unit_cannot_eat_a_longer_word(self):
+        # "wait 5 seconds" used to match the bare "s" alternative and read
+        # as 5 s by luck; with the guard it parses as nothing (a number
+        # plus a word the patterns do not understand is not a delay).
+        assert parse_retry_after_seconds("wait 5 seconds") is None
+        assert parse_retry_after_seconds("try again in 10 moons") is None
+        # The required-unit rejections stay pinned.
+        assert parse_retry_after_seconds("try again in 5 minutes") is None
+        assert parse_retry_after_seconds("please wait 5 minutes") is None
+
+
 class TestChainParsing:
     def test_hint_in_nested_cause(self):
         # genai-pyo3 shape: a terse wrapper whose real detail is nested.

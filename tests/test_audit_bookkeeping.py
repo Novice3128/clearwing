@@ -458,10 +458,15 @@ class TestHunterAudit:
         assert rows[0]["details"]["model"] == "hunter-served"
         assert rows[0]["details"]["input_tokens"] == 300
         assert rows[0]["details"]["output_tokens"] == 120
-        # Reconciliation against the SAME id the cost records used.
-        assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
-            CostTracker().session_total(book_id)
+        # Codex PR-63 r3: reconciliation holds within the session's
+        # LIFETIME; arun now forgets the minted standalone bucket on exit
+        # (it would otherwise leak one tracker entry per hunt forever),
+        # so post-hoc the DISK audit trail is the source of truth and the
+        # tracker side reads zero (bookkeeping.py doctrine).
+        assert rows[0]["details"]["cost_usd"] == pytest.approx(
+            CostTracker.estimate_cost(300, 120, "hunter-model")
         )
+        assert CostTracker().session_total(book_id) == 0.0
 
     def test_hunter_summarizer_row_keeps_provider_echo(self, monkeypatch, tmp_path):
         """Codex PR-63 r2: the hunter's CONTEXT-SUMMARIZER book call must
@@ -535,10 +540,10 @@ class TestHunterAudit:
         # The main call keeps its own (r1) echo split.
         hunter_row = next(r for r in rows if r["agent"] == "hunter")
         assert hunter_row["details"]["model"] == "hunter-served"
-        # Reconciliation against the SAME suffixed execution id.
-        assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
-            CostTracker().session_total(session_dirs[0])
-        )
+        # Codex PR-63 r3: the minted standalone bucket is forgotten when
+        # arun exits — post-hoc reconciliation reads the DISK trail (the
+        # tracker side is zero by design), per the bookkeeping doctrine.
+        assert CostTracker().session_total(session_dirs[0]) == 0.0
 
 
 class TestHunterAuditSessionId:
@@ -622,6 +627,124 @@ class TestHunterAuditSessionId:
         assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
             CostTracker().session_total(parent_sid)
         )
+
+
+class TestStandaloneCostBucketReclamation:
+    """Codex PR-63 r3 (P2): the standalone hunter's minted cost bucket.
+
+    ``arun`` books standalone executions under a fresh
+    ``{ctx.session_id}-{uuid8}`` id in the process-global CostTracker;
+    without reclamation, every hunt in a long-lived process leaked one
+    ``_session_totals``/``_session_tokens`` entry forever. The bucket is
+    now dropped on EVERY exit path — but only for ids WE minted: an
+    ambient session id (operator job / webui turn) belongs to its parent
+    and must survive the hunt. The disk audit trail and the COST_UPDATE
+    frames (which carry their values at emit time) are unaffected by the
+    forget; ``HunterRunResult`` totals come from local counters.
+    """
+
+    def _make_hunter(self, session_id: str) -> NativeHunter:
+        class _HunterLLM:
+            model_name = "claude-sonnet-4-6"  # priced row → bucket total > 0
+            provider_name = "stub"
+
+            async def achat(self, **kwargs):
+                return ChatResponse(
+                    content=[{"text": "No findings."}],
+                    usage=Usage(prompt_tokens=300, completion_tokens=120, total_tokens=420),
+                    provider_model_name="hunter-served",
+                )
+
+        ctx = HunterContext(
+            repo_path=str(_FIXTURE_C),
+            findings=[],
+            file_path="src/codec_a.c",
+            session_id=session_id,
+            specialist="general",
+        )
+        return NativeHunter(
+            llm=_HunterLLM(),
+            prompt="system prompt",
+            tools=[],
+            ctx=ctx,
+            max_steps=1,
+        )
+
+    def _spy_on_forget(self, monkeypatch) -> list[str]:
+        forgotten: list[str] = []
+        original_forget = CostTracker.forget_session
+
+        def _forget_spy(tracker_self, session_id):
+            forgotten.append(session_id)
+            original_forget(tracker_self, session_id)
+
+        monkeypatch.setattr(CostTracker, "forget_session", _forget_spy)
+        return forgotten
+
+    def test_standalone_bucket_reclaimed_after_run(self, monkeypatch, tmp_path):
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        ctx_sid = f"sh-{uuid.uuid4().hex[:8]}"
+        forgotten = self._spy_on_forget(monkeypatch)
+
+        result = asyncio.run(self._make_hunter(ctx_sid).arun())
+        assert result.findings == []
+
+        session_dirs = _audit_session_dirs(audit_home, ctx_sid)
+        assert len(session_dirs) == 1
+        book_id = session_dirs[0]
+        rows = _llm_cost_rows(_audit_rows(audit_home, book_id))
+        # The audit trail is disk-persistent and unaffected by the forget.
+        assert len(rows) == 1
+        assert rows[0]["details"]["cost_usd"] > 0.0
+        # The minted bucket WAS reclaimed: the id reached forget_session
+        # and neither tracker dict still holds it.
+        assert book_id in forgotten
+        assert CostTracker().session_total(book_id) == 0.0
+        assert CostTracker().session_tokens(book_id) == (0, 0)
+
+    def test_ambient_bucket_survives_standalone_reclaim(self, monkeypatch, tmp_path):
+        from clearwing.agent.tooling import session_scope
+
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        ctx_sid = f"sh-{uuid.uuid4().hex[:8]}"
+        parent_sid = f"job-{uuid.uuid4().hex[:8]}"
+        forgotten = self._spy_on_forget(monkeypatch)
+
+        with session_scope(parent_sid):
+            asyncio.run(self._make_hunter(ctx_sid).arun())
+
+        rows = _llm_cost_rows(_audit_rows(audit_home, parent_sid))
+        assert len(rows) == 1
+        total = sum(r["details"]["cost_usd"] for r in rows)
+        # The ambient bucket's lifecycle belongs to the parent session —
+        # the hunt must NOT forget an id it did not mint.
+        assert parent_sid not in forgotten
+        assert total > 0.0
+        assert CostTracker().session_total(parent_sid) == pytest.approx(total)
+        assert CostTracker().session_tokens(parent_sid) == (300, 120)
+
+    def test_failed_reclaim_never_breaks_the_run(self, monkeypatch, tmp_path):
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        ctx_sid = f"sh-{uuid.uuid4().hex[:8]}"
+
+        def _exploding_forget(tracker_self, session_id):
+            raise RuntimeError("tracker lock poisoned")
+
+        monkeypatch.setattr(CostTracker, "forget_session", _exploding_forget)
+
+        # Cleanup must never mask the hunt's real result: the run
+        # completes and the audit trail still lands on disk.
+        result = asyncio.run(self._make_hunter(ctx_sid).arun())
+        assert result.findings == []
+        session_dirs = _audit_session_dirs(audit_home, ctx_sid)
+        assert len(session_dirs) == 1
+        assert len(_llm_cost_rows(_audit_rows(audit_home, session_dirs[0]))) == 1
 
 
 class TestEndToEndReconciliation:

@@ -206,17 +206,36 @@ _RETRY_AFTER_MAX_SECONDS: float = 300.0
 
 # Explicit ms-suffixed header name, checked FIRST so the seconds pattern
 # below can never misread an ms value as seconds (the "retry-after-ms"
-# unit bug: 500 ms must be 0.5 s, never 500 s).
-_RE_RETRY_AFTER_MS = re.compile(r"retry[-_ ]after[-_ ]?ms[:=]?\s*([0-9]+(?:\.[0-9]+)?)")
+# unit bug: 500 ms must be 0.5 s, never 500 s). The clean-end guard
+# keeps a partial digit run ("retry-after-ms: 1e3" → "1") from parsing
+# (Codex PR-63 r3).
+_RE_RETRY_AFTER_MS = re.compile(
+    r"retry[-_ ]after[-_ ]?ms[:=]?\s*([0-9]+(?:\.[0-9]+)?)(?![a-z0-9.])"
+)
 # Numeric Retry-After with a trailing ms unit ("retry-after: 500 ms").
-_RE_RETRY_AFTER_MS_SUFFIX = re.compile(r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*ms\b")
-_RE_RETRY_AFTER_SECONDS = re.compile(r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)")
+_RE_RETRY_AFTER_MS_SUFFIX = re.compile(
+    r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*ms\b(?![a-z0-9.])"
+)
+# Numeric Retry-After (seconds). The number must END cleanly (Codex PR-63
+# r3 P2): the old pattern matched any digit run after the header name, so
+# "retry-after: 5 minutes" half-matched as 5 s and "retry-after: 1e3" as
+# 1 s — both premature retries that re-hit a rate-limited upstream. After
+# an optional GLUED unit (ms/s — "retry-after: 30s" is 30 s, and the
+# rendered "retry-after: 300.000s" suffix must round-trip), no
+# alphanumeric/dot may touch the number AND none may follow intervening
+# whitespace ("5 minutes", "30 seconds"). Text is matched lowercased, so
+# [a-z] covers every letter.
+_RE_RETRY_AFTER_SECONDS = re.compile(
+    r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)(?:ms|s)?(?![a-z0-9.]|\s*[a-z0-9.])"
+)
 # Legacy provider-body phrasings kept from the previous parser. The unit
 # is REQUIRED: "try again in 1200ms" reads as 1.2 s while "please wait 5
 # minutes" must not match at all (a unitless number is not a delay the
-# provider actually specified).
-_RE_TRY_AGAIN = re.compile(r"try again in\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)")
-_RE_WAIT = re.compile(r"\bwait\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)")
+# provider actually specified). The trailing guard keeps the bare "s"
+# alternative from eating the first letter of a longer word — "wait 5
+# seconds" is not "wait 5s" (Codex PR-63 r3).
+_RE_TRY_AGAIN = re.compile(r"try again in\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)(?![a-z0-9])")
+_RE_WAIT = re.compile(r"\bwait\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)(?![a-z0-9])")
 # Retry-After as an HTTP-date (RFC 1123 shape; matched on the ORIGINAL-case
 # text because parsedate_to_datetime expects canonical casing).
 _RE_RETRY_AFTER_DATE = re.compile(
