@@ -621,8 +621,20 @@ def create_app():
         session_cost = {"cost_usd": 0.0, "tokens": 0}
         session_cost_lock = threading.Lock()
 
-        def _session_scope_cost_update(data: dict) -> dict | None:
+        # Codex PR-62 r2 (Finding 2): for cost_update frames the ENTIRE
+        # sequence — accumulate, assemble, dumps, schedule the enqueue,
+        # record the transcript — runs under this lock (see the
+        # cost_update branch in `on_event`). The enqueue order IS the wire
+        # order (single writer, FIFO), so accumulation and publish must be
+        # one serialized step: with the lock around the arithmetic only, a
+        # worker holding a SMALLER total could schedule its enqueue after a
+        # worker holding a larger one, and the wire totals would regress.
+        def _session_scope_cost_update_locked(data: dict) -> dict | None:
             """Returns the frame to enqueue, or None to drop it.
+
+            Caller MUST hold ``session_cost_lock`` — this function mutates
+            the accumulator without re-acquiring it (not an RLock; the
+            publish path that calls it owns the acquisition).
 
             Frames now carry an attribution id (the runtime since PR #39,
             hunts since issue #41): only frames whose id matches THIS
@@ -647,6 +659,18 @@ def create_app():
                 scoped_cost, in_tokens, out_tokens = telemetry.CostTracker().session_snapshot(
                     session_id
                 )
+                # Late-booking reconciliation (Codex PR-62 r2, Finding 1):
+                # the tracker is authoritative, so the out-of-turn frame
+                # not only carries the snapshot but RE-BASES the in-turn
+                # accumulator onto it. Without this, a call that completed
+                # after the turn ended would be reported once and then
+                # forgotten — the next turn's in-turn frames would add
+                # onto the stale base and the wire/report totals would
+                # regress below spend that already happened. The raw
+                # (unrounded) snapshot is stored; display keeps the
+                # in-turn branch's round(..., 10) semantics.
+                session_cost["cost_usd"] = scoped_cost
+                session_cost["tokens"] = in_tokens + out_tokens
                 scoped = dict(data)
                 scoped["total_cost_usd"] = round(scoped_cost, 10)
                 scoped["total_tokens"] = in_tokens + out_tokens
@@ -655,14 +679,13 @@ def create_app():
             per_call_tokens = (data.get("input_tokens") or 0) + (
                 data.get("output_tokens") or 0
             )
-            with session_cost_lock:
-                if isinstance(call_cost, (int, float)):
-                    session_cost["cost_usd"] += float(call_cost)
-                if isinstance(per_call_tokens, int) and per_call_tokens > 0:
-                    session_cost["tokens"] += per_call_tokens
-                scoped = dict(data)
-                scoped["total_cost_usd"] = round(session_cost["cost_usd"], 10)
-                scoped["total_tokens"] = session_cost["tokens"]
+            if isinstance(call_cost, (int, float)):
+                session_cost["cost_usd"] += float(call_cost)
+            if isinstance(per_call_tokens, int) and per_call_tokens > 0:
+                session_cost["tokens"] += per_call_tokens
+            scoped = dict(data)
+            scoped["total_cost_usd"] = round(session_cost["cost_usd"], 10)
+            scoped["total_tokens"] = session_cost["tokens"]
             return scoped
 
         def _record_in_transcript(event_name: str, data: Any) -> None:
@@ -697,6 +720,54 @@ def create_app():
             elif event_name == "error":
                 transcript.add_error(data.get("message") or str(data))
 
+        def _publish_bus_event(event_name: str, serializable: Any) -> None:
+            """Assemble, pre-serialize, schedule, and record one bus event.
+
+            Extracted from ``on_event`` (Codex PR-62 r2, Finding 2) so the
+            cost_update path can run this whole publish sequence UNDER
+            ``session_cost_lock``: the enqueue order IS the wire order
+            (single writer, FIFO), so accumulate and publish must be one
+            serialized step or the wire totals can regress. Every other
+            event type publishes unlocked, exactly as before.
+            """
+            item = {"type": event_name, "data": serializable}
+            # Pre-serialize BEFORE enqueue (issue #45): an
+            # unserializable payload used to reach the writer and fail
+            # send_json with the same TypeError on every retry — an
+            # immortal frame blocking every later one. Dropping it here
+            # keeps the queue moving; the shallow type check in
+            # `on_event` cannot catch nested non-JSON values (e.g. a set
+            # inside a dict), which is exactly what this dumps call
+            # proves out.
+            try:
+                text = json.dumps(item)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Dropping unserializable %s frame — it would "
+                    "stall the outbound writer; later frames still go out",
+                    event_name,
+                    exc_info=True,
+                )
+                # Dropped from the SOCKET, not from history: transcript
+                # recording is unconditional and independent of the frame
+                # gate (#53), and the report render falls back to
+                # str()/default=str for values json cannot encode, so the
+                # event stays legible there. Recording the dropped
+                # tool_start also keeps its own tool_result's
+                # content_length from mis-sticking onto the previous
+                # tool entry.
+                _record_in_transcript(event_name, serializable)
+                return
+            try:
+                ws_loop.call_soon_threadsafe(
+                    outbound_queue.put_nowait, (text, item, None)
+                )
+            except RuntimeError:
+                # The loop is already closed — the socket is tearing
+                # down; there is nothing left to deliver to.
+                return
+            _record_in_transcript(event_name, serializable)
+
         # Subscribe to EventBus and forward events to the WebSocket
         try:
             bus = EventBus()
@@ -715,11 +786,26 @@ def create_app():
                             event_type_name == "cost_update"
                             and isinstance(serializable, dict)
                         ):
-                            serializable = _session_scope_cost_update(serializable)
-                            if serializable is None:
-                                # A concurrent session's frame — never
-                                # reaches this socket or its transcript.
-                                return
+                            # Codex PR-62 r2 (Finding 2): hold the session
+                            # lock across the scope-rewrite AND the whole
+                            # publish sequence (assembly, dumps, enqueue
+                            # scheduling, transcript) so the wire order of
+                            # cost frames always matches the accumulation
+                            # order — totals never regress. Safe to call
+                            # under the lock: call_soon_threadsafe is
+                            # non-blocking, and the transcript's
+                            # cost_update branch is dict writes. No RLock —
+                            # the locked helpers simply never re-acquire.
+                            with session_cost_lock:
+                                scoped = _session_scope_cost_update_locked(
+                                    serializable
+                                )
+                                if scoped is None:
+                                    # A concurrent session's frame — never
+                                    # reaches this socket or its transcript.
+                                    return
+                                _publish_bus_event(event_type_name, scoped)
+                            return
                         if event_type_name == "agent_message" and isinstance(
                             serializable, dict
                         ):
@@ -728,46 +814,7 @@ def create_app():
                             # must not receive this session's LLM chatter.
                             if _is_foreign_session_message(serializable, session_id):
                                 return
-                        item = {"type": event_type_name, "data": serializable}
-                        # Pre-serialize BEFORE enqueue (issue #45): an
-                        # unserializable payload used to reach the writer
-                        # and fail send_json with the same TypeError on
-                        # every retry — an immortal frame blocking every
-                        # later one. Dropping it here keeps the queue
-                        # moving; the shallow type check above cannot
-                        # catch nested non-JSON values (e.g. a set inside
-                        # a dict), which is exactly what this dumps call
-                        # proves out.
-                        try:
-                            text = json.dumps(item)
-                        except (TypeError, ValueError):
-                            logger.error(
-                                "Dropping unserializable %s frame — it would "
-                                "stall the outbound writer; later frames still go out",
-                                event_type_name,
-                                exc_info=True,
-                            )
-                            # Dropped from the SOCKET, not from history:
-                            # transcript recording is unconditional and
-                            # independent of the frame gate (#53), and the
-                            # report render falls back to str()/default=str
-                            # for values json cannot encode, so the event
-                            # stays legible there. Recording the dropped
-                            # tool_start also keeps its own tool_result's
-                            # content_length from mis-sticking onto the
-                            # previous tool entry.
-                            _record_in_transcript(event_type_name, serializable)
-                            return
-                        try:
-                            ws_loop.call_soon_threadsafe(
-                                outbound_queue.put_nowait, (text, item, None)
-                            )
-                        except RuntimeError:
-                            # The loop is already closed — the socket is
-                            # tearing down; there is nothing left to
-                            # deliver to.
-                            return
-                        _record_in_transcript(event_type_name, serializable)
+                        _publish_bus_event(event_type_name, serializable)
                     except Exception:
                         logger.debug("Failed to enqueue event", exc_info=True)
 

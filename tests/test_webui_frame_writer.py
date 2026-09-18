@@ -11,7 +11,13 @@ FIFO queue and one writer coroutine:
 - out-of-turn cost frames carry session-scoped totals (#48-1), never the
   emitter's process-global ones;
 - the session-cost accumulator is lock-protected against worker threads
-  (#48-2).
+  (#48-2);
+- a late-booked call (arriving after the turn ended) re-bases the
+  accumulator to the tracker's water level, so the next turn's in-turn
+  frames never regress below it (Codex PR-62 r2);
+- cost frames' accumulate→publish sequence is serialized under the
+  session lock: the wire totals arrive in monotonically non-decreasing
+  order (Codex PR-62 r2).
 """
 
 from __future__ import annotations
@@ -560,6 +566,200 @@ class TestSessionCostThreadSafety:
         last = cost_frames[-1]["data"]
         assert last["total_cost_usd"] == pytest.approx(total_emissions * 0.01)
         assert last["total_tokens"] == total_emissions
+
+
+class _BookingGraph:
+    """Books ONE real tracker call per astream under this session's id —
+    ``record_llm_call`` also emits the COST_UPDATE frame carrying the
+    exact booked cost, which is what makes in-turn accumulation and
+    tracker totals line up exactly."""
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+
+    def get_state(self, config):
+        del config
+        return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+
+    async def astream(self, input_msg, config, stream_mode="values"):
+        from clearwing.observability.telemetry import CostTracker
+
+        del input_msg, config, stream_mode
+        CostTracker().record_llm_call(
+            1000, 100, "fake-model", session_id=self.session_id
+        )
+        yield {"messages": [_AI("done")]}
+
+
+class TestLateBookingRebase:
+    """Codex PR-62 r2 (Finding 1): an LLM call attributed to this session
+    that completes AFTER the turn ended must re-base the in-turn
+    accumulator to the tracker's water level — the next turn's in-turn
+    frames add onto the late-booked base instead of the stale one, so the
+    wire totals never regress below spend that already happened."""
+
+    def test_next_turn_accumulates_from_late_booked_water_level(self, client):
+        from clearwing.observability.telemetry import CostTracker
+
+        call_cost = CostTracker.estimate_cost(1000, 100, "fake-model")
+        late_cost = CostTracker.estimate_cost(200, 50, "fake-model")
+
+        with patch("clearwing.ui.web.app.create_agent", _BookingGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                assert ws.receive_json()["type"] == "started"
+
+                # Turn 1: one booked call, one in-turn cost frame.
+                ws.send_json({"type": "message", "content": "run"})
+                turn1 = None
+                sid = None
+                while True:
+                    frame = json.loads(ws.receive_text())
+                    if frame["type"] == "cost_update":
+                        turn1 = frame["data"]
+                    if frame["type"] == "complete":
+                        sid = frame["data"]["session_id"]
+                        break
+                assert turn1 is not None
+                assert turn1["total_cost_usd"] == pytest.approx(call_cost)
+                assert turn1["total_tokens"] == 1100
+
+                # Late booking: the call completes on a worker thread
+                # AFTER the turn ended — the tracker books it and the
+                # frame arrives out-of-turn (this test thread is the
+                # worker-thread shape).
+                CostTracker().record_llm_call(
+                    200, 50, "fake-model", session_id=sid
+                )
+                late = None
+                for _ in range(20):
+                    frame = _receive_json_with_timeout(ws, timeout=10.0)
+                    if frame["type"] == "cost_update":
+                        late = frame["data"]
+                        break
+                if late is None:
+                    pytest.fail("no late-booked cost_update within 20 frames")
+                assert late["total_cost_usd"] == pytest.approx(
+                    call_cost + late_cost
+                )
+                assert late["total_tokens"] == 1350
+
+                # Turn 2: its in-turn frame must build on the LATE-BOOKED
+                # water level — pre-fix the accumulator still held turn
+                # 1's total and the wire regressed below the late frame.
+                ws.send_json({"type": "message", "content": "again"})
+                turn2 = None
+                while True:
+                    frame = json.loads(ws.receive_text())
+                    if frame["type"] == "cost_update":
+                        turn2 = frame["data"]
+                    if frame["type"] == "complete":
+                        break
+                assert turn2 is not None
+                assert turn2["total_cost_usd"] >= late["total_cost_usd"]
+                expected = 2 * call_cost + late_cost
+                assert turn2["total_cost_usd"] == pytest.approx(expected)
+                assert turn2["total_tokens"] == 2450
+                # The final water level equals the tracker's authoritative
+                # session total: two turns' calls plus the late booking.
+                assert turn2["total_cost_usd"] == pytest.approx(
+                    CostTracker().session_total(sid)
+                )
+
+                # Clean stop handshake — also proves no stray cost frame
+                # was still in flight after turn 2.
+                ws.send_json({"type": "stop"})
+                assert ws.receive_json()["type"] == "stopped"
+                assert ws.receive_json()["type"] == "complete"
+
+
+class TestCostFramePublishOrdering:
+    """Codex PR-62 r2 (Finding 2): accumulate and publish are ONE
+    serialized sequence under the session lock — the enqueue (wire) order
+    of concurrent cost frames matches their accumulation order, so the
+    delivered totals sequence never regresses."""
+
+    def test_concurrent_cost_frames_wire_totals_monotonic(self, client):
+        import sys
+
+        threads_n, per_thread = 8, 50
+
+        class _ConcurrentCostGraph:
+            def __init__(self, **kwargs):
+                self.session_id = kwargs.get("session_id")
+
+            def get_state(self, config):
+                del config
+                return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+
+            async def astream(self, input_msg, config, stream_mode="values"):
+                del input_msg, config, stream_mode
+
+                # Distinct per-thread costs widen any out-of-order dip the
+                # test could observe.
+                def worker(cost):
+                    for _ in range(per_thread):
+                        _emit_cost(
+                            {
+                                "input_tokens": 1,
+                                "output_tokens": 0,
+                                "cost": cost,
+                                "total_cost_usd": 0.0,
+                                "total_tokens": 0,
+                                "model": "fake-model",
+                                "provider": "openai",
+                                "session_id": self.session_id,
+                                "elapsed_ms": 0,
+                            }
+                        )
+
+                workers = [
+                    threading.Thread(target=worker, args=(0.01 * (t + 1),), daemon=True)
+                    for t in range(threads_n)
+                ]
+                for w in workers:
+                    w.start()
+                for w in workers:
+                    w.join()
+                yield {"messages": [_AI("done")]}
+
+        with patch("clearwing.ui.web.app.create_agent", _ConcurrentCostGraph):
+            # Shrink the GIL switch interval: the pre-fix race window
+            # (lock released after the arithmetic, enqueue scheduled only
+            # after dumps) is a handful of bytecodes wide and almost never
+            # hit at the default 5ms interval — at ~1µs a preempted
+            # holder is the common case, so the monotonicity assertion
+            # actually exercises the serialization it guards.
+            old_interval = sys.getswitchinterval()
+            sys.setswitchinterval(1e-6)
+            try:
+                with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                    ws.send_json({"type": "start", "target": "10.0.0.9"})
+                    ws.send_json({"type": "message", "content": "run"})
+                    cost_frames = []
+                    while True:
+                        frame = json.loads(ws.receive_text())
+                        if frame["type"] == "cost_update":
+                            cost_frames.append(frame)
+                        if frame["type"] == "complete":
+                            break
+            finally:
+                sys.setswitchinterval(old_interval)
+
+        total_emissions = threads_n * per_thread
+        assert len(cost_frames) == total_emissions
+        costs = [f["data"]["total_cost_usd"] for f in cost_frames]
+        tokens = [f["data"]["total_tokens"] for f in cost_frames]
+        # Monotonic non-decreasing: the single writer delivers in enqueue
+        # order, and (post-fix) enqueue order == accumulation order — a
+        # smaller total never follows a larger one on the wire.
+        assert all(b >= a for a, b in zip(costs, costs[1:]))
+        assert all(b >= a for a, b in zip(tokens, tokens[1:]))
+        # Final consistency: the last delivered frame carries the exact
+        # accumulated totals for every emission.
+        expected_total = 0.01 * sum(range(1, threads_n + 1)) * per_thread
+        assert costs[-1] == pytest.approx(expected_total)
+        assert tokens[-1] == total_emissions
 
 
 class TestWriterFailureTeardown:
