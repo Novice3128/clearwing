@@ -48,6 +48,18 @@ def _llm_cost_rows(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r.get("event_type") == "llm_call"]
 
 
+def _audit_session_dirs(base_dir, prefix: str) -> list[str]:
+    """Audit session dir names equal to *prefix* or freshly suffixed
+    (``{prefix}-{uuid8}`` — the standalone hunter's per-execution ids)."""
+    if not base_dir.exists():
+        return []
+    return sorted(
+        d.name
+        for d in base_dir.iterdir()
+        if d.name == prefix or d.name.startswith(f"{prefix}-")
+    )
+
+
 class _FakeUsage:
     def __init__(self, prompt=0, completion=0, total=0):
         self.prompt_tokens = prompt
@@ -57,12 +69,12 @@ class _FakeUsage:
 
 
 class _FakeResponse:
-    def __init__(self, text="done", usage=None):
+    def __init__(self, text="done", usage=None, provider_model_name="served-model-x"):
         self.first_text = text
         self.texts = [text] if text else []
         self.tool_calls = []
         self.usage = usage or _FakeUsage()
-        self.provider_model_name = "served-model-x"
+        self.provider_model_name = provider_model_name
         self.reasoning_content = None
 
 
@@ -290,6 +302,45 @@ class TestOperatorSupervisorAudit:
             CostTracker().session_total(sid)
         )
 
+    def test_supervisor_audit_model_keeps_provider_echo(self, monkeypatch, tmp_path):
+        """Codex PR-63 r1: the operator books PRICING under the member
+        (configured/served) key while the audit row records the model the
+        PROVIDER echoed — the runtime/hunter audit_model split, so a
+        versioned echo never rewrites the pricing key or vice versa."""
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        sid = f"op-{uuid.uuid4().hex[:8]}"
+
+        operator = OperatorAgent(OperatorConfig(goals=["scan"], target="127.0.0.1"))
+        operator._session_id = sid
+        operator._audit_logger = init_session_audit_logger(sid)
+
+        class _OpLLM:
+            model_name = "claude-sonnet-4-6"  # the configured member key
+            provider_name = "anthropic"
+
+            async def aask_text(self, **kwargs):
+                return _FakeResponse(
+                    "Continue with the next goal.",
+                    usage=_FakeUsage(210, 90, 300),
+                    provider_model_name="claude-opus-4-7-20260901",
+                )
+
+        decision = asyncio.run(operator._adecide_next(_OpLLM(), "progress"))
+        assert decision.startswith("Continue")
+
+        rows = _llm_cost_rows(_audit_rows(audit_home, sid))
+        assert len(rows) == 1
+        # The audit row shows the provider's echo, not the configured key.
+        assert rows[0]["details"]["model"] == "claude-opus-4-7-20260901"
+        # Pricing stayed on the configured member key — the two tiers
+        # differ, so the cost pins WHICH key priced the call.
+        configured = CostTracker.estimate_cost(210, 90, "claude-sonnet-4-6")
+        echoed = CostTracker.estimate_cost(210, 90, "claude-opus-4-7-20260901")
+        assert configured != echoed  # guard: the split must be observable
+        assert rows[0]["details"]["cost_usd"] == pytest.approx(configured)
+        assert CostTracker().session_total(sid) == pytest.approx(configured)
+
 
 class TestHunterAudit:
     def test_hunter_main_call_is_audited_and_reconciled(self, monkeypatch, tmp_path):
@@ -327,15 +378,106 @@ class TestHunterAudit:
         result = asyncio.run(hunter.arun())
         assert result.findings == []
 
-        rows = _llm_cost_rows(_audit_rows(audit_home, sid))
+        # Codex PR-63 r1: a standalone hunt books under a FRESH suffixed
+        # id (ctx.session_id-<uuid8>) — find the execution's own trail.
+        session_dirs = _audit_session_dirs(audit_home, sid)
+        assert len(session_dirs) == 1
+        book_id = session_dirs[0]
+        assert book_id.startswith(f"{sid}-")
+
+        rows = _llm_cost_rows(_audit_rows(audit_home, book_id))
         assert len(rows) == 1
         assert rows[0]["agent"] == "hunter"
         # Audit prefers the served model echo (runtime effective_model parity).
         assert rows[0]["details"]["model"] == "hunter-served"
         assert rows[0]["details"]["input_tokens"] == 300
         assert rows[0]["details"]["output_tokens"] == 120
+        # Reconciliation against the SAME id the cost records used.
         assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
-            CostTracker().session_total(sid)
+            CostTracker().session_total(book_id)
+        )
+
+
+class TestHunterAuditSessionId:
+    """Codex PR-63 r1: the hunter's bookkeeping id.
+
+    Standalone hunts (no ambient session) get a FRESH ``{ctx.session_id}-
+    {uuid8}`` id per execution — deterministic ctx ids (exploit-{finding},
+    elaborate-{finding}) are REUSED across runs/restarts, and appending a
+    new run onto the stale audit.jsonl made executions unreconcilable.
+    An ambient session (operator job / webui turn that spawned the hunt)
+    still keeps ONE shared trail per session.
+    """
+
+    def _make_hunter(self, session_id: str) -> NativeHunter:
+        class _HunterLLM:
+            model_name = "hunter-model"
+            provider_name = "stub"
+
+            async def achat(self, **kwargs):
+                return ChatResponse(
+                    content=[{"text": "No findings."}],
+                    usage=Usage(prompt_tokens=300, completion_tokens=120, total_tokens=420),
+                    provider_model_name="hunter-served",
+                )
+
+        ctx = HunterContext(
+            repo_path=str(_FIXTURE_C),
+            findings=[],
+            file_path="src/codec_a.c",
+            session_id=session_id,
+            specialist="general",
+        )
+        return NativeHunter(
+            llm=_HunterLLM(),
+            prompt="system prompt",
+            tools=[],
+            ctx=ctx,
+            max_steps=1,
+        )
+
+    def test_standalone_runs_each_get_a_fresh_suffixed_trail(self, monkeypatch, tmp_path):
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        ctx_sid = f"sh-{uuid.uuid4().hex[:8]}"
+
+        asyncio.run(self._make_hunter(ctx_sid).arun())
+        asyncio.run(self._make_hunter(ctx_sid).arun())
+
+        # Two executions of the SAME deterministic ctx id → two distinct
+        # audit trails, both prefixed with the ctx id (+ "-" + 8 hex).
+        session_dirs = _audit_session_dirs(audit_home, ctx_sid)
+        assert len(session_dirs) == 2
+        assert session_dirs[0] != session_dirs[1]
+        for name in session_dirs:
+            suffix = name[len(ctx_sid) + 1 :]
+            assert len(suffix) == 8 and all(c in "0123456789abcdef" for c in suffix)
+            rows = _llm_cost_rows(_audit_rows(audit_home, name))
+            assert len(rows) == 1  # this run's call, not the stale one's
+            assert rows[0]["agent"] == "hunter"
+
+    def test_ambient_session_keeps_one_shared_trail(self, monkeypatch, tmp_path):
+        from clearwing.agent.tooling import session_scope
+
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        ctx_sid = f"sh-{uuid.uuid4().hex[:8]}"
+        parent_sid = f"job-{uuid.uuid4().hex[:8]}"
+
+        with session_scope(parent_sid):
+            asyncio.run(self._make_hunter(ctx_sid).arun())
+            asyncio.run(self._make_hunter(ctx_sid).arun())
+
+        # No per-execution trail was created: both hunts appended to the
+        # spawning session's ONE shared audit file.
+        assert _audit_session_dirs(audit_home, ctx_sid) == []
+        rows = _llm_cost_rows(_audit_rows(audit_home, parent_sid))
+        assert len(rows) == 2
+        assert all(r["agent"] == "hunter" for r in rows)
+        assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
+            CostTracker().session_total(parent_sid)
         )
 
 

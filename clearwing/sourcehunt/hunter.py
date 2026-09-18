@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1578,17 +1579,26 @@ class NativeHunter:
         )
         # Session audit trail (#61), same attribution source as the cost
         # records below: the ambient session (operator job / webui turn
-        # that spawned this hunt) or the hunt's own sh-* execution id.
-        # Hunters run in-process (asyncio tasks), so the jsonl appends land
-        # in the same audit.jsonl the spawning session writes — AuditLogger's
-        # lock is PER-INSTANCE (it serializes appends through one logger,
-        # not across loggers); cross-instance safety comes from every
-        # hunter appending from the same event loop's synchronous segments
-        # plus a single ``write()`` per append under open("a") (O_APPEND),
-        # which the kernel positions atomically.
-        audit_logger = init_session_audit_logger(
-            current_session_id() or self.ctx.session_id
-        )
+        # that spawned this hunt) keeps ONE shared trail per session;
+        # standalone hunts fall back to their own execution id — with a
+        # fresh suffix when the ctx id is deterministic and REUSED across
+        # runs/restarts (exploit-{finding_id}, elaborate-{finding_id}),
+        # so each execution's audit rows and tracker bucket stay
+        # reconcilable instead of appending a new run onto a stale
+        # audit.jsonl (Codex PR-63 r1). Hunters run in-process (asyncio
+        # tasks), so the jsonl appends land in the same file the spawning
+        # session writes — AuditLogger's lock is PER-INSTANCE (it
+        # serializes appends through one logger, not across loggers);
+        # cross-instance safety comes from every hunter appending from the
+        # same event loop's synchronous segments plus a single
+        # ``write()`` per append under open("a") (O_APPEND), which the
+        # kernel positions atomically.
+        ambient_session = current_session_id()
+        if ambient_session:
+            book_session_id: str = ambient_session
+        else:
+            book_session_id = f"{self.ctx.session_id}-{uuid.uuid4().hex[:8]}"
+        audit_logger = init_session_audit_logger(book_session_id)
         total_input_tokens = 0
         total_output_tokens = 0
         total_cost_usd = 0.0
@@ -1802,7 +1812,7 @@ class NativeHunter:
                             model=self.llm.model_name,
                             cached_tokens=s_cached,
                             provider=getattr(self.llm, "provider_name", None),
-                            session_id=current_session_id() or self.ctx.session_id,
+                            session_id=book_session_id,
                             audit_logger=audit_logger,
                             agent="summarizer",
                         )
@@ -1922,7 +1932,7 @@ class NativeHunter:
                     or self.llm.model_name,
                     cached_tokens=cached_tokens,
                     provider=provider_name,
-                    session_id=current_session_id() or self.ctx.session_id,
+                    session_id=book_session_id,
                     audit_logger=audit_logger,
                     agent="hunter",
                 )

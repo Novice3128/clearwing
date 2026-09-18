@@ -443,6 +443,13 @@ class OperatorAgent:
                         # rate and the job's limit check used a wrong model.
                         model=getattr(operator_llm, "served_model_name", None)
                         or getattr(operator_llm, "model_name", "unknown"),
+                        # The audit row keeps the model the PROVIDER echoed
+                        # (canonical/versioned name) for forensics accuracy,
+                        # mirroring the runtime/hunter audit_model split
+                        # (Codex PR-63 r1) — pricing stays on the member key.
+                        audit_model=getattr(response, "provider_model_name", None)
+                        or getattr(operator_llm, "served_model_name", None)
+                        or getattr(operator_llm, "model_name", "unknown"),
                         cached_tokens=usage_cached if isinstance(usage_cached, int) else 0,
                         provider=getattr(operator_llm, "served_provider_name", None)
                         or getattr(operator_llm, "provider_name", None),

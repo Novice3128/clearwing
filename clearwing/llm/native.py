@@ -238,8 +238,13 @@ def parse_retry_after_seconds(
     Scans the FULL ``__cause__``/``__context__`` chain when given an
     exception — genai-pyo3 and the aiohttp transport nest the real detail
     under a terse wrapper, and a bare ``str(exc)`` misses it (issue #59).
-    Precedence (opencode retry.ts order):
+    Precedence:
 
+    0. a ``clearwing_retry_after`` attribute anywhere on the chain — the
+       aiohttp transport stashes the actual response HEADER there; the
+       header outranks every body-text token, so provider chatter like a
+       body ``retry-after: 1`` can never override a 120s header (Codex
+       PR-63 r1);
     1. ``Retry-After-Ms`` style header (milliseconds),
     2. numeric ``Retry-After`` with an ``ms`` unit suffix,
     3. numeric ``Retry-After`` (seconds),
@@ -249,6 +254,15 @@ def parse_retry_after_seconds(
     Returns the delay in seconds capped at *max_seconds* (default 300), or
     None when nothing parses.
     """
+    if not isinstance(source, str):
+        cur: BaseException | None = source
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            attr = getattr(cur, "clearwing_retry_after", None)
+            if isinstance(attr, (int, float)) and not isinstance(attr, bool):
+                return min(max(float(attr), 0.0), max_seconds)
+            cur = cur.__cause__ or cur.__context__
     raw = source if isinstance(source, str) else _exception_chain_raw(source)
     lowered = raw.lower()
 
@@ -340,17 +354,36 @@ def _retry_after_hint_from_headers(headers: Any) -> float | None:
     return None
 
 
-def _retry_after_suffix(headers: Any) -> str:
-    """Render a headers-derived Retry-After hint as the ``retry-after: N``
+def _retry_after_suffix(hint: float | None) -> str:
+    """Render a header-derived Retry-After hint as the ``retry-after: N``
     text protocol so the downstream parser (and the FallbackChain's
-    cooldown sizing) can recover it from the raised exception's text."""
-    hint = _retry_after_hint_from_headers(headers)
+    cooldown sizing) can recover it from the raised exception's text.
+    The AUTHORITATIVE copy rides on the exception's
+    ``clearwing_retry_after`` attribute (see the aiohttp raise sites) —
+    this text is the human-readable echo, not the source of truth."""
     if hint is None or hint <= 0:
         return ""
     # Fixed-point, never ``:g``: general formatting switches to scientific
     # notation at ≥ 1e6 ("3e+06"), and the downstream regex would truncate
     # that to 3 s — breaking the round-trip the suffix exists for.
-    return f" (retry-after: {hint:.3f}s)"
+    return f" (retry-after: {min(hint, _RETRY_AFTER_MAX_SECONDS):.3f}s)"
+
+
+def _attach_retry_after(exc: BaseException, hint: float | None) -> BaseException:
+    """Stash a header-derived Retry-After on *exc*, out-of-band (Codex
+    PR-63 r1).
+
+    The response header is authoritative: an error BODY may also contain
+    ``retry-after: 1`` (or ``retry-after-ms``) tokens that the chain-text
+    parser would find FIRST, silently overriding the header's 120s with
+    1s. The parser prefers this attribute over any text, so body chatter
+    can never outrank the header."""
+    if hint is not None and hint > 0:
+        try:
+            exc.clearwing_retry_after = min(hint, _RETRY_AFTER_MAX_SECONDS)  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - exotic exception types
+            pass
+    return exc
 
 
 def _non_negative_int_env(name: str, default: int) -> int:
@@ -1723,10 +1756,18 @@ class AsyncLLMClient:
                         # Embed any Retry-After hint via the shared text
                         # protocol so the retry backoff (and the fallback
                         # chain's cooldown) can honor the header instead of
-                        # losing it with the response object (issue #59).
-                        raise RuntimeError(
-                            f"OpenAI-compatible fallback failed with HTTP "
-                            f"{resp.status}: {detail}{_retry_after_suffix(resp.headers)}"
+                        # losing it with the response object (issue #59);
+                        # the attribute carries the authoritative value
+                        # past any retry-after tokens in the BODY text
+                        # (Codex PR-63 r1).
+                        header_hint = _retry_after_hint_from_headers(resp.headers)
+                        raise _attach_retry_after(
+                            RuntimeError(
+                                f"OpenAI-compatible fallback failed with HTTP "
+                                f"{resp.status}: "
+                                f"{detail}{_retry_after_suffix(header_hint)}"
+                            ),
+                            header_hint,
                         )
                     try:
                         return await self._collect_openai_sse_response(resp, on_text_delta)
@@ -1742,9 +1783,14 @@ class AsyncLLMClient:
             async with session.post(url, json=body, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        f"OpenAI-compatible fallback failed with HTTP "
-                        f"{resp.status}: {text[:1000]}{_retry_after_suffix(resp.headers)}"
+                    header_hint = _retry_after_hint_from_headers(resp.headers)
+                    raise _attach_retry_after(
+                        RuntimeError(
+                            f"OpenAI-compatible fallback failed with HTTP "
+                            f"{resp.status}: "
+                            f"{text[:1000]}{_retry_after_suffix(header_hint)}"
+                        ),
+                        header_hint,
                     )
                 try:
                     payload = json.loads(text)

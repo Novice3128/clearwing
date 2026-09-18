@@ -1173,7 +1173,14 @@ class TestHuntCostAttribution:
         self._run_one_step_hunt(captured)
 
         assert captured, "hunter emitted no COST_UPDATE frames"
-        assert all(frame["session_id"] == "sh-attr0001" for frame in captured)
+        # Codex PR-63 r1: a standalone hunt books under a FRESH suffixed
+        # execution id (ctx.session_id-<uuid8>) — still its OWN trail,
+        # never another session's, but unique per execution so a reused
+        # deterministic ctx id cannot append onto a stale run's totals.
+        assert all(
+            frame["session_id"].startswith("sh-attr0001-") for frame in captured
+        )
+        assert len({frame["session_id"] for frame in captured}) == 1
 
     def test_session_scoped_hunt_attributes_to_parent_session(self):
         from clearwing.agent.tooling import session_scope

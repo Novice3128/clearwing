@@ -89,6 +89,25 @@ _COOLDOWN_MAX_SECONDS: float = 600.0
 # parsed hints at 300s (native._RETRY_AFTER_MAX_SECONDS).
 _COOLDOWN_RETRY_AFTER_MAX_SECONDS: float = 300.0
 
+# Marker attribute distinguishing a CONSUMER-side exception (the caller's
+# on_text_delta raising through the chain's counting wrapper mid-stream)
+# from a provider failure: the wrapper re-raises it tagged, and the
+# dispatch handler re-raises it verbatim without cooling the member or
+# failing over (Codex PR-63 r1). Attribute tag, not a wrapper class, so
+# the caller still receives its own exception type/instance.
+_CONSUMER_ERROR_ATTR = "_clearwing_consumer_error"
+
+
+def _mark_consumer_error(exc: BaseException) -> None:
+    try:
+        setattr(exc, _CONSUMER_ERROR_ATTR, True)
+    except Exception:  # pragma: no cover - exotic exception types
+        pass
+
+
+def _is_consumer_error(exc: BaseException) -> bool:
+    return getattr(exc, _CONSUMER_ERROR_ATTR, False) is True
+
 
 class FallbackChain:
     """Duck-typed stand-in for :class:`AsyncLLMClient` (issue #17).
@@ -248,7 +267,14 @@ class FallbackChain:
             streak += 1
             self._cooldown_streak[id(client)] = streak
         if streak >= 1:
-            window = min(_COOLDOWN_BASE_SECONDS * (2 ** (streak - 1)), _COOLDOWN_MAX_SECONDS)
+            # Clamp the exponent before exponentiating (Codex PR-63 r1):
+            # a provider down for weeks of capped half-open probes keeps
+            # growing its streak, and 60.0 * 2**1024 overflows the float
+            # BEFORE min() can apply the 600s cap — turning a provider
+            # failure into an OverflowError. 2**10 × 60s already exceeds
+            # the cap, so anything past ten doublings is indistinguishable.
+            exponent = min(streak - 1, 10)
+            window = min(_COOLDOWN_BASE_SECONDS * (2**exponent), _COOLDOWN_MAX_SECONDS)
         else:
             # extend_only with no prior streak: defensive — a cooling
             # member always has one — fall back to the base window.
@@ -366,7 +392,15 @@ class FallbackChain:
             nonlocal deltas_emitted
             deltas_emitted = True
             if original_callback is not None:
-                original_callback(text)
+                try:
+                    original_callback(text)
+                except Exception as exc:
+                    # Consumer-side failure: abort the member's stream by
+                    # re-raising, but TAGGED so the dispatch handler below
+                    # returns it to the caller instead of mistaking it for
+                    # a provider failure (the member did not fail).
+                    _mark_consumer_error(exc)
+                    raise
 
         if original_callback is not None:
             kwargs["on_text_delta"] = _counting_callback
@@ -377,24 +411,20 @@ class FallbackChain:
                 # Abandoned partial output already reached the consumer —
                 # never interleave a second answer into it.
                 kwargs["on_text_delta"] = None
+            # ONLY a provider failure counts (Codex PR-63 r1): consumer-side
+            # exceptions — the caller's on_text_delta raising through the
+            # counting callback (tagged there), or the suppressed-response
+            # re-emission below (outside this try) — must neither cool the
+            # member nor move the chain to the next one: the member did not
+            # fail, and re-dispatching would double-serve a call whose
+            # partial output the consumer already saw.
             try:
                 response = await client.achat_stream(**kwargs)
-                self._record_served(client)
-                if suppressed_this_member and original_callback is not None:
-                    # The legacy interactive CLI prints ONLY what the delta
-                    # callback delivered (it discards the returned events),
-                    # so suppressed failover text would leave the user with
-                    # nothing but the abandoned fragment — emit the complete
-                    # response once (Codex PR-55 r5). Event/state consumers
-                    # keep the authoritative response object either way.
-                    try:
-                        text = response_text(response)
-                    except Exception:
-                        text = ""
-                    if text:
-                        original_callback(text)
-                return response
             except Exception as exc:
+                # Consumer-side: propagate verbatim — no cooldown, no
+                # failover (the marker is set by _counting_callback).
+                if _is_consumer_error(exc):
+                    raise
                 # Cancellation must never fail over (BaseException is not
                 # caught); only genuine provider failures move the chain.
                 last_exc = exc
@@ -428,6 +458,25 @@ class FallbackChain:
                     getattr(clients[index + 1], "provider_name", "?"),
                     getattr(clients[index + 1], "model_name", "?"),
                 )
+                continue
+            # Success path — OUTSIDE the provider-failure handler (Codex
+            # PR-63 r1): a raising consumer callback propagates to the
+            # caller instead of cooling the member that served the call.
+            self._record_served(client)
+            if suppressed_this_member and original_callback is not None:
+                # The legacy interactive CLI prints ONLY what the delta
+                # callback delivered (it discards the returned events),
+                # so suppressed failover text would leave the user with
+                # nothing but the abandoned fragment — emit the complete
+                # response once (Codex PR-55 r5). Event/state consumers
+                # keep the authoritative response object either way.
+                try:
+                    text = response_text(response)
+                except Exception:
+                    text = ""
+                if text:
+                    original_callback(text)
+            return response
         raise last_exc  # pragma: no cover - loop always returns or raises
 
     async def achat(self, **kwargs: Any):

@@ -10,6 +10,10 @@
 - Every parsed value is capped at 300 s.
 - The aiohttp transport fallback embeds the header hint into its raised
   RuntimeError text so the retry backoff can honor it.
+- Codex PR-63 r1: the aiohttp raise sites ALSO stash the header hint on
+  the exception's ``clearwing_retry_after`` attribute, which outranks
+  every body-text token (a body ``retry-after: 1`` must never override a
+  120 s header).
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from genai_pyo3 import ChatMessage, ChatOptions, ChatRequest
 
 from clearwing.llm.native import (
     AsyncLLMClient,
+    _attach_retry_after,
     _retry_after_hint_from_headers,
     _retry_after_suffix,
     parse_retry_after_seconds,
@@ -159,19 +164,74 @@ class TestHeaderExtraction:
         assert _retry_after_hint_from_headers(None) is None
 
     def test_suffix_renders_the_text_protocol(self):
-        assert _retry_after_suffix({"Retry-After-Ms": "2500"}) == " (retry-after: 2.500s)"
-        assert _retry_after_suffix({"Retry-After": "30"}) == " (retry-after: 30.000s)"
-        assert _retry_after_suffix({}) == ""
+        # Codex PR-63 r1: the suffix takes the header-derived hint VALUE
+        # (not the headers mapping) — the raise sites extract once and
+        # feed both the text echo and the authoritative attribute.
+        assert _retry_after_suffix(2.5) == " (retry-after: 2.500s)"
+        assert _retry_after_suffix(30.0) == " (retry-after: 30.000s)"
+        assert _retry_after_suffix(None) == ""
+        assert _retry_after_suffix(0.0) == ""
 
     def test_suffix_fixed_point_round_trip_for_huge_hints(self):
         # ``:g`` formatting went scientific at ≥ 1e6 ("3e+06"), and the
         # downstream numeric regex truncated that to 3 s. The fixed-point
-        # render must round-trip: embedded → parsed → capped at 300, never
-        # silently read as 3.
-        suffix = _retry_after_suffix({"Retry-After": "3000000"})
-        assert suffix == " (retry-after: 3000000.000s)"
+        # render (pre-capped at 300 since PR-63 r1) must round-trip:
+        # embedded → parsed → capped at 300, never silently read as 3.
+        suffix = _retry_after_suffix(3000000.0)
+        assert suffix == " (retry-after: 300.000s)"
         exc = RuntimeError(f"HTTP 503 upstream exploded{suffix}")
         assert parse_retry_after_seconds(exc) == 300.0
+
+
+class TestAttachedRetryAfterAttribute:
+    """Codex PR-63 r1: the aiohttp raise sites stash the authoritative
+    header-derived Retry-After on the exception's ``clearwing_retry_after``
+    attribute; the parser prefers it (precedence 0) over every body-text
+    token, so provider body chatter can never override the header."""
+
+    def test_attribute_beats_body_seconds_token(self):
+        exc = RuntimeError("HTTP 429 quota exceeded; body says retry-after: 1")
+        exc.clearwing_retry_after = 120.0
+        assert parse_retry_after_seconds(exc) == 120.0
+
+    def test_attribute_beats_body_ms_token(self):
+        exc = RuntimeError("rate limited (retry-after-ms: 500)")
+        exc.clearwing_retry_after = 120.0
+        assert parse_retry_after_seconds(exc) == 120.0
+
+    def test_attribute_found_through_cause_chain(self):
+        # The transport raise may be wrapped (retry plumbing, genai's
+        # terse wrappers): the attribute walk covers the full chain.
+        inner = RuntimeError("upstream exploded")
+        inner.clearwing_retry_after = 90.0
+        wrapped = RuntimeError("Web call failed for model m")
+        wrapped.__cause__ = inner
+        assert parse_retry_after_seconds(wrapped) == 90.0
+
+    def test_attribute_still_capped_at_max_seconds(self):
+        exc = RuntimeError("slow down")
+        exc.clearwing_retry_after = 9999.0
+        assert parse_retry_after_seconds(exc) == 300.0
+
+    def test_bool_attribute_is_not_a_delay(self):
+        # True is an int subclass but not a delay — the parser must skip
+        # it and fall through to the text scan (None here).
+        exc = RuntimeError("connection reset")
+        exc.clearwing_retry_after = True
+        assert parse_retry_after_seconds(exc) is None
+
+    def test_attach_caps_hints_at_300(self):
+        exc = _attach_retry_after(RuntimeError("HTTP 503"), 400.0)
+        assert exc.clearwing_retry_after == 300.0
+
+    def test_attach_sets_positive_hints_verbatim(self):
+        exc = _attach_retry_after(RuntimeError("HTTP 429"), 120.0)
+        assert exc.clearwing_retry_after == 120.0
+
+    def test_attach_ignores_none_and_nonpositive_hints(self):
+        for hint in (None, 0.0, -5.0):
+            exc = _attach_retry_after(RuntimeError("HTTP 503"), hint)
+            assert not hasattr(exc, "clearwing_retry_after")
 
 
 class _FakeResponse:
@@ -254,6 +314,44 @@ class TestAiohttpFallbackEmbedsHeader:
                 client._openai_chat_http_fallback(self._request(), ChatOptions())
             )
         assert "retry-after" not in str(exc_info.value)
+
+    def test_header_attribute_beats_misleading_body_token(self, monkeypatch):
+        """The exact Codex PR-63 r1 shape: the response HEADER says 120s
+        while the error BODY text carries its own ``retry-after: 1``
+        chatter. The text scan alone would parse 1 (the body token sits
+        before the rendered suffix); the attached attribute must win."""
+        import clearwing.llm.native as native_module
+
+        client = _client()
+        _FakeSession.response = _FakeResponse(
+            503, {"Retry-After": "120"}, body="quota exceeded; retry-after: 1"
+        )
+        monkeypatch.setattr(native_module.aiohttp, "ClientSession", _FakeSession)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            asyncio.run(
+                client._openai_chat_http_fallback(self._request(), ChatOptions())
+            )
+        # The authoritative copy rides the exception attribute, capped.
+        assert exc_info.value.clearwing_retry_after == 120.0
+        # And the shared parser prefers it over the body token.
+        assert parse_retry_after_seconds(exc_info.value) == 120.0
+
+    def test_header_attribute_beats_misleading_body_ms_token(self, monkeypatch):
+        import clearwing.llm.native as native_module
+
+        client = _client()
+        _FakeSession.response = _FakeResponse(
+            503, {"Retry-After": "120"}, body="slow down; retry-after-ms: 500"
+        )
+        monkeypatch.setattr(native_module.aiohttp, "ClientSession", _FakeSession)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            asyncio.run(
+                client._openai_chat_http_fallback(self._request(), ChatOptions())
+            )
+        assert exc_info.value.clearwing_retry_after == 120.0
+        assert parse_retry_after_seconds(exc_info.value) == 120.0
 
 
 class TestRetryDelayIntegration:

@@ -166,6 +166,21 @@ class TestCooldownExpiryAndReset:
         # Last failure: streak 12 → 60*2^11 = 122880 → capped at 600.
         assert chain._cooldown_remaining(primary) <= 600.0
 
+    def test_huge_streak_never_overflows_the_exponent(self, clock):
+        """Codex PR-63 r1: a provider down for weeks of capped half-open
+        probes keeps growing its streak. 60.0 * 2**streak overflows the
+        float BEFORE ``min()`` could apply the 600s cap — the cooldown
+        itself must clamp the exponent first, so a provider failure can
+        never surface as an OverflowError."""
+        primary = _Member("primary-model")
+        backup = _Member("backup-model", response="saved")
+        chain = FallbackChain(primary, [backup])
+
+        chain._cooldown_streak[id(primary)] = 5000
+        chain._start_cooldown(primary, RuntimeError("status code 503"))
+        # Window == the 600s cap exactly (60 * 2**10 already exceeds it).
+        assert chain._cooldown_remaining(primary) == 600.0
+
 
 class TestRetryAfterExtension:
     def test_retry_after_extends_the_window(self, clock):
@@ -399,6 +414,110 @@ class TestNoCooldownPaths:
         # cooldown bookkeeping, no skip/fail-open chatter.
         assert collapsed._cooldown_remaining(primary) == 0.0
         assert notices == []
+
+
+class TestConsumerCallbackExceptions:
+    """Codex PR-63 r1: a consumer-side exception — the CALLER's
+    on_text_delta raising while the member streams — is not a provider
+    failure. It must propagate to the caller verbatim, with no cooldown
+    on the member that was serving and no failover (re-dispatching would
+    double-serve a call whose partial output the consumer already saw)."""
+
+    def _streaming_primary(self):
+        class _StreamingPrimary:
+            model_name = "primary-model"
+            provider_name = "openai"
+            spend_ledger = None
+            calls = 0
+
+            async def achat_stream(self, **kwargs):
+                self.calls += 1
+                callback = kwargs.get("on_text_delta")
+                if callback is not None:
+                    callback("live delta")
+                return SimpleNamespace(first_text="answer", texts=["answer"])
+
+        return _StreamingPrimary()
+
+    def test_callback_exception_propagates_without_cooldown_or_failover(self, clock):
+        primary = self._streaming_primary()
+        backup = _Member("backup-model", response="saved")
+        chain = FallbackChain(primary, [backup])
+
+        def _boom(text: str) -> None:
+            raise RuntimeError(f"consumer exploded on {text!r}")
+
+        # (a) the caller's own exception surfaces unchanged.
+        with pytest.raises(RuntimeError, match="consumer exploded on 'live delta'"):
+            asyncio.run(chain.achat_stream(messages=[], on_text_delta=_boom))
+
+        # (c) the chain never treated it as a provider failure, so no
+        # failover: the fallback member was never dispatched.
+        assert primary.calls == 1
+        assert backup.calls == 0
+        # (b) the primary entered no cooldown and keeps its place at the
+        # head of the dispatch order.
+        assert chain._cooldown_remaining(primary) == 0.0
+        assert id(primary) not in chain._cooldown_streak
+
+        # The next call still starts from the primary — healthy as far as
+        # the chain knows.
+        result = asyncio.run(chain.achat_stream(messages=[]))
+        assert result.first_text == "answer"
+        assert primary.calls == 2
+        assert backup.calls == 0
+        assert chain.served_by_primary is True
+
+    def test_suppressed_reemission_exception_propagates_without_cooling_server(
+        self, clock
+    ):
+        """The other consumer-side raise point: after a mid-stream failover
+        (deltas already delivered), the serving member's full answer is
+        re-emitted through the ORIGINAL callback — a raising consumer must
+        not cool the member that served nor move the chain further."""
+        emitted: list[str] = []
+
+        class _FailMidStream:
+            model_name = "primary-model"
+            provider_name = "openai"
+            spend_ledger = None
+
+            async def achat_stream(self, **kwargs):
+                callback = kwargs.get("on_text_delta")
+                if callback is not None:
+                    callback("partial")
+                raise RuntimeError("stream died")
+
+        class _ServingBackup:
+            model_name = "backup-model"
+            provider_name = "openai"
+            spend_ledger = None
+            calls = 0
+
+            async def achat_stream(self, **kwargs):
+                self.calls += 1
+                assert kwargs.get("on_text_delta") is None  # suppressed
+                return SimpleNamespace(first_text="full answer", texts=["full answer"])
+
+        primary = _FailMidStream()
+        backup = _ServingBackup()
+        chain = FallbackChain(primary, [backup])
+
+        def _accept_then_boom(text: str) -> None:
+            emitted.append(text)
+            if text == "full answer":  # the suppressed re-emission
+                raise RuntimeError("consumer exploded on the full answer")
+
+        with pytest.raises(RuntimeError, match="consumer exploded"):
+            asyncio.run(chain.achat_stream(messages=[], on_text_delta=_accept_then_boom))
+
+        # The primary's death was a genuine provider failure (it cools),
+        # but the member that SERVED must not: no cooldown, no streak.
+        assert backup.calls == 1
+        assert chain._cooldown_remaining(backup) == 0.0
+        assert id(backup) not in chain._cooldown_streak
+        # The consumer saw the partial delta and the re-emission attempt.
+        assert emitted == ["partial", "full answer"]
 
 
 class TestStreamPolicyUnchanged:
