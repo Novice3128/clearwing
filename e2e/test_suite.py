@@ -812,6 +812,70 @@ def test_adjudicate_refuses_overwrite_of_reviewed(tmp_path):
         runner.cmd_adjudicate(a)
 
 
+# --------------------------------------- Codex #67 r3 fixes -------------
+
+def test_flip_requires_per_gate_coverage(tmp_path):
+    """r3 P1: one placeholder row must not authorize flipping a run with
+    multiple failed gates — every overturned gate needs its own row."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    (d / "gates.json").write_text(json.dumps([
+        {"gate": "cache-min", "pass": False, "severity": "hard", "detail": "x"},
+        {"gate": "degenerate-output", "pass": False, "severity": "hard", "detail": "y"}]))
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"
+    filled = adj.read_text().replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成：核實、方法論、流程、交付四路全數通過，無保留意見，同意翻案。")
+    filled = filled.replace("verdict: ", "verdict: PASS\n_", 1)
+    hdr = "| gate | run/scenario | conclusion | evidence | limits |\n|---|---|---|---|---|\n"
+    partial = filled.replace(
+        hdr, hdr + "| cache-min | full/t1 | shape fragility | replay | n=1 |\n", 1)
+    adj.write_text(partial)
+    a2 = _Args()
+    a2.run_dirs = [str(d)]
+    a2.finalize = True
+    with pytest.raises(SystemExit):      # degenerate-output uncovered -> refuse
+        runner.cmd_adjudicate(a2)
+    full = partial.replace(
+        "| cache-min | full/t1 | shape fragility | replay | n=1 |",
+        "| cache-min | full/t1 | shape fragility | replay | n=1 |\n"
+        "| degenerate-output | full/t3 | warm recall, not degenerate | audit | n=2 |", 1)
+    adj.write_text(full)
+    runner.cmd_adjudicate(a2)            # all gates covered -> FINAL
+    assert "adjudication-status: FINAL" in adj.read_text()
+
+
+def test_export_requires_hash_marker(tmp_path):
+    """r3 P1: a FINAL document with the reviewed-hash stripped must not
+    export (the integrity check was fail-open without the marker)."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    (d / "report.md").write_text("# cw-e2e full — x — FAIL\n")
+    adj = d / "adjudication.md"
+    adj.write_text("<!-- adjudication-status: FINAL -->\nverdict: FAIL\n")
+    e = _Args()
+    e.run_dir = str(d)
+    e.out = None
+    with pytest.raises(SystemExit):
+        runner.cmd_export(e)
+
+
+def test_budget_precheck_blocks_run(monkeypatch, tmp_path):
+    """r3 P2: the cap is enforced BEFORE spend — a run whose cap ceiling
+    would cross $700 dies at startup."""
+    monkeypatch.setattr(runner, "RESULTS", tmp_path)
+    (tmp_path / "budget-ledger.json").write_text(json.dumps(
+        {"runs": [{"ts": "t", "run": "prior", "cost_usd": 699.0}],
+         "total_usd": 699.0, "cap_usd": 700}))
+    tier = {"cost_cap": 5.0, "scenarios": [{"name": "x", "cost_cap": 5.0}]}
+    with pytest.raises(SystemExit):
+        runner._budget_precheck(tier, None)
+    ok_tier = {"cost_cap": 0.5, "scenarios": [{"name": "x", "cost_cap": 0.5}]}
+    runner._budget_precheck(ok_tier, None)          # 699.5 <= 700 -> no raise
+
+
 # --------------------------------------- Codex #67 r2 fixes -------------
 
 def test_verdict_vocabulary_and_override_evidence(tmp_path):
@@ -888,23 +952,32 @@ def test_aside_diff_reports_created_deleted(tmp_path):
     finally:
         mp.undo()
     note = out["memory-aside-diff-recorded"][2]
-    assert "memory.db-wal:+CREATED" in note and "knowledge_graph.json:-DELETED" in note
+    assert "knowledge_graph.json:-DELETED" in note
 
 
 # --------------------------------------- Codex #67 r1 fixes -------------
 
-def test_aside_copy_includes_wal(tmp_path):
-    """P1-A: SQLite WAL mode — copying only memory.db snapshots a stale
-    database; the -wal sidecar must be captured too."""
+def test_aside_copy_sqlite_consistent_snapshot(tmp_path):
+    """P1 r1+r3: .db snapshots go through SQLite's backup API — a CONSISTENT
+    copy including uncheckpointed WAL content; -wal/-shm are not copied
+    separately (a backup supersedes them)."""
+    import sqlite3
     home = tmp_path / "home"
     home.mkdir()
-    (home / "memory.db").write_bytes(b"db")
-    (home / "memory.db-wal").write_bytes(b"WAL-PENDING-WRITES")
+    src = home / "memory.db"
+    conn = sqlite3.connect(src)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE m (k TEXT)")
+    conn.execute("INSERT INTO m VALUES ('committed-in-wal')")
+    conn.commit()
+    # deliberately NO checkpoint — the row lives in memory.db-wal only
     dest = tmp_path / "aside"
     dest.mkdir()
     copied = runner._aside_copy(home, dest)
-    assert "memory.db-wal" in copied
-    assert (dest / "memory.db-wal").read_bytes() == b"WAL-PENDING-WRITES"
+    assert "memory.db" in copied
+    assert "memory.db-wal" not in copied and "memory.db-shm" not in copied
+    got = sqlite3.connect(dest / "memory.db").execute("SELECT k FROM m").fetchall()
+    assert got == [("committed-in-wal",)]        # WAL content captured
 
 
 def test_probe_majority(monkeypatch):

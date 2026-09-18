@@ -73,16 +73,34 @@ ASIDE_FILES = ("memory.db", "memory.db-wal", "memory.db-shm", "knowledge_graph.j
 
 
 def _aside_copy(home: Path, dest: Path) -> list[str]:
-    """Copy the memory state trio + KG. SQLite runs in WAL mode
-    (semantic_memory.py:95 / episodic_memory.py:66) — copying only
-    memory.db snapshots a STALE database and the contamination control
-    would miss mutations living in memory.db-wal (Codex #67 r1 P1)."""
+    """Snapshot memory state + KG. .db files go through SQLite's backup API
+    — a CONSISTENT snapshot including uncheckpointed WAL content (plain
+    file copies can tear when the live process checkpoints mid-copy, and
+    copying db+wal separately is not atomic either; Codex #67 r1+r3 P1).
+    knowledge_graph.json is a plain file."""
     copied = []
     for name in ASIDE_FILES:
         src = home / name
-        if src.exists():
-            dest.joinpath(name).write_bytes(src.read_bytes())
-            copied.append(name)
+        if not src.exists():
+            continue
+        out = dest / name
+        if name.endswith(".db"):
+            try:
+                import sqlite3
+                src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=5)
+                dst_conn = sqlite3.connect(str(out))
+                with dst_conn:
+                    src_conn.backup(dst_conn)
+                src_conn.close()
+                dst_conn.close()
+                copied.append(name)
+                continue
+            except Exception:        # noqa: BLE001 — fall back to byte copy
+                pass                  # (non-SQLite db file or lock timeout)
+        if name.endswith(("-wal", "-shm")):
+            continue                  # superseded by the backup API snapshot
+        out.write_bytes(src.read_bytes())
+        copied.append(name)
     return copied
 
 
@@ -558,10 +576,12 @@ def scenario_pytest(run_dir: Path) -> dict:
 def probe_majority(host: str, port: int, tries: int = 3) -> bool:
     """Majority-of-N probe: a single lost SYN must never become the
     recorded baseline or the post-run verdict (Codex #67 r1 P2)."""
-    votes = [tcp_probe(host, port) for _ in range(tries)]
-    if tries > 1:
-        time.sleep(0)      # votes are sequential already; gap added by timeout cost
-    return sum(votes) * 2 > len(votes)
+    votes = []
+    for i in range(tries):
+        if i:
+            time.sleep(0.5)     # back-to-back SYNs all landing inside one
+        votes.append(tcp_probe(host, port))   # transient window would defeat
+    return sum(votes) * 2 > len(votes)        # the majority (Codex #67 r3)
 
 
 def tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -876,6 +896,15 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
             if any(s and s in data for s in secrets) or re.search(
                     rb"api_key[=:?&]\s*['\"]?[A-Za-z0-9_-]{20,}", data):
                 hits.append(str(f))
+    for f in list(run_dir.glob("state/aside-*/*")):   # memory snapshots may
+        if not f.is_file():                            # embed secrets; they are
+            continue                                   # NOT covered by the suffix
+        try:                                           # allowlist (Codex #67 r3 P1)
+            data = f.read_bytes()
+        except OSError:
+            continue
+        if any(s and s in data for s in secrets):
+            hits.append(str(f))
     out.append(("artifact-keyscan", not hits, f"{hits[:3]} ({len(secrets)} value-probes)"))
     s, _ = http_get(f"{SUITE['webui']['live']}/api/health")
     out.append(("live-health-final", s == 200, f"HTTP {s}"))
@@ -1139,13 +1168,22 @@ def cmd_adjudicate(args) -> None:
         verdict = mv.group(1).strip()
         if verdict not in ADJ_VERDICTS:
             die(f"verdict {verdict!r} not in {ADJ_VERDICTS} (Codex #67 r2)")
-        facts = [_run_dir_facts(d) for d in dirs]
-        machine = sorted({f["verdict"] for f in facts if f["verdict"] != "?"})
+        idx_dirs = _adj_indexed_dirs(text) or dirs
+        facts = [_run_dir_facts(x) for x in idx_dirs]   # the ROUND, not the
+        machine = sorted({f["verdict"] for f in facts if f["verdict"] != "?"})  # CLI arg
         flipped = machine and verdict not in machine and not (len(machine) > 1)
-        if flipped and not _adj_override_rows(text):
-            die(f"final verdict {verdict} flips the machine verdict {machine} but the "
-                "overridden-gates table is EMPTY — a flip must carry its 論據 rows "
-                "(gate | run/scenario | conclusion | evidence | limits)")
+        if flipped:
+            rows = _adj_override_rows(text)
+            if not rows:
+                die(f"final verdict {verdict} flips the machine verdict {machine} but the "
+                    "overridden-gates table is EMPTY — a flip must carry its 論據 rows "
+                    "(gate | run/scenario | conclusion | evidence | limits)")
+            covered = {r.strip("|").split("|")[0].strip().lower() for r in rows}
+            failed = {g.lower() for f in facts for g in f["failed_gates"]}
+            uncovered = failed - covered
+            if uncovered:
+                die(f"flip evidence incomplete: failed gate(s) {sorted(uncovered)} have no "
+                    "override row — every overturned gate needs its own row")
         stamp_dirs = _adj_indexed_dirs(text) or dirs   # same set export will use
         stamp = (f"<!-- reviewed-hash: {_adj_reviewed_hash(stamp_dirs)} -->")
         adj.write_text(text.replace(ADJ_STATUS.format("DRAFT"),
@@ -1227,7 +1265,10 @@ def cmd_export(args) -> None:
             "required) before exporting external-facing content")
     indexed = _adj_indexed_dirs(text) or [d]
     hm = re.search(r"<!-- reviewed-hash: ([0-9a-f]+) -->", text)
-    if hm and hm.group(1) != _adj_reviewed_hash(indexed):
+    if not hm:
+        die("FINAL adjudication carries no reviewed-hash (deleted? pre-feature "
+            "document?) — re-finalize to bind it to the reviewed artifacts")
+    if hm.group(1) != _adj_reviewed_hash(indexed):
         die("reviewed artifacts changed since finalize (analyze re-run or "
             "report/gates/ledger mutation) — re-review and re-finalize; export "
             "refuses to mix an old verdict with fresh machine facts")
@@ -1245,15 +1286,31 @@ def cmd_export(args) -> None:
     for f in all_facts:
         out.append(f"  - `{f['path']}` — {f['verdict']} · ${f['cost']} · "
                    + (f"failed: {', '.join(f['failed_gates'])}" if f["failed_gates"] else "clean"))
-    if (d / "r3-manual.md").exists() and not (d / "r3-done").exists():
+    if any(f["r3_pending"] for f in all_facts):
         out.append("- ⚠️ R3 人工抽核未完成（r3-manual.md 待填、無 r3-done）——"
-                   "發版級宣稱（Full×2＋deep-cold）不應引用本 run")
+                   "發版級宣稱（Full×2＋deep-cold）不應引用本輪")
     text = "\n".join(out)
     if args.out:
         Path(args.out).write_text(text + "\n")
         log(f"exported: {args.out}")
     else:
         print(text)
+
+
+def _budget_precheck(tier: dict, only: str | None) -> None:
+    """Enforce the program cap BEFORE spending (Codex #67 r3): the cleanup
+    ledger check comes too late for a run that starts at $699."""
+    try:
+        led_p = RESULTS / "budget-ledger.json"
+        spent = json.loads(led_p.read_text()).get("total_usd", 0) if led_p.exists() else 0
+    except (OSError, ValueError):
+        spent = 0
+    est = sum(cost_cap_of(sc, tier) for sc in tier["scenarios"]
+              if not only or sc["name"] == only)
+    if spent + est > 700:
+        die(f"budget pre-check: cumulative ${spent:.2f} + this run's cap ceiling "
+            f"${est:.2f} would exceed the $700 program cap — reduce scope or get "
+            "the cap raised (ledger: e2e/results/budget-ledger.json)")
 
 
 def cmd_run(args) -> None:
@@ -1274,6 +1331,7 @@ def cmd_run(args) -> None:
         for sc in selected)
     if needs_profile and not args.force:
         check_llm_profile()          # scenario-aware (Codex #67 r1): --only fc-approval stays legal
+    _budget_precheck(tier, args.only)
     with SuiteLock():
         run_dir = new_run_dir(tier_name + ("-partial" if args.only else ""))
         log(f"run dir: {run_dir}")
@@ -1314,14 +1372,16 @@ def cmd_run(args) -> None:
                     # spend already metered before the crash must not vanish
                     # from the ledger (Codex #67 r2): recover the running
                     # total from the frames log the driver managed to write
-                    fl = run_dir / "scenarios" / f"{sc['name']}.frames.jsonl"
-                    if fl.exists():
+                    for fl in sorted((run_dir / "scenarios").glob(
+                            f"{sc['name']}*.frames.jsonl")):   # suffixed repeats too
                         try:
                             import re as _re2
                             costs = [float(m) for m in _re2.findall(
-                                r'"total_cost_usd":\s*([0-9.]+)', fl.read_text(errors="ignore"))]
+                                r'"total_cost_usd":\s*([0-9.]+)',
+                                fl.read_text(errors="ignore"))]
                             if costs:
-                                crashed["cost_usd_product"] = max(costs)
+                                crashed["cost_usd_product"] = max(
+                                    crashed.get("cost_usd_product") or 0, max(costs))
                         except (OSError, ValueError):
                             pass
                     ctx["results"].append({"name": sc["name"], "summary": crashed,

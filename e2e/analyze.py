@@ -104,12 +104,20 @@ def cache_prefix_median(per_call: list[tuple]) -> float | None:
     — the per-call caliber is the regression detector."""
     ratios = []
     prev_in: dict[str, int] = {}
+    others = 0
     for row in per_call:
         ti, tc, agent = row[0], row[1], (row[3] if len(row) > 3 else "main")
         if ti < 5000:
             continue            # tiny auxiliary contexts (~450 tokens) have no
                                 # shared prefix by design — 0% cache there is not
                                 # degradation (n=2 replay lesson)
+        if agent != "main":
+            # concurrent instances sharing one audit agent label (sourcehunt
+            # runs up to 8 hunters all audited as agent="hunter") cannot be
+            # separated without a product-side hunt id — excluded from the
+            # median rather than conflated (Codex #67 r3); gh/ note filed
+            others += 1
+            continue
         prev = prev_in.get(agent)
         if prev is not None and ti <= prev * 1.2:
             ratios.append(100 * tc / max(ti, 1))
@@ -442,7 +450,9 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
             "## 待抽核報告（samples=" + str(samples) + "）", "",
         ]
         for sid in sids:
-            r3.append(f"- sid `{sid}` → `~/.clearwing/results/sessions/{sid}/report.md`")
+            # 8899 runs with cwd=REPO_ROOT (verify gate) — default_results_dir
+            # is RELATIVE, so reports land under the checkout, not $HOME
+            r3.append(f"- sid `{sid}` → `{E2E_ROOT.parent / 'results' / 'sessions' / sid / 'report.md'}`")
         r3 += [
             "", "## 抽核欄位（v3 fp-verification 紀律）", "",
             "1. 執行摘要數字 vs 工具活動表（tool calls/errors/cost 對拍）",
