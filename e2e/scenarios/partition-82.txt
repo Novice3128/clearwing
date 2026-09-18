@@ -1,0 +1,1 @@
+請依序對 {{TARGET}} 執行：scan_ports（前 20 個常用埠，scan_type 用 connect）、detect_services、scan_vulnerabilities，然後用 save_report 把完整結果分別存成 Markdown 與 JSON：{{RUN_DIR}}/scenarios/partition-report-{{TARGET}}.md 與 {{RUN_DIR}}/scenarios/partition-report-{{TARGET}}.json。完成後簡短回報：埠數、發現數、候選數。不需要使用 Kali 容器。

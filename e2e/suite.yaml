@@ -1,0 +1,114 @@
+# cw-e2e suite configuration — declarative tiers/scenarios/thresholds.
+# Secrets discipline: env VAR NAMES only (never key paths or values).
+# Runner enforces `targets` as a hard whitelist (SPEC §2.1).
+
+targets:
+  - 192.168.73.81   # AD DC (full-depth)
+  - 192.168.73.82   # small Windows target (quick/chaos)
+
+webui:
+  live: http://127.0.0.1:8899    # member-deployed instance
+  self: http://127.0.0.1:8898    # suite-spawned instance (deep tiers)
+
+env:
+  keyfile: CW_KEYFILE            # path to webui API key file (REQUIRED, no default)
+  llm_profile: CW_LLM_PROFILE    # path to LLM profiles yaml (REQUIRED for --base-url chaos)
+
+hot_paths:                        # MANUAL trigger reference (diff vs last run HEAD); `trigger` subcommand planned
+  - clearwing/ui
+  - clearwing/llm
+  - clearwing/observability
+  - clearwing/reporting
+  - clearwing/agent/tools
+  - clearwing/providers
+  - docs/web-api.md
+
+thresholds:
+  hard:
+    dup_pairs_max: 0
+    late_frames_max: 0
+    cache_zero_fail: true         # Full only
+  ratio:
+    reconcile_max_pct: 0.5        # audit x PRICING vs meter
+    cache_min_pct: 80             # Full only
+  trend:
+    duration_band_pct: 30
+    cost_band_pct: 30
+
+pricing_glm53: {input: 1.40, cached_input: 0.14, output: 4.40}   # USD / 1M
+
+pytest:
+  env_fail_allowlist:
+    - tests/test_sandbox_integration.py
+  area_subset:
+    - tests/test_llm_fallback.py
+    - tests/test_pricing_and_cache.py
+    - tests/test_cost_thread_totals.py
+    - tests/test_reporting.py
+    - tests/test_llm_timeout_resilience.py
+    - tests/test_webui.py
+    - tests/test_kali_docker.py
+
+tiers:
+  quick:
+    cost_cap: 2.0
+    scenarios:
+      - {name: probe-partial-fill, type: probe_partial_fill}
+      - {name: fc-approval, type: ws, prompt: quick-fc.txt, target: "192.168.73.82", max_seconds: 300,
+         cost_cap: 1.0, trust_status: true, expect: {approvals: ">=1", dup_pairs: 0, late_frames: 0}}
+      - {name: stop-frame, type: ws, prompt: quick-scan.txt, target: "192.168.73.82", max_seconds: 300,
+         cost_cap: 1.0, stop_after_tools: 1, expect: {cancelled_turn: true}}   # scan => deterministic tool_start (fc prompt lets the LLM skip tools)
+      - {name: watchdog-lowcap, type: ws, prompt: quick-scan.txt, target: "192.168.73.82", max_seconds: 300,
+         cost_cap: 0.01, expect: {watchdog: true, graceful: complete_or_stopped}}
+      - {name: warm-hud, type: hud, prompt: warm.txt, target: "192.168.73.82", cost_cap: 0.5}
+      - {name: report-cli, type: report_cli}
+      - {name: chaos-refuse1, type: chaos, mode: refuse, n: 1, prompt: chaos-task.txt,
+         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+      - {name: pathless-404-probe, type: chaos, mode: refuse, n: 1, prompt: chaos-task.txt,
+         target: "192.168.73.82", max_seconds: 60, cost_cap: 0.5, base_url_pathless: true,
+         expect: {complete_status: error}}
+      - {name: pytest-subset, type: pytest}
+
+  full:
+    cost_cap: 25.0
+    scenarios:
+      - {name: t1-fulldepth, type: ws, prompt: fulldepth-81.txt, target: "192.168.73.81", max_seconds: 4800,
+         cost_cap: 15.0, trust_status: true, memory: warm, idle_limit: 900,
+         expect: {complete_status: ok, errors: 0}}
+      - {name: fc-delay, type: ws, prompt: quick-fc.txt, target: "192.168.73.82", max_seconds: 300,
+         cost_cap: 1.0, approve_delay: 3, trust_status: true,
+         expect: {approvals: ">=1"}}     # timing variant: complete-before-approval detector
+      - {name: t2-partition, type: ws, prompt: partition-82.txt, target: "192.168.73.82", max_seconds: 900,
+         cost_cap: 5.0, trust_status: true}
+      - {name: t3-warm-chain, type: ws, prompt: warm.txt, target: "192.168.73.82", max_seconds: 240,
+         cost_cap: 0.5, repeat: 3}
+      - {name: chaos-refuse1, type: chaos, mode: refuse, n: 1, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+      - {name: chaos-refuse3, type: chaos, mode: refuse, n: 3, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+      - {name: chaos-reset2, type: chaos, mode: reset, n: 2, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+      - {name: chaos-stall75, type: chaos, mode: stall, n: 1, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+      - {name: chaos-429, type: chaos, mode: ratelimit, n: 2, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+      - {name: deny-path, type: ws, prompt: quick-fc.txt, target: "192.168.73.82", max_seconds: 300,
+         cost_cap: 1.0, deny_first_approval: true, trust_status: true}
+      - {name: probe-partial-fill, type: probe_partial_fill}
+      - {name: report-cli, type: report_cli}
+    analysis:
+      flag_baseline: 9            # hex32 false-flag faces observed 2026-09-17 (gate: flag-faces-baseline)
+      fact_check_samples: 3       # MANUAL R3 report fact-check (not automated)
+
+  deep-cold:
+    cost_cap: 25.0
+    instance: self                # suite-spawned 8898, isolated CLEARWING_HOME
+    scenarios:
+      - {name: smoke, type: ws, prompt: warm.txt, target: "192.168.73.82", max_seconds: 240, cost_cap: 0.5}
+      - {name: cold-fulldepth, type: ws, prompt: fulldepth-81.txt, target: "192.168.73.81", max_seconds: 5400,
+         cost_cap: 15.0, trust_status: true, memory: cold}
+
+  deep-fallback:
+    requires_approval: true       # --approve-fallback
+    scenarios:
+      - {name: failover-refuse-all, type: chaos, mode: refuse, n: 999999, prompt: chaos-task.txt,
+         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0, via_config: true}
+      - {name: failover-return, type: chaos, mode: refuse, n: 2, prompt: chaos-task.txt,
+         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0, via_config: true}
+      - {name: failover-slowfail, type: chaos, mode: stall, n: 999999, prompt: chaos-task.txt,
+         target: "192.168.73.82", max_seconds: 600, cost_cap: 1.0, via_config: true}
