@@ -69,6 +69,16 @@ def check_target(target: str) -> str:
     return target
 
 
+def cost_cap_of(sc: dict, tier: dict) -> float:
+    """Scenario cap > tier cap > suite default. Never index tier["cost_cap"]
+    directly — it is an eagerly-evaluated default and deep-fallback defines
+    no tier-level cap (every chaos scenario crashed with KeyError, Codex r1)."""
+    v = sc.get("cost_cap")
+    if v is None:
+        v = tier.get("cost_cap", SUITE["thresholds"].get("default_cost_cap", 5.0))
+    return float(v)
+
+
 def ws_from_base(base: str) -> str:
     """http(s) base -> ws endpoint (webui mounts /ws/agent)."""
     return base.replace("http", "ws", 1).rstrip("/") + "/ws/agent"
@@ -205,6 +215,22 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
     flag_faces = 0
     completes_without_status = 0
     complete_while_approval_open = 0
+    busy_rejects = 0
+    # Approval protocol (web/app.py): approval_needed is emitted INSIDE the
+    # message turn; `approve` frames are REJECTED with an error frame while
+    # the turn task is still active, and the accepted window opens when the
+    # turn's finally-block sends complete(status="awaiting_approval").
+    # Sending on approval_needed was therefore a race that usually won and
+    # silently lost the decision when it lost (Codex r1) — queue decisions
+    # and flush one per awaiting_approval complete instead.
+    pending_decisions: list[tuple[bool, int]] = []
+    flushed_last: tuple[bool, int] | None = None
+    # Late-frame drain: with trust_status=true the loop used to close the
+    # socket on the first terminal complete, so post-terminal frames were
+    # never read and the late-frames gate could only ever see zero
+    # (Codex r1). Keep draining a bounded grace window after terminal.
+    terminal_at: float | None = None
+    drain_s = float(SUITE["thresholds"].get("late_drain_s", 5))
 
     async def send(ws, obj):
         await ws.send(json.dumps(obj))
@@ -219,10 +245,18 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
         await send(ws, {"type": "message", "content": prompt})
         idle = 0
         frames = 0
-        while time.time() - t0 < max_seconds and frames < 12000:
+        # drain may run past max_seconds — the late-frames gate must not
+        # under-observe exactly the longest runs (bounded by drain_s itself)
+        while (time.time() - t0 < max_seconds or terminal_at is not None) and frames < 12000:
+            in_drain = terminal_at is not None
+            if in_drain and time.time() - terminal_at >= drain_s:
+                frames_log.write(f"# terminal drain window ({drain_s}s) closed\n")
+                break
             try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                raw = await asyncio.wait_for(ws.recv(), timeout=2 if in_drain else 30)
             except (asyncio.TimeoutError, TimeoutError):
+                if in_drain:
+                    continue            # short poll until drain window expires
                 idle += 30
                 if idle >= idle_limit:
                     if liveness.grew(sid):
@@ -256,10 +290,9 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
                     deny = True
                 if POLICY_DENY.search(prm) or DESTRUCTIVE_DENY.search(prm):
                     policy_denied += 1
-                if approve_delay:
-                    await asyncio.sleep(approve_delay)
-                await send(ws, {"type": "approve", "approved": not deny})
-                frames_log.write(f"# approve #{approvals} decision={not deny}\n")
+                pending_decisions.append((not deny, approvals))
+                frames_log.write(f"# approval #{approvals} queued decision={not deny} "
+                                 "(sent when awaiting_approval window opens)\n")
             elif t == "cost_update":
                 cost_updates += 1
                 cost_usd = max(cost_usd, float(d.get("total_cost_usd") or d.get("cost") or 0))
@@ -268,7 +301,9 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
                 tokens_cached += int(d.get("cached_tokens") or 0)
                 if d.get("model"):
                     cost_models.add(d["model"])
-                if cost_usd > cost_cap and not watchdog:
+                if cost_usd > cost_cap and not watchdog and terminal_at is None:
+                    # terminal_at guard: a late post-terminal cost_update must
+                    # never provoke a stop — the drain window is observe-only
                     watchdog = True
                     await send(ws, {"type": "stop"})
                     frames_log.write(f"# COST WATCHDOG fired at ${cost_usd:.4f} — stop sent\n")
@@ -280,14 +315,34 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
                 if d.get("args", {}).get("container_id"):
                     containers.add(d["args"]["container_id"][:12])
                 tools_log.write(f"+{round(time.time()-t0):>5}s {name} {json.dumps(d.get('args') or {}, ensure_ascii=False)[:300]}\n")
-                if stop_after_tools and tool_starts >= stop_after_tools:
+                if stop_after_tools and tool_starts >= stop_after_tools and terminal_at is None:
                     await send(ws, {"type": "stop"})
                     frames_log.write(f"# STOP sent after tool_start #{tool_starts}\n")
                     stop_after_tools = 0
             elif t == "tool_result":
                 approval_open = 0   # approval consumed by execution
             elif t == "error":
-                errors.append(str(d.get("message") or d.get("error") or raw)[:200])
+                msg_txt = str(d.get("message") or d.get("error") or raw)[:200]
+                # Residual micro-race: our flushed approve can still land in
+                # the gap between complete(awaiting_approval) send and
+                # turn_task completion — the server answers with the busy
+                # error frame. Retry once after a settle delay, and do NOT
+                # count the self-healed reject as a run error (t1 gates on
+                # errors==0; a recovered protocol hiccup must not FAIL it).
+                if flushed_last is not None and terminal_at is None \
+                        and "turn is already running" in msg_txt:
+                    busy_rejects += 1
+                    approved, seq = flushed_last
+                    await asyncio.sleep(0.5)
+                    await send(ws, {"type": "approve", "approved": approved})
+                    # retry ONCE per approval: clearing flushed_last bounds the
+                    # retry count AND prevents a stale decision re-firing on a
+                    # later unrelated error containing the phrase (review r2)
+                    flushed_last = None
+                    frames_log.write(f"# approve #{seq} RE-SENT after busy-reject "
+                                     f"(#{busy_rejects}, self-healed, retry budget spent)\n")
+                else:
+                    errors.append(msg_txt)
             elif t == "agent_message":
                 c = d.get("content")
                 if isinstance(c, str) and c:
@@ -308,8 +363,18 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
                         and status != "awaiting_approval":
                     complete_while_approval_open += 1   # D1/#29 detector
                 frames_log.write(f"# complete status={status} at +{round(time.time()-t0)}s\n")
+                if status == "awaiting_approval" and pending_decisions and terminal_at is None:
+                    approved, seq = pending_decisions.pop(0)
+                    if approve_delay:
+                        await asyncio.sleep(approve_delay)
+                    await send(ws, {"type": "approve", "approved": approved})
+                    flushed_last = (approved, seq)
+                    frames_log.write(f"# approve #{seq} decision={approved} "
+                                     f"sent in awaiting_approval window (delay={approve_delay}s)\n")
                 if trust_status and status in ("ok", "stopped", "error"):
-                    break
+                    if terminal_at is None:      # FIRST terminal anchors the drain
+                        terminal_at = time.time()   # window — late completes must
+                        frames_log.write(f"# terminal — draining {drain_s}s for late frames\n")
 
     text = "".join(agent_text)
     summary = {
@@ -326,6 +391,8 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
         "reply_chars": len(text), "reply_tail": text[-500:],
         "approval_open_at_end": approval_open, "flag_frames": flag_frames,
         "flag_faces": flag_faces,
+        "pending_approvals_at_end": len(pending_decisions),
+        "busy_rejects": busy_rejects,
         "completes_without_status": completes_without_status,
         "complete_while_approval_open": complete_while_approval_open,
         "containers": sorted(containers), "home": str(home) if home else None,
@@ -363,10 +430,10 @@ def run_ws_scenario(sc: dict, run_dir: Path, tier: dict, ws_url: str, keyfile: P
     elif sc.get("via_config"):
         pass                                          # fallback chain lives in real config; no base_url
     out = run_dir / "scenarios" / (sc["name"] + instance_tag)
-    log(f"scenario {sc['name']}{instance_tag}: target={target} cap={sc.get('cost_cap', tier['cost_cap'])}")
+    log(f"scenario {sc['name']}{instance_tag}: target={target} cap={cost_cap_of(sc, tier)}")
     summary = asyncio.run(ws_run(
         ws_url, keyfile, target, prompt, out,
-        int(sc.get("max_seconds", 600)), float(sc.get("cost_cap", tier["cost_cap"])),
+        int(sc.get("max_seconds", 600)), cost_cap_of(sc, tier),
         base_url=base_url, api_key=api_key,
         trust_status=sc.get("trust_status", True),
         approve_delay=float(sc.get("approve_delay", 0)),
@@ -413,9 +480,15 @@ def probe_partial_fill(ws_url: str, keyfile: Path, out: Path) -> dict:
 def scenario_report_cli(run_dir: Path, sid: str) -> dict:
     p = subprocess.run([str(REPO_ROOT / ".venv/bin/clearwing"), "report", "-s", sid],
                        capture_output=True, text=True, cwd=str(REPO_ROOT))
-    ok = p.returncode == 0 and len(p.stdout.strip()) > 0
+    # `report -s` prints a nonempty "No report found" message AND exits 0 on
+    # the absent-report path (ui/commands/report.py) — a bare nonempty-stdout
+    # check marked that failure path PASS (Codex r1). Require real content.
+    no_report = "No report found" in p.stdout
+    has_report = ("Session report:" in p.stdout or "Clearwing Session Report" in p.stdout)
+    ok = p.returncode == 0 and has_report and not no_report
     (run_dir / "scenarios" / "report-cli.txt").write_text(p.stdout[:5000] + "\n---stderr---\n" + p.stderr[:2000])
-    log(f"  -> report -s {sid}: exit={p.returncode} bytes={len(p.stdout)} pass={ok}")
+    log(f"  -> report -s {sid}: exit={p.returncode} bytes={len(p.stdout)} "
+        f"pass={ok}{' (no-report message!)' if no_report else ''}")
     return {"type": "report_cli", "sid": sid, "exit": p.returncode, "pass": bool(ok)}
 
 
@@ -428,9 +501,22 @@ def scenario_pytest(run_dir: Path) -> dict:
               if l.startswith("FAILED")]
     allow = SUITE["pytest"]["env_fail_allowlist"]
     non_env = [f for f in failed if f not in allow]
+    # Nonzero exit with NO parsed FAILED lines = collection/import/internal/
+    # usage error — stdout-only matching called those runs PASS (Codex r1).
+    # Exit 1 remains tolerable ONLY when every FAILED line is env-allowlisted.
+    env_only = p.returncode == 1 and bool(failed) and not non_env
+    ok = (p.returncode == 0 and not failed) or env_only
+    if p.returncode == 0:
+        exit_note = ""
+    elif env_only:
+        exit_note = "env-allowlisted failures only"
+    else:
+        exit_note = "nonzero exit without tolerable FAILED lines (collection/import/internal/usage error)"
     (run_dir / "scenarios" / "pytest-subset.txt").write_text(p.stdout[-8000:])
-    log(f"  -> pytest subset: {tail} (non-env failures: {non_env or 'none'})")
-    return {"type": "pytest", "tail": tail, "non_env_failures": non_env, "pass": not non_env}
+    log(f"  -> pytest subset: exit={p.returncode} {tail} "
+        f"(non-env failures: {non_env or 'none'}) {exit_note}")
+    return {"type": "pytest", "tail": tail, "exit": p.returncode,
+            "non_env_failures": non_env, "note": exit_note, "pass": bool(ok)}
 
 
 def tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -451,6 +537,73 @@ def listening_pids(port: int) -> list[int]:
             if m:
                 pids.append(int(m.group(1)))
     return pids
+
+
+def _proc_start_epoch(pid: int) -> float | None:
+    """/proc clock: process start as wall-clock epoch, or None if unreadable."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # fields after the comm entry "(...)" — starttime is the 20th there
+        starttime = int(stat[stat.rfind(")") + 2:].split()[19])
+        btime = next(l for l in Path("/proc/stat").read_text().splitlines()
+                     if l.startswith("btime"))
+        return int(btime.split()[1]) + starttime / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _product_head_epoch() -> int | None:
+    """Committer time of the last commit touching anything EXCEPT e2e/ —
+    that is the code the live process actually imports (suite-only commits
+    must not trip the process-freshness gate)."""
+    r = subprocess.run(["git", "-C", str(REPO_ROOT), "log", "-1", "--format=%ct",
+                        "--", ".", ":(exclude)e2e"], capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def proc_freshness(proc_start: float | None, prod_head: int | None) -> bool:
+    """Gate: process must have started AFTER the last product-code commit
+    (2s clock-skew tolerance). None on either side fails closed."""
+    if proc_start is None or prod_head is None:
+        return False
+    return proc_start >= prod_head - 2
+
+
+def _environ_api_key(pid: int) -> str | None:
+    """CLEARWING_WEB_API_KEY from the live 8899 process environ — the
+    authoritative key the server actually authenticates with (same-user
+    /proc read). Value is held in memory only, never printed."""
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    for entry in environ:
+        if entry.startswith(b"CLEARWING_WEB_API_KEY="):
+            return entry.split(b"=", 1)[1].decode("utf-8", "replace")
+    return None
+
+
+def evaluate_key_gate(kf_bytes: bytes | None, environ_key: str | None,
+                      mirror_bytes: bytes | None) -> tuple[str, bool, str]:
+    """Pure key-equivalence decision. Priority: the 8899 process environ is
+    authoritative (a stale webui-8899.key mirror must not brick the run);
+    the file mirror is the fallback when /proc is unreadable. All compares
+    newline-stripped (the two files differ only by trailing newline in a
+    known-good deployment)."""
+    if kf_bytes is None:
+        return ("key-files-info", True, "CW_KEYFILE unset/unreadable (verify-only context)")
+    if environ_key is not None:
+        same = kf_bytes.strip() == environ_key.encode().strip()
+        return ("key-matches-live-process", same,
+                f"CW_KEYFILE == 8899 env key (newline-stripped): {same}")
+    if mirror_bytes is not None:
+        same = kf_bytes.strip() == mirror_bytes.strip()
+        return ("key-files-match", same,
+                f"CW_KEYFILE == webui-8899.key (newline-stripped): {same}")
+    return ("key-files-info", True, "no mirror file, no /proc environ — unverified (info)")
 
 
 def verify(run_dir: Path | None, strict: bool = True) -> dict:
@@ -474,6 +627,15 @@ def verify(run_dir: Path | None, strict: bool = True) -> dict:
             checks.append(("8899-runs-repo-venv", cwd == REPO_ROOT, f"cwd={cwd}"))
         except OSError:
             checks.append(("8899-runs-repo-venv", False, "cannot read /proc"))
+        # A cwd match does not prove the process LOADED this code: if 8899
+        # started before a pull/checkout, its imported modules are stale and
+        # the suite would certify a revision it never exercised (Codex r1).
+        # Gate: process start must postdate the last product-code commit.
+        proc_start = _proc_start_epoch(pids[0])
+        prod_head = _product_head_epoch()
+        checks.append(("8899-proc-newer-than-product-head", proc_freshness(proc_start, prod_head),
+                       f"proc_start={time.strftime('%F %T', time.localtime(proc_start)) if proc_start else '?'} "
+                       f"product_head={time.strftime('%F %T', time.localtime(prod_head)) if prod_head else '?'}"))
     else:
         checks.append(("8899-runs-repo-venv", False, "no listener on 8899"))
 
@@ -492,13 +654,18 @@ def verify(run_dir: Path | None, strict: bool = True) -> dict:
         except Exception as e:  # noqa: BLE001
             checks.append((f"cfg-drift-{name}", False, f"spawn fail: {e}"))
 
+    kf_env = os.environ.get(SUITE["env"]["keyfile"])
     try:
-        kf_env = os.environ.get(SUITE["env"]["keyfile"])
-        k2 = Path.home() / ".clearwing/webui-8899.key"
-        same = (kf_env and Path(kf_env).read_bytes().strip() == k2.read_bytes().strip())
-        checks.append(("key-files-info", True, f"env-key == webui-8899.key (newline-stripped): {same}"))
+        kf_bytes = Path(kf_env).read_bytes() if kf_env else None
     except OSError:
-        checks.append(("key-files-info", True, "webui-8899.key absent (env-key deployment)"))
+        kf_bytes = None
+    mirror = Path.home() / ".clearwing/webui-8899.key"
+    try:
+        mirror_bytes = mirror.read_bytes() if mirror.exists() else None
+    except OSError:
+        mirror_bytes = None
+    checks.append(evaluate_key_gate(kf_bytes, _environ_api_key(pids[0]) if pids else None,
+                                    mirror_bytes))
 
     if run_dir:
         import hashlib
@@ -597,7 +764,7 @@ def scenario_hud(sc: dict, run_dir: Path, ws_url: str, keyfile: Path) -> dict:
 
 
 def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] | None = None,
-                sids: list[str] | None = None) -> list[tuple[str, bool, str]]:
+                sids: list[str] | None = None, keyfile: Path | None = None) -> list[tuple[str, bool, str]]:
     """Cleanup SOP as assertions (SPEC §2.8). Only recorded containers — never
     name-filter all (docker is global across instances). Kali containers are
     named clearwing-kali-<session_id>, so remove by sid; container ids are a
@@ -629,15 +796,36 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
     if before_8899 is not None:
         out.append(("live-8899-pids-unchanged", listening_pids(8899) == before_8899,
                     f"before={before_8899} now={listening_pids(8899)}"))
+    # Secret scan — VALUE-based (the regex alone missed JSON/repr/header
+    # forms): byte-search artifacts for the actual webui + LLM key values,
+    # held in memory, never printed; only hit FILENAMES are reported.
+    secrets: list[bytes] = []
+    try:
+        if keyfile is not None:
+            secrets.append(keyfile.read_bytes().strip())
+    except OSError:
+        pass
+    llm_profile = os.environ.get(SUITE["env"]["llm_profile"])
+    if llm_profile:
+        try:
+            import yaml as _y
+            v = (_y.safe_load(Path(llm_profile).expanduser().read_text())
+                 .get("zai", {}).get("api_key", ""))
+            if isinstance(v, str) and len(v) >= 20:
+                secrets.append(v.encode())
+        except Exception:
+            pass
     hits = []
     for f in run_dir.rglob("*"):
-        if f.is_file() and f.suffix in (".jsonl", ".json", ".txt", ".log", ".tools"):
+        if f.is_file() and f.suffix in (".jsonl", ".json", ".txt", ".log", ".tools", ".key"):
             try:
-                if re.search(r"api_key[=:?&]\s*['\"]?[A-Za-z0-9_-]{20,}", f.read_text(errors="ignore")):
-                    hits.append(str(f))
+                data = f.read_bytes()
             except OSError:
-                pass
-    out.append(("artifact-keyscan", not hits, f"{hits[:3]}"))
+                continue
+            if any(s and s in data for s in secrets) or re.search(
+                    rb"api_key[=:?&]\s*['\"]?[A-Za-z0-9_-]{20,}", data):
+                hits.append(str(f))
+    out.append(("artifact-keyscan", not hits, f"{hits[:3]} ({len(secrets)} value-probes)"))
     s, _ = http_get(f"{SUITE['webui']['live']}/api/health")
     out.append(("live-health-final", s == 200, f"HTTP {s}"))
     for name, ok, note in out:
@@ -658,6 +846,7 @@ def run_chaos_scenario(sc: dict, run_dir: Path, tier: dict, ws_url: str, keyfile
     try:
         raw_target = str(sc.get("target", "192.168.73.82"))
         target = raw_target if raw_target.startswith("192.") else f"192.168.73.{raw_target.lstrip('.')}"
+        check_target(target)                      # whitelist applies to chaos too (Codex r1)
         prompt = render_prompt(sc["prompt"], run_dir, target)
         out = run_dir / "scenarios" / sc["name"]
         if sc.get("via_config"):
@@ -668,7 +857,7 @@ def run_chaos_scenario(sc: dict, run_dir: Path, tier: dict, ws_url: str, keyfile
             base, key = f"http://127.0.0.1:{proxy.port}{direct['path']}", llm_api_key()
         summary = asyncio.run(ws_run(
             ws_url, keyfile, target, prompt, out,
-            int(sc.get("max_seconds", 420)), float(sc.get("cost_cap", tier["cost_cap"])),
+            int(sc.get("max_seconds", 420)), cost_cap_of(sc, tier),
             base_url=base, api_key=key, trust_status=sc.get("trust_status", True), home=home,
             approve_delay=float(sc.get("approve_delay", 0))))
         summary["chaos"] = {"mode": sc["mode"], "n": sc["n"], "refusals": proxy.refusals()}
@@ -769,12 +958,22 @@ def cmd_run(args) -> None:
                 import surgery
                 surgery.stop_instance(spawn)
             if surg:
-                surg.exit()                            # restore + diff/health verify
+                report = surg.exit()                       # restore + diff/health verify
+                restored = bool(report.get("restored") and report.get("diff_clean")
+                                and report.get("backup_deleted"))
+                surg_gate = ("surgery-restore", restored,
+                             f"restored={report.get('restored')} diff_clean={report.get('diff_clean')} "
+                             f"backup_deleted={report.get('backup_deleted')} "
+                             f"live_health={report.get('live_health')}")
+            else:
+                surg_gate = None
             try:
                 cleanup = cleanup_run(run_dir, ctx["containers"], before_8899=ver.get("_pids"),
-                                      sids=ctx["sids"])
+                                      sids=ctx["sids"], keyfile=keyfile)
             except Exception as e:  # noqa: BLE001
                 cleanup = [("cleanup-crashed", False, str(e))]
+            if surg_gate:
+                cleanup.append(surg_gate)
             (run_dir / "cleanup.json").write_text(json.dumps(cleanup))
         import analyze
         analyze.render(run_dir, tier_name, ver, cleanup)
@@ -796,6 +995,7 @@ def main() -> None:
     r.add_argument("--keyfile")
     a = sub.add_parser("analyze", help="re-render analysis+report for an existing run dir")
     a.add_argument("run_dir")
+    s = sub.add_parser("selftest", help="offline regression suite (no LLM cost, no live deps)")
     args = ap.parse_args()
     if args.cmd == "verify":
         verify(None, strict=not args.force)
@@ -805,6 +1005,10 @@ def main() -> None:
         import analyze
         analyze.render(Path(args.run_dir).resolve(), "re-analyze",
                        {"git": git_info()}, [])
+    elif args.cmd == "selftest":
+        p = subprocess.run([str(REPO_ROOT / ".venv/bin/python"), "-m", "pytest",
+                            str(E2E_ROOT / "test_suite.py"), "-q"])
+        sys.exit(p.returncode)
 
 
 if __name__ == "__main__":

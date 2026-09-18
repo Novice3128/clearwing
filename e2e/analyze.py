@@ -115,6 +115,9 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
     add("complete-while-approval-open", inv.get("no_complete_while_approval_open", True),
         f"count={summary.get('complete_while_approval_open')} (D1/#29 detector: terminal "
         f"complete arriving while an approved tool has not executed)")
+    add("approval-pending-end", (summary.get("pending_approvals_at_end") or 0) == 0,
+        f"pending={summary.get('pending_approvals_at_end')} (queued decisions never flushed — "
+        "stranded approval window)")
     add("dup-pairs", fm["dup_pairs"] <= SUITE["thresholds"]["hard"]["dup_pairs_max"],
         f"dup_pairs={fm['dup_pairs']}")
     add("late-frames", fm["late_frames"] <= SUITE["thresholds"]["hard"]["late_frames_max"],
@@ -125,16 +128,24 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
         add("cache-nonzero", cache_pct > 1, f"cache={cache_pct:.1f}%")
         add("cache-min", cache_pct >= SUITE["thresholds"]["ratio"]["cache_min_pct"],
             f"cache={cache_pct:.1f}%")
-    if audit and summary.get("cost_updates"):
-        meter = summary.get("cost_usd_product") or 0
-        real = audit["real_cost_cache_aware"]
-        diff_pct = abs(meter - real) / max(real, 1e-9) * 100
-        add("reconcile", diff_pct <= SUITE["thresholds"]["ratio"]["reconcile_max_pct"],
-            f"meter=${meter} vs audit-recompute=${real} ({diff_pct:.2f}%)")
-        missing = summary["cost_updates"] - audit["llm_calls"]
-        add("audit-completeness", missing <= 0,
-            f"cost_updates={summary['cost_updates']} vs audit_calls={audit['llm_calls']}"
-            + (f" — MISSING {missing} llm_call(s) from audit" if missing > 0 else ""))
+    if summary.get("cost_updates"):
+        if audit is None:
+            # Metered LLM spend with NO audit trail used to skip both the
+            # reconcile and completeness gates entirely — a total loss of
+            # audit instrumentation still produced PASS (Codex r1).
+            add("audit-present", False,
+                f"cost_updates={summary['cost_updates']} but audit.jsonl missing — "
+                "reconciliation impossible (hard criterion of this suite)")
+        else:
+            meter = summary.get("cost_usd_product") or 0
+            real = audit["real_cost_cache_aware"]
+            diff_pct = abs(meter - real) / max(real, 1e-9) * 100
+            add("reconcile", diff_pct <= SUITE["thresholds"]["ratio"]["reconcile_max_pct"],
+                f"meter=${meter} vs audit-recompute=${real} ({diff_pct:.2f}%)")
+            missing = summary["cost_updates"] - audit["llm_calls"]
+            add("audit-completeness", missing <= 0,
+                f"cost_updates={summary['cost_updates']} vs audit_calls={audit['llm_calls']}"
+                + (f" — MISSING {missing} llm_call(s) from audit" if missing > 0 else ""))
 
     if flag_baseline is not None and tier_name == "full":
         faces = summary.get("flag_faces")
@@ -166,6 +177,22 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
             elif k == "errors":
                 add("expect-errors", (summary.get("error_count") or 0) == int(v),
                     f"errors={summary.get('error_count')} want={v}")
+            elif k == "chaos_hits":
+                # Injected-fault count: the proxy must actually have been in
+                # the path — a provider bypassing the proxy (or failing
+                # before touching it) otherwise passes (Codex r1).
+                want = int(str(v).lstrip(">="))
+                hits = (summary.get("chaos") or {}).get("refusals")
+                add("expect-chaos-hits", hits is not None and hits >= want,
+                    f"proxy_faulted={hits} want>={want}")
+            elif k == "graceful":
+                # watchdog-lowcap: after the driver's cost-cap stop, the run
+                # must end complete_or_stopped — never a hard drop. The YAML
+                # value gates ENFORCEMENT (graceful: false -> no gate).
+                if v:
+                    got = summary.get("complete_statuses") or []
+                    add("expect-graceful", bool(got) and got[-1] in ("ok", "stopped"),
+                        f"last={got[-1] if got else None} want=ok|stopped")
     return g
 
 
@@ -256,6 +283,14 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
                                     f"{h.get('report_cost')}/{h.get('report_tokens')}"})
         if hud_row and not h.get("pass"):
             hud_row["gates"].append({"gate": "hud-render", "pass": False, "detail": str(h)[:100]})
+    # Cleanup assertions are gates, not decoration: surviving key-bearing
+    # artifacts, suite containers, occupied ports, a changed 8899 process, or
+    # a dead final health check used to render as WARN while the verdict
+    # still said PASS (Codex r1).
+    for name, ok, note in cleanup:
+        if not ok:
+            all_gates.append({"gate": f"cleanup-{name}", "pass": False,
+                              "severity": "hard", "detail": str(note)[:100]})
     all_gates.extend(trend_gate(ledger, previous_full(run_dir)))
     # frame-type census: NEW frame types from product features become VISIBLE here
     census: dict[str, int] = {}
@@ -269,7 +304,11 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         indent=1))
 
     hard_fail = [g for g in all_gates if not g["pass"] and g["severity"] == "hard"]
-    overall = "FAIL" if hard_fail else "PASS"
+    trend_fail = [g for g in all_gates if not g["pass"] and g["severity"] == "trend"]
+    # SPEC §4 three-verdict scale: failed trend gates must surface as
+    # REGRESSION — a ±30%-band breach rendered as clean PASS lost the
+    # outcome class entirely (Codex r1).
+    overall = "FAIL" if hard_fail else ("REGRESSION" if trend_fail else "PASS")
     partial = "-partial" in run_dir.name
     try:
         suite_sha = json.loads((run_dir / "state/pre-state.json").read_text()).get("suite_sha256", "?")

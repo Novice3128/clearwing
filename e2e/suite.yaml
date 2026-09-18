@@ -34,6 +34,8 @@ thresholds:
   trend:
     duration_band_pct: 30
     cost_band_pct: 30
+  late_drain_s: 5                 # post-terminal drain window (late-frames gate)
+  default_cost_cap: 5.0           # fallback when neither scenario nor tier sets one
 
 pricing_glm53: {input: 1.40, cached_input: 0.14, output: 4.40}   # USD / 1M
 
@@ -63,10 +65,11 @@ tiers:
       - {name: warm-hud, type: hud, prompt: warm.txt, target: "192.168.73.82", cost_cap: 0.5}
       - {name: report-cli, type: report_cli}
       - {name: chaos-refuse1, type: chaos, mode: refuse, n: 1, prompt: chaos-task.txt,
-         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0,
+         expect: {complete_status: ok, chaos_hits: ">=1"}}   # injected fault + successful recovery
       - {name: pathless-404-probe, type: chaos, mode: refuse, n: 1, prompt: chaos-task.txt,
          target: "192.168.73.82", max_seconds: 60, cost_cap: 0.5, base_url_pathless: true,
-         expect: {complete_status: error}}
+         expect: {complete_status: error}}                    # deliberate 404 — no recovery expected
       - {name: pytest-subset, type: pytest}
 
   full:
@@ -82,11 +85,19 @@ tiers:
          cost_cap: 5.0, trust_status: true}
       - {name: t3-warm-chain, type: ws, prompt: warm.txt, target: "192.168.73.82", max_seconds: 240,
          cost_cap: 0.5, repeat: 3}
-      - {name: chaos-refuse1, type: chaos, mode: refuse, n: 1, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
-      - {name: chaos-refuse3, type: chaos, mode: refuse, n: 3, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
-      - {name: chaos-reset2, type: chaos, mode: reset, n: 2, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
-      - {name: chaos-stall75, type: chaos, mode: stall, n: 1, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
-      - {name: chaos-429, type: chaos, mode: ratelimit, n: 2, prompt: chaos-task.txt, target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0}
+      # Chaos matrix: every scenario must (a) actually route through the proxy
+      # (chaos_hits) and (b) RECOVER — terminal `error` alone used to pass
+      # terminal_closure (Codex r1).
+      - {name: chaos-refuse1, type: chaos, mode: refuse, n: 1, prompt: chaos-task.txt, target: "192.168.73.82",
+         max_seconds: 420, cost_cap: 1.0, expect: {complete_status: ok, chaos_hits: ">=1"}}
+      - {name: chaos-refuse3, type: chaos, mode: refuse, n: 3, prompt: chaos-task.txt, target: "192.168.73.82",
+         max_seconds: 420, cost_cap: 1.0, expect: {complete_status: ok, chaos_hits: ">=3"}}
+      - {name: chaos-reset2, type: chaos, mode: reset, n: 2, prompt: chaos-task.txt, target: "192.168.73.82",
+         max_seconds: 420, cost_cap: 1.0, expect: {complete_status: ok, chaos_hits: ">=2"}}
+      - {name: chaos-stall75, type: chaos, mode: stall, n: 1, prompt: chaos-task.txt, target: "192.168.73.82",
+         max_seconds: 420, cost_cap: 1.0, expect: {complete_status: ok, chaos_hits: ">=1"}}
+      - {name: chaos-429, type: chaos, mode: ratelimit, n: 2, prompt: chaos-task.txt, target: "192.168.73.82",
+         max_seconds: 420, cost_cap: 1.0, expect: {complete_status: ok, chaos_hits: ">=2"}}
       - {name: deny-path, type: ws, prompt: quick-fc.txt, target: "192.168.73.82", max_seconds: 300,
          cost_cap: 1.0, deny_first_approval: true, trust_status: true}
       - {name: probe-partial-fill, type: probe_partial_fill}
@@ -99,16 +110,25 @@ tiers:
     cost_cap: 25.0
     instance: self                # suite-spawned 8898, isolated CLEARWING_HOME
     scenarios:
-      - {name: smoke, type: ws, prompt: warm.txt, target: "192.168.73.82", max_seconds: 240, cost_cap: 0.5}
+      # ORDER MATTERS: the cold measurement must run BEFORE anything warms
+      # the home — the old smoke-first order created memory/audit/provider
+      # state, so "cold"-fulldepth measured an already-warmed environment
+      # (Codex r1). Instance sanity is covered by the spawn health gate.
       - {name: cold-fulldepth, type: ws, prompt: fulldepth-81.txt, target: "192.168.73.81", max_seconds: 5400,
          cost_cap: 15.0, trust_status: true, memory: cold}
+      - {name: smoke, type: ws, prompt: warm.txt, target: "192.168.73.82", max_seconds: 240,
+         cost_cap: 0.5, memory: warm}   # post-measurement sanity: instance healthy after the big run
 
   deep-fallback:
     requires_approval: true       # --approve-fallback
+    cost_cap: 2.0                 # tier-level cap so scenario/tier lookups never KeyError
     scenarios:
       - {name: failover-refuse-all, type: chaos, mode: refuse, n: 999999, prompt: chaos-task.txt,
-         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0, via_config: true}
+         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0, via_config: true,
+         expect: {complete_status: ok, chaos_hits: ">=1"}}    # primary never healthy — fallback carries it
       - {name: failover-return, type: chaos, mode: refuse, n: 2, prompt: chaos-task.txt,
-         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0, via_config: true}
+         target: "192.168.73.82", max_seconds: 420, cost_cap: 1.0, via_config: true,
+         expect: {complete_status: ok, chaos_hits: ">=2"}}
       - {name: failover-slowfail, type: chaos, mode: stall, n: 999999, prompt: chaos-task.txt,
-         target: "192.168.73.82", max_seconds: 600, cost_cap: 1.0, via_config: true}
+         target: "192.168.73.82", max_seconds: 600, cost_cap: 1.0, via_config: true,
+         expect: {complete_status: ok, chaos_hits: ">=1"}}    # slow-fail primary × #57

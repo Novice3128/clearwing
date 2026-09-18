@@ -19,8 +19,8 @@ Design constraints baked from the 2026-09-17/18 reviews (SPEC §2.5–2.6):
 from __future__ import annotations
 
 import atexit
+import json
 import os
-import re
 import secrets
 import signal
 import subprocess
@@ -49,6 +49,17 @@ def http_status(url: str, timeout: float = 3.0) -> int:
         return e.code
     except Exception:  # noqa: BLE001
         return -1
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass                            # best-effort: not all filesystems allow it
 
 
 # ------------------------------------------------------- self instance ----
@@ -113,6 +124,12 @@ def stop_instance(meta: dict) -> None:
         meta["_logf"].close()
     except Exception:
         pass
+    try:
+        # ephemeral instance key must not survive the run as a key-bearing
+        # artifact (review r2)
+        Path(meta["keyfile"]).unlink(missing_ok=True)
+    except (OSError, KeyError):
+        pass
 
 
 def assert_cold_home(home: Path) -> dict:
@@ -127,6 +144,66 @@ def assert_cold_home(home: Path) -> dict:
 
 
 # ------------------------------------------------------ config surgery ----
+
+def build_surgical_config(original: str, proxy_base: str) -> tuple[str, str]:
+    """Pure config rewrite: returns (new_yaml_text, chaos_primary_url).
+
+    Structural injection — mutate the parsed provider mapping and dump, so
+    `fallbacks` lands UNDER provider no matter what keys follow it. The old
+    text-append glued indented `fallbacks:` lines onto whatever top-level
+    block was last; with any mapping after `provider` the fallback became
+    its child (or invalid YAML) and was never read by resolve_fallback_
+    endpoints (Codex r1). Comments are dropped in the surgical state —
+    acceptable: exit() restores the original bytes.
+    """
+    cfg = _yaml.safe_load(original)
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("provider"), dict):
+        raise RuntimeError("live config has no provider mapping — refusing surgery")
+    prov = cfg["provider"]
+    direct, api_key, model = prov.get("base_url"), prov.get("api_key"), prov.get("model")
+    if not (isinstance(direct, str) and direct and api_key and model):
+        raise RuntimeError("provider mapping lacks base_url/api_key/model — refusing surgery")
+    from urllib.parse import urlsplit
+    _u = urlsplit(direct)
+    if _u.scheme == "http" and _u.hostname in ("127.0.0.1", "localhost", "::1"):
+        raise RuntimeError("live config already points at a local proxy — refusing")
+    chaos_primary = f"{proxy_base}{urlsplit(direct).path.rstrip('/')}"
+    prov["base_url"] = chaos_primary
+    prov["fallbacks"] = [{
+        "adapter": "openai",
+        "base_url": direct,
+        "model": model,
+        "api_key": api_key,
+    }]
+    return _yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True, width=4096), chaos_primary
+
+
+def _sessions_running_8899() -> bool:
+    """True when any 8899 session is running/paused; False when the list is
+    verifiably clean. /api/sessions returns objects with status strings —
+    there is no boolean `true` to string-match (Codex r1). Any non-200
+    (incl. 503 store-unavailable) REFUSES: right before editing the real
+    config, "cannot verify" must not degrade into "proceed"."""
+    code = http_status("http://127.0.0.1:8899/api/sessions")
+    if code != 200:
+        raise RuntimeError(f"/api/sessions answered HTTP {code} — surgery refused "
+                           "(cannot verify no running sessions)")
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8899/api/sessions", timeout=5) as r:
+            body = r.read()
+        sessions = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError("/api/sessions returned non-JSON — surgery refused "
+                           "(cannot verify no running sessions)")
+    except OSError as e:
+        raise RuntimeError(f"/api/sessions unreadable ({type(e).__name__}) — surgery refused")
+    if not isinstance(sessions, list):
+        raise RuntimeError("/api/sessions returned non-list — surgery refused")
+    # `paused` = parked awaiting an approval decision — still an active
+    # mid-turn session that surgery would strand
+    return any(isinstance(s, dict) and s.get("status") in ("running", "paused")
+               for s in sessions)
+
 
 class ConfigSurgery:
     """Guarded edit of the REAL ~/.clearwing/config.yaml (fallback tier).
@@ -158,6 +235,7 @@ class ConfigSurgery:
         if not self._armed or self._original is None:
             return
         self._write_atomic(self._original)
+        LIVE_CFG.with_name("config.yaml.cwe2e-tmp").unlink(missing_ok=True)
         self._armed = False
         if self.backup is not None:
             self.backup.unlink(missing_ok=True)
@@ -171,39 +249,35 @@ class ConfigSurgery:
         _log("config RESTORED (atomic write, backup deleted, traps disarmed)")
 
     def enter(self) -> "ConfigSurgery":
-        residue = sorted(Path.home().glob(".clearwing/config.yaml.bak-*"))
+        residue = sorted(str(p) for p in Path.home().glob(".clearwing/config.yaml.bak-*")) + \
+            ([str(LIVE_CFG.with_name("config.yaml.cwe2e-tmp"))]
+             if LIVE_CFG.with_name("config.yaml.cwe2e-tmp").exists() else [])
         if residue:
-            raise RuntimeError(f"stale config backups present (contain secrets): {residue} — "
-                               "verify live config integrity, then delete them before surgery")
+            raise RuntimeError(f"stale config surgery residue present (contains secrets): "
+                               f"{residue} — verify live config integrity, then delete before surgery")
+        if LIVE_CFG.is_symlink():
+            raise RuntimeError("live config is a symlink — atomic replace would destroy it "
+                               "(dotfile-managed deployment); surgery refused")
         original = LIVE_CFG.read_text()
-        direct = re.search(r"base_url:\s*(\S+)", original).group(1)
-        if direct.startswith("http://127.0.0.1"):
-            raise RuntimeError("live config already points at a local proxy — refusing")
-        api_key = re.search(r"api_key:\s*(\S+)", original).group(1)
-        model = re.search(r"model:\s*(\S+)", original).group(1)
-        self.original_url = direct          # pre-surgery snapshot for chaos proxy
-        from urllib.parse import urlsplit
-        path = urlsplit(direct).path.rstrip("/")
-        chaos_primary = f"{self.proxy_base}{path}"
         # pre-flight: member 8899 must have no running sessions (we never
         # restart it, but the risk window disclosure demands a clean field)
-        s_code = http_status("http://127.0.0.1:8899/api/sessions")
-        if s_code == 200:
-            import urllib.request as _u
-            try:
-                body = _u.urlopen("http://127.0.0.1:8899/api/sessions", timeout=5).read().decode("utf-8", "replace")
-                if '"running"' in body and "true" in body.lower():
-                    raise RuntimeError("member 8899 has running sessions — surgery refused")
-            except RuntimeError:
-                raise
-            except Exception:
-                pass                            # cannot read: proceed with disclosure in log
+        running = _sessions_running_8899()
+        if running:
+            raise RuntimeError("member 8899 has running sessions — surgery refused")
+        new_text, chaos_primary = build_surgical_config(original, self.proxy_base)
+        # direct endpoint snapshot for the chaos proxy, taken pre-surgery
+        self.original_url = _yaml.safe_load(original)["provider"]["base_url"]
         self._original = original
         self.backup = LIVE_CFG.with_name(
             f"config.yaml.bak-cwe2e-{time.strftime('%Y%m%d-%H%M%S')}")
         bfd = os.open(self.backup, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(bfd, "w") as fh:
             fh.write(original)
+            fh.flush()
+            os.fsync(fh.fileno())          # the backup is the only recovery
+                                           # asset after SIGKILL — it must be
+                                           # durable BEFORE the swap happens
+        _fsync_dir(LIVE_CFG.parent)
         self._armed = True                     # armed BEFORE the swap: any crash from here restores
         atexit.register(self._restore_now)
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -212,20 +286,28 @@ class ConfigSurgery:
                 self._trapped.append(sig)
             except (ValueError, OSError):
                 pass
-        out = []
-        for line in original.splitlines():
-            if line.strip().startswith("base_url:"):
-                line = line.replace(direct, chaos_primary)
-            out.append(line)
-        out += [
-            "  fallbacks:",
-            "    - adapter: openai",
-            f"      base_url: {direct}",
-            f"      model: {model}",
-            f"      api_key: {api_key}",
-        ]
-        self._write_atomic("\n".join(out) + "\n")
-        _log(f"config surgery ACTIVE: primary->{chaos_primary}, fallback->direct, backup={self.backup.name}")
+        self._write_atomic(new_text)
+        # post-write structural self-verify before declaring surgery active
+        reread = _yaml.safe_load(LIVE_CFG.read_text())
+        reread_prov = (reread or {}).get("provider") or {}
+        ok_shape = (reread_prov.get("base_url") == chaos_primary
+                    and isinstance(reread_prov.get("fallbacks"), list)
+                    and reread_prov["fallbacks"]
+                    and reread_prov["fallbacks"][0].get("base_url") == self.original_url)
+        if not ok_shape:
+            self._restore_now()
+            fb = reread_prov.get("fallbacks")
+            fb_shape = (f"list[{len(fb)}] first-keys="
+                        f"{sorted(fb[0].keys()) if isinstance(fb[0], dict) else type(fb[0]).__name__}"
+                        if isinstance(fb, list) and fb else type(fb).__name__)
+            # NEVER include fallback values here — they contain the live
+            # api_key and this message lands in crash output (review r2 P1)
+            raise RuntimeError("post-write self-verify failed: fallbacks not under provider — "
+                               f"restored original (shape={fb_shape}, "
+                               f"provider_keys={sorted(reread_prov.keys())})")
+        _log(f"config surgery ACTIVE: primary->{chaos_primary}, fallback->direct, "
+             f"backup={self.backup.name} — config is FROZEN for the duration; "
+             f"member edits inside the window are reverted on restore")
         return self
 
     def exit(self) -> dict:
