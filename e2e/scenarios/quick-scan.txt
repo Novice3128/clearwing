@@ -1,0 +1,1 @@
+請用 scan_ports 對 {{TARGET}} 掃描前 20 個常用埠（scan_type 用 connect），然後用 save_report 把結果存成 JSON 到 {{RUN_DIR}}/scenarios/scan-report.json，完成後簡短回報開放埠清單。不需要使用 Kali 容器。

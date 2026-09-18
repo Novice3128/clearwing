@@ -1,0 +1,1 @@
+請用 Kali 容器對 {{TARGET}} 執行 nmap -Pn -sT -p 80,3000 {{TARGET}}（此指令需要審批，請直接發起），取得結果後用 save_report 存 JSON 到 {{RUN_DIR}}/scenarios/fc-report.json，然後結束。
