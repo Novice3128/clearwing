@@ -130,16 +130,24 @@ class ContextSummarizer:
         """(Re)generate the running summary over the oldest 70% of *messages*.
 
         Returns ``{"text": str, "covered_count": int, "view": list,
-        "usage": dict | None}``. ``view`` is *messages* with the covered
-        segment removed — the caller replaces its history with it, which is
-        what keeps the threshold from re-firing (and re-billing a summary
-        LLM call) on every step. ``covered_count`` is the cumulative number
-        of summarized messages across epochs. ``usage`` carries the summary
-        call's token counts (input/output/cached) when the provider
-        reported them, so callers can book the summarizer's spend; None on
-        every path that skipped the LLM. When the old segment holds nothing
-        newly coverable the prior state is returned unchanged and the LLM
-        is NOT called (coverage unchanged -> reuse; issue #38).
+        "usage": dict | None, "served_model": str | None}``. The four
+        #38-contract keys keep their meaning: ``view`` is *messages* with
+        the covered segment removed — the caller replaces its history with
+        it, which is what keeps the threshold from re-firing (and
+        re-billing a summary LLM call) on every step. ``covered_count`` is
+        the cumulative number of summarized messages across epochs.
+        ``usage`` carries the summary call's token counts
+        (input/output/cached) when the provider reported them, so callers
+        can book the summarizer's spend; None on every path that skipped
+        the LLM. ``served_model`` (additive, Codex PR-63 r2) is the
+        provider's model echo from the summary response so callers audit
+        the call under the model that actually served it — None wherever
+        no LLM was called or the response carried no concrete string echo
+        (defensive getattr + isinstance: test doubles may not expose the
+        attribute, and mocks auto-create non-string junk). When the old
+        segment holds nothing newly coverable the prior state is returned
+        unchanged and the LLM is NOT called (coverage unchanged -> reuse;
+        issue #38).
 
         *prior* is the previous ``{"text", "covered_count"}`` state; its text
         is fed to the summarization prompt so knowledge accumulates across
@@ -152,6 +160,7 @@ class ContextSummarizer:
                 "covered_count": prior.get("covered_count", 0),
                 "view": messages,
                 "usage": None,
+                "served_model": None,
             }
 
         total = len(messages)
@@ -167,6 +176,7 @@ class ContextSummarizer:
                 "covered_count": prior.get("covered_count", 0),
                 "view": list(messages),
                 "usage": None,
+                "served_model": None,
             }
 
         prior_text = prior.get("text") or ""
@@ -216,6 +226,16 @@ class ContextSummarizer:
                 "cached_tokens": usage_cached if isinstance(usage_cached, int) else 0,
             }
 
+        # The provider's model echo for the summary call (Codex PR-63 r2):
+        # callers price under the configured member key but must AUDIT the
+        # model that actually served — same split as the main loop's
+        # effective_model. Defensive getattr + isinstance, matching the
+        # usage handling above: fake clients (unittest mocks auto-create
+        # attributes) and older builds yield None, never a junk object.
+        served_model = getattr(summary_response, "provider_model_name", None)
+        if not isinstance(served_model, str):
+            served_model = None
+
         if not summary_text.strip():
             # Empty/whitespace summary: committing it would REPLACE the
             # covered messages with nothing — silently destroying history
@@ -227,6 +247,7 @@ class ContextSummarizer:
                 "covered_count": prior.get("covered_count", 0),
                 "view": list(messages),
                 "usage": usage,
+                "served_model": served_model,
             }
 
         covered_ids = {id(m) for m in to_summarize}
@@ -245,4 +266,5 @@ class ContextSummarizer:
             "covered_count": covered_count,
             "view": view,
             "usage": usage,
+            "served_model": served_model,
         }

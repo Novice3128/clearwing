@@ -14,6 +14,7 @@ served_by_primary flag, and the stream delta suppression policy.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -518,6 +519,83 @@ class TestConsumerCallbackExceptions:
         assert id(backup) not in chain._cooldown_streak
         # The consumer saw the partial delta and the re-emission attempt.
         assert emitted == ["partial", "full answer"]
+
+
+class TestMidDispatchCooldownRevival:
+    """Codex PR-63 r2: a member SKIPPED at dispatch time whose cooldown
+    EXPIRES while the dispatched members are still retrying must be
+    re-dispatched at the tail instead of failing the call — the eligibility
+    snapshot at call start is stale by the time the chain would give up.
+
+    No ``clock`` fixture in this class: it monkeypatches the ``time``
+    module's monotonic globally, which also freezes the event loop's clock
+    (``asyncio.sleep`` would never advance) — and a frozen monotonic makes
+    the injected cooldown NEVER expire. Real (sub-second) time only."""
+
+    def _slow_failing_backup(self):
+        class _SlowFailingBackup(_Member):
+            # 0.35s in the member's own retry loop — past the primary's
+            # 0.2s remaining cooldown at dispatch time.
+            async def achat(self, **kwargs):
+                self.calls += 1
+                await asyncio.sleep(0.35)
+                raise RuntimeError("backup still down")
+
+        return _SlowFailingBackup("backup-model", response="unused")
+
+    def test_achat_revives_member_cooled_during_dispatch(self):
+        primary = _Member("primary-model", response="primary-answer")
+        backup = self._slow_failing_backup()
+        chain = FallbackChain(primary, [backup])
+        # Primary cooling at dispatch time (0.2s left) → skipped.
+        chain._cooldown_until[id(primary)] = time.monotonic() + 0.2
+
+        started = time.monotonic()
+        result = asyncio.run(chain.achat(messages=[]))
+
+        # (a) The call SUCCEEDS via the revived primary — no raise, even
+        # though the backup (the only dispatch-order member) failed.
+        assert result == "primary-answer"
+        # (b) The backup really was dispatched (and burned 0.35s).
+        assert backup.calls == 1
+        assert time.monotonic() - started >= 0.3
+        assert primary.calls == 1
+        assert chain.served_by_primary is True
+
+    def test_achat_stream_revives_member_cooled_during_dispatch(self):
+        primary = _Member("primary-model", response="primary-answer")
+        backup = self._slow_failing_backup()
+        chain = FallbackChain(primary, [backup])
+        chain._cooldown_until[id(primary)] = time.monotonic() + 0.2
+
+        emitted: list[str] = []
+        result = asyncio.run(chain.achat_stream(messages=[], on_text_delta=emitted.append))
+
+        assert result == "primary-answer"
+        assert backup.calls == 1
+        assert primary.calls == 1
+        # No member streamed deltas here, so the revived primary (a later
+        # index) was never wrongly suppressed.
+        assert emitted == []
+        assert chain.served_by_primary is True
+
+    def test_unexpired_cooldown_is_not_awaited(self):
+        # Reverse guard: a cooldown still well within its window must NOT
+        # be slept on — the chain raises promptly instead of blocking (or
+        # looping forever) waiting for the skipped member to recover.
+        primary = _Member("primary-model", response="primary-answer")
+        backup = _Member("backup-model", response="unused")
+        backup.exc = RuntimeError("backup down")
+        chain = FallbackChain(primary, [backup])
+        chain._cooldown_until[id(primary)] = time.monotonic() + 60.0
+
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="backup down"):
+            asyncio.run(chain.achat(messages=[]))
+
+        assert time.monotonic() - started < 5.0  # no cooldown waiting
+        assert backup.calls == 1
+        assert primary.calls == 0  # never dispatched while cooling
 
 
 class TestStreamPolicyUnchanged:

@@ -632,6 +632,13 @@ class NativeAgentGraph:
                             s_output,
                             tracker=self.cost_tracker,
                             model=summary_model,
+                            # The audit row keeps the model the provider
+                            # ECHOED on the summary response (Codex PR-63
+                            # r2): a FallbackChain's served_model_name is
+                            # the LAST-served member of the MAIN call, not
+                            # necessarily the summary's server — the
+                            # response-level echo is the per-call truth.
+                            audit_model=result.get("served_model") or summary_model,
                             cached_tokens=s_cached,
                             provider=getattr(self.llm, "served_provider_name", None)
                             or getattr(self.llm, "provider_name", None),

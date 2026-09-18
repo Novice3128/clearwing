@@ -517,6 +517,54 @@ class TestContextSummarizer:
         mock_llm.aask_text.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_summarize_returns_served_model_echo(self):
+        # Codex PR-63 r2: the provider's model echo rides on the result so
+        # callers (runtime, hunter) can AUDIT the summary call under the
+        # model that actually served it. Additive — the #38 four-key
+        # contract is untouched; no exact-key-set assertion on purpose.
+        messages = [HumanMessage(content=f"Msg {i}") for i in range(10)]
+
+        class _Usage:
+            prompt_tokens = 12
+            completion_tokens = 6
+            total_tokens = 18
+            prompt_tokens_details = None
+
+        mock_llm = AsyncMock()
+        mock_llm.aask_text.return_value = MagicMock(
+            first_text="summary", usage=_Usage(), provider_model_name="echoed-model-7"
+        )
+
+        result = await self.summarizer.summarize(messages, mock_llm)
+
+        assert result["served_model"] == "echoed-model-7"
+
+        # A response WITHOUT the echo attribute (test doubles, older
+        # builds) must yield None, never a MagicMock auto-attribute.
+        mock_llm.aask_text.return_value = MagicMock(first_text="summary")
+        result = await self.summarizer.summarize(messages, mock_llm)
+        assert result["served_model"] is None
+
+    @pytest.mark.asyncio
+    async def test_summarize_served_model_none_on_early_returns(self):
+        # Paths that never reach an LLM response carry the key as None.
+        mock_llm = AsyncMock()
+        empty = await self.summarizer.summarize([], mock_llm)
+        assert empty["served_model"] is None
+
+        from clearwing.llm import ToolMessage
+
+        tool_traffic = [
+            AIMessage(content="", tool_calls=[{"id": "c1", "name": "t", "args": {}}]),
+            ToolMessage(content="result", tool_call_id="c1"),
+        ] * 10
+        reused = await self.summarizer.summarize(
+            tool_traffic, mock_llm, prior={"text": "prior", "covered_count": 1}
+        )
+        assert reused["served_model"] is None
+        mock_llm.aask_text.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_empty_summary_does_not_compact_history(self):
         # An empty/whitespace summary must not replace the covered messages
         # with nothing: the prior state and the original view survive, and

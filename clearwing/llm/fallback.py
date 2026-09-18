@@ -351,6 +351,57 @@ class FallbackChain:
                 f"{getattr(first, 'model_name', '?')}"
             )
 
+    def _revived_members(
+        self,
+        skipped: Sequence[AsyncLLMClient],
+        attempted: set[int],
+    ) -> list[AsyncLLMClient]:
+        """Skipped members whose cooldown expired MID-DISPATCH (Codex PR-63 r2).
+
+        ``_dispatch_order`` snapshots eligibility at call start, but a
+        serving member's own retry loop can outlast a skipped member's
+        remaining window — by the time the chain would give up, that
+        member is healthy again and must be re-dispatched instead of
+        failing the call. Members already attempted THIS call are excluded
+        (their cooldown was just (re)started by their own failure, and
+        ``_cooldown_remaining`` would otherwise resurrect them forever on
+        a zero-length window). Fail-open tours pass an empty ``skipped``
+        list, so revival is naturally a no-op there.
+        """
+        return [
+            member
+            for member in skipped
+            if id(member) not in attempted and self._cooldown_remaining(member) <= 0.0
+        ]
+
+    def _announce_failover(
+        self,
+        failed: AsyncLLMClient,
+        nxt: AsyncLLMClient,
+        exc: Exception,
+        *,
+        deltas_emitted: bool,
+    ) -> None:
+        """Notice + log for a member failure that moves the chain onward."""
+        notice = (
+            f"llm provider {getattr(failed, 'provider_name', '?')}/"
+            f"{getattr(failed, 'model_name', '?')} failed "
+            f"({type(exc).__name__}); falling back to "
+            f"{getattr(nxt, 'provider_name', '?')}/"
+            f"{getattr(nxt, 'model_name', '?')}"
+        )
+        if deltas_emitted:
+            notice += " — partial output above is abandoned; the full answer follows"
+        self._notify(notice)
+        logger.warning(
+            "LLM provider %s/%s failed (%s); falling back to %s/%s",
+            getattr(failed, "provider_name", "?"),
+            getattr(failed, "model_name", "?"),
+            self._brief(exc),
+            getattr(nxt, "provider_name", "?"),
+            getattr(nxt, "model_name", "?"),
+        )
+
     @property
     def spend_ledger(self):
         """The primary client's run-scoped ledger, if one is bound."""
@@ -405,7 +456,11 @@ class FallbackChain:
         if original_callback is not None:
             kwargs["on_text_delta"] = _counting_callback
 
+        # Attempted member ids (Codex PR-63 r2): the tail-of-loop revival
+        # check must never re-dispatch a member this call already tried.
+        attempted: set[int] = set()
         for index, client in enumerate(clients):
+            attempted.add(id(client))
             suppressed_this_member = index > 0 and deltas_emitted
             if suppressed_this_member:
                 # Abandoned partial output already reached the consumer —
@@ -439,24 +494,21 @@ class FallbackChain:
                 # streak does not grow per call.
                 self._start_cooldown(client, exc, extend_only=fail_open)
                 if index + 1 >= len(clients):
+                    # Codex PR-63 r2: a member SKIPPED at dispatch time may
+                    # have cooled back to eligibility while the members
+                    # above burned their retry budgets — re-check before
+                    # giving up. CPython list iterators see ``extend``ed
+                    # elements and the length guard above re-evaluates each
+                    # round, so revived members become tail members (their
+                    # later index keeps the delta-suppression semantics
+                    # below correct: revived members ARE later members).
+                    revived = self._revived_members(skipped, attempted)
+                    if revived:
+                        clients.extend(revived)
+                        continue
                     raise
-                notice = (
-                    f"llm provider {getattr(client, 'provider_name', '?')}/"
-                    f"{getattr(client, 'model_name', '?')} failed "
-                    f"({type(exc).__name__}); falling back to "
-                    f"{getattr(clients[index + 1], 'provider_name', '?')}/"
-                    f"{getattr(clients[index + 1], 'model_name', '?')}"
-                )
-                if deltas_emitted:
-                    notice += " — partial output above is abandoned; the full answer follows"
-                self._notify(notice)
-                logger.warning(
-                    "LLM provider %s/%s failed (%s); falling back to %s/%s",
-                    getattr(client, "provider_name", "?"),
-                    getattr(client, "model_name", "?"),
-                    self._brief(exc),
-                    getattr(clients[index + 1], "provider_name", "?"),
-                    getattr(clients[index + 1], "model_name", "?"),
+                self._announce_failover(
+                    client, clients[index + 1], exc, deltas_emitted=deltas_emitted
                 )
                 continue
             # Success path — OUTSIDE the provider-failure handler (Codex
@@ -486,7 +538,11 @@ class FallbackChain:
         if skipped:
             self._notify_skips(skipped, clients[0], remaining)
         last_exc: Exception | None = None
+        # Attempted member ids (Codex PR-63 r2): the tail-of-loop revival
+        # check must never re-dispatch a member this call already tried.
+        attempted: set[int] = set()
         for index, client in enumerate(clients):
+            attempted.add(id(client))
             try:
                 response = await client.achat(**kwargs)
                 self._record_served(client)
@@ -498,6 +554,16 @@ class FallbackChain:
                 # tours extend the window without growing the streak.
                 self._start_cooldown(client, exc, extend_only=fail_open)
                 if index + 1 >= len(clients):
+                    # Codex PR-63 r2, same as achat_stream: a skipped
+                    # member's cooldown may have EXPIRED while the
+                    # dispatched members were retrying — revive it (append
+                    # to the iteration list) instead of raising; the for
+                    # loop picks up extended members and the length guard
+                    # re-evaluates each round.
+                    revived = self._revived_members(skipped, attempted)
+                    if revived:
+                        clients.extend(revived)
+                        continue
                     raise
                 self._notify(
                     f"llm provider {getattr(client, 'provider_name', '?')}/"

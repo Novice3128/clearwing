@@ -26,6 +26,7 @@ from genai_pyo3 import ChatResponse, Usage
 from clearwing.agent.operator import OperatorAgent, OperatorConfig
 from clearwing.agent.runtime import NativeAgentGraph
 from clearwing.agent.tools.hunt import HunterContext
+from clearwing.data.memory.summarizer import ContextSummarizer
 from clearwing.observability.bookkeeping import (
     book_llm_call,
     init_session_audit_logger,
@@ -272,6 +273,71 @@ class TestRuntimeSummarizerAndMainStep:
             CostTracker().session_total(sid)
         )
 
+    @pytest.mark.asyncio
+    async def test_summarizer_audit_model_keeps_provider_echo(self, monkeypatch, tmp_path):
+        """Codex PR-63 r2: the summarizer's audit row must record the model
+        the PROVIDER echoed on the SUMMARY response (``served_model`` from
+        ``ContextSummarizer.summarize``), while pricing stays on the
+        configured member key — the audit_model split the main loop already
+        had, which the summary path used to miss entirely (the row carried
+        the pricing key, hiding which model actually served the summary)."""
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        sid = f"rt-{uuid.uuid4().hex[:8]}"
+
+        class _EchoingSummaryLLM(_SummarizerAwareLLM):
+            model_name = "claude-sonnet-4-6"  # the configured pricing key
+
+            async def aask_text(self, **kwargs):
+                return _FakeResponse(
+                    "summary text",
+                    usage=_FakeUsage(430, 722, 1152),
+                    provider_model_name="claude-opus-4-7-20260901",
+                )
+
+        graph = NativeAgentGraph(
+            llm=_EchoingSummaryLLM(),
+            native_tools=[],
+            tools=[],
+            system_prompt_fn=lambda s: "sys",
+            model_name="m",
+            session_id=sid,
+            state_updater_fn=lambda *a, **k: {},
+            knowledge_graph_populator_fn=None,
+            input_guardrail_tool_names=frozenset(),
+            output_guardrail_tool_names=frozenset(),
+            enable_cost_tracker=True,
+            enable_episodic_memory=False,
+            enable_audit=True,
+            enable_knowledge_graph=False,
+            enable_input_guardrail=False,
+            enable_output_guardrail=False,
+            enable_event_bus=False,
+            enable_context_summarizer=True,
+            agent_limits=None,
+        )
+
+        big = "x" * 2000
+        history = [{"role": "user", "content": f"note {i} {big}"} for i in range(10)]
+        cfg = {"configurable": {"thread_id": "ws-audit-echo"}}
+        async for _ in graph.astream({"messages": history}, cfg):
+            pass
+
+        rows = _llm_cost_rows(_audit_rows(audit_home, sid))
+        summarizer_row = next(r for r in rows if r["agent"] == "summarizer")
+        # The audit row shows the provider's echo, not the configured key.
+        assert summarizer_row["details"]["model"] == "claude-opus-4-7-20260901"
+        # Pricing stayed on the configured member key — the two tiers
+        # differ, so the cost pins WHICH key priced the call.
+        configured = CostTracker.estimate_cost(430, 722, "claude-sonnet-4-6")
+        echoed = CostTracker.estimate_cost(430, 722, "claude-opus-4-7-20260901")
+        assert configured != echoed  # guard: the split must be observable
+        assert summarizer_row["details"]["cost_usd"] == pytest.approx(configured)
+        # Reconciliation survives the split: audit sum == tracker total.
+        assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
+            CostTracker().session_total(sid)
+        )
+
 
 class TestOperatorSupervisorAudit:
     def test_supervisor_call_is_audited_and_reconciled(self, monkeypatch, tmp_path):
@@ -395,6 +461,83 @@ class TestHunterAudit:
         # Reconciliation against the SAME id the cost records used.
         assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
             CostTracker().session_total(book_id)
+        )
+
+    def test_hunter_summarizer_row_keeps_provider_echo(self, monkeypatch, tmp_path):
+        """Codex PR-63 r2: the hunter's CONTEXT-SUMMARIZER book call must
+        carry audit_model too — the provider echo from the summary response
+        (``served_model``), with pricing on the configured member key. The
+        main-call split existed (r1); the summary path wrote only the
+        pricing key into the audit row."""
+
+        class _HunterSummaryLLM:
+            model_name = "hunter-model"  # the configured pricing key
+            provider_name = "stub"
+
+            async def achat(self, **kwargs):
+                return ChatResponse(
+                    content=[{"text": "No findings."}],
+                    usage=Usage(prompt_tokens=300, completion_tokens=120, total_tokens=420),
+                    provider_model_name="hunter-served",
+                )
+
+            async def aask_text(self, **kwargs):
+                return ChatResponse(
+                    content=[{"text": "compacted summary"}],
+                    usage=Usage(prompt_tokens=430, completion_tokens=722, total_tokens=1152),
+                    provider_model_name="hunter-summary-served",
+                )
+
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        sid = f"sh-{uuid.uuid4().hex[:8]}"
+
+        ctx = HunterContext(
+            repo_path=str(_FIXTURE_C),
+            findings=[],
+            file_path="src/codec_a.c",
+            session_id=sid,
+            specialist="general",
+        )
+        hunter = NativeHunter(
+            llm=_HunterSummaryLLM(),
+            prompt="system prompt",
+            tools=[],
+            ctx=ctx,
+            max_steps=1,
+            summarizer=ContextSummarizer(),
+            # ~125k estimated tokens > 80% of the summarizer's default
+            # 150k window, with a coverable old segment — trips the
+            # summary path on the hunt's first model step.
+            initial_user_message="x " * 250_000,
+        )
+
+        result = asyncio.run(hunter.arun())
+        assert result.findings == []
+
+        session_dirs = _audit_session_dirs(audit_home, sid)
+        assert len(session_dirs) == 1
+        rows = _llm_cost_rows(_audit_rows(audit_home, session_dirs[0]))
+        agents = [r["agent"] for r in rows]
+        assert "summarizer" in agents
+        assert "hunter" in agents
+
+        summarizer_row = next(r for r in rows if r["agent"] == "summarizer")
+        # The audit row records the model that served the SUMMARY call,
+        # while pricing stayed on the configured member key.
+        assert summarizer_row["details"]["model"] == "hunter-summary-served"
+        assert summarizer_row["details"]["input_tokens"] == 430
+        assert summarizer_row["details"]["output_tokens"] == 722
+        assert summarizer_row["details"]["cost_usd"] == pytest.approx(
+            CostTracker.estimate_cost(430, 722, "hunter-model")
+        )
+        # The main call keeps its own (r1) echo split.
+        hunter_row = next(r for r in rows if r["agent"] == "hunter")
+        assert hunter_row["details"]["model"] == "hunter-served"
+        # Reconciliation against the SAME suffixed execution id.
+        assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
+            CostTracker().session_total(session_dirs[0])
         )
 
 

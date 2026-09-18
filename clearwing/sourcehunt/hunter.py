@@ -1810,6 +1810,11 @@ class NativeHunter:
                             s_out,
                             tracker=CostTracker(),
                             model=self.llm.model_name,
+                            # Audit prefers the provider's model ECHO on the
+                            # summary response (Codex PR-63 r2) — the same
+                            # pricing/audit split as the main call below,
+                            # which the summary path used to miss entirely.
+                            audit_model=result.get("served_model") or self.llm.model_name,
                             cached_tokens=s_cached,
                             provider=getattr(self.llm, "provider_name", None),
                             session_id=book_session_id,
