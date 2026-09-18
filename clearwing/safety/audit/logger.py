@@ -16,7 +16,7 @@ class AuditEntry:
     timestamp: str
     session_id: str
     event_type: str  # tool_call, llm_call, approval, error, finding, command
-    agent: str = "main"  # main, recon, exploit, reporter, planner
+    agent: str = "main"  # main, recon, exploit, reporter, planner, summarizer, operator, hunter
     tool_name: str | None = None
     tool_args: dict | None = None
     tool_result: str | None = None

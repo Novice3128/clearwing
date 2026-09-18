@@ -21,8 +21,15 @@ Semantics:
 - Each client keeps its OWN retry policy (rate-limit backoff, timeout
   caps, per-attempt spend reservations). The chain only intervenes after
   a client's retries are exhausted or it failed non-retryably.
+- Cooldown/stickiness (issue #57): a member whose dispatch failed at chain
+  level is skipped for 60s × 2^(consecutive-cooldowns − 1) (max 600s; a
+  parsed Retry-After extends the window, capped at 300s). Cooldown expiry
+  restores eligibility (half-open); a success resets the streak; when
+  every member is cooling the chain fails open to the normal order
+  instead of erroring with no candidates.
 - Cancellation is never failover: ``asyncio.CancelledError`` /
-  ``KeyboardInterrupt`` (BaseException) propagate immediately.
+  ``KeyboardInterrupt`` (BaseException) propagate immediately (and never
+  start a cooldown).
 - Spend-ledger safety: a chain is inert while any member client runs an
   ENFORCING spend ledger — a fallback dispatch would bill a reservation
   the ledger never sees (its pricing was validated for the primary
@@ -41,6 +48,7 @@ switches after a serving provider fails mid-session.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -59,8 +67,46 @@ from clearwing.llm.native import (  # noqa: E402
     _validate_schema_response,
     extract_json_array,
     extract_json_object,
+    parse_retry_after_seconds,
     response_text,
 )
+
+# --- Member cooldown (issue #57) ---------------------------------------------
+#
+# Design calibrated against known-good agent stacks: openai/codex keeps a
+# session-scoped failure flag so a failed provider stops being re-tried
+# first on every request (codex-rs/core/src/responses_retry.rs), and
+# LiteLLM cools a failing deployment over DEFAULT_COOLDOWN_TIME_SECONDS
+# (= 60s) with exponential growth (litellm/router_utils/cooldown_handler).
+# Without it, a persistently-5xx primary re-charges its FULL retry budget
+# on every turn before the chain switches — exactly the stall the chain
+# exists to prevent.
+
+_COOLDOWN_BASE_SECONDS: float = 60.0
+_COOLDOWN_MAX_SECONDS: float = 600.0
+# A Retry-After hint parsed from the failing member's exception may extend
+# the window beyond the exponential schedule, but the shared parser caps
+# parsed hints at 300s (native._RETRY_AFTER_MAX_SECONDS).
+_COOLDOWN_RETRY_AFTER_MAX_SECONDS: float = 300.0
+
+# Marker attribute distinguishing a CONSUMER-side exception (the caller's
+# on_text_delta raising through the chain's counting wrapper mid-stream)
+# from a provider failure: the wrapper re-raises it tagged, and the
+# dispatch handler re-raises it verbatim without cooling the member or
+# failing over (Codex PR-63 r1). Attribute tag, not a wrapper class, so
+# the caller still receives its own exception type/instance.
+_CONSUMER_ERROR_ATTR = "_clearwing_consumer_error"
+
+
+def _mark_consumer_error(exc: BaseException) -> None:
+    try:
+        setattr(exc, _CONSUMER_ERROR_ATTR, True)
+    except Exception:  # pragma: no cover - exotic exception types
+        pass
+
+
+def _is_consumer_error(exc: BaseException) -> bool:
+    return getattr(exc, _CONSUMER_ERROR_ATTR, False) is True
 
 
 class FallbackChain:
@@ -103,6 +149,18 @@ class FallbackChain:
         # adapter label (e.g. two openai_compat endpoints) — this flag can.
         self.served_by_primary: bool = True
         self._retry_notice: Callable[[str], None] | None = None
+        # Per-member cooldown state (issue #57), keyed by id(client): the
+        # chain holds strong references to every member for its whole
+        # lifetime, so ids cannot be recycled while the state is live.
+        # ``_cooldown_until`` is a time.monotonic() deadline; the streak
+        # counts CONSECUTIVE cooldowns and only a success resets it.
+        self._cooldown_until: dict[int, float] = {}
+        self._cooldown_streak: dict[int, int] = {}
+        # Fail-open notices fire once per all-cooling EPISODE (review r1):
+        # every dispatch while all members cool would otherwise repeat
+        # the same announcement; reset by any dispatch that has an
+        # eligible member again.
+        self._fail_open_notified = False
 
     # -- AsyncLLMClient-compatible surface --------------------------------
 
@@ -163,6 +221,186 @@ class FallbackChain:
         self.served_model_name = getattr(client, "model_name", None)
         self.served_provider_name = getattr(client, "provider_name", None)
         self.served_by_primary = client is self.primary
+        # A success proves the member healthy again — its cooldown streak
+        # resets to zero (issue #57 half-open recovery).
+        self._clear_cooldown(client)
+
+    # -- Cooldown bookkeeping (issue #57) ---------------------------------
+
+    def _cooldown_remaining(self, client: AsyncLLMClient) -> float:
+        """Seconds left in *client*'s cooldown (0.0 when eligible).
+
+        Expiry alone restores eligibility (half-open): the next request
+        retries the member naturally, and only a success clears the streak
+        that sizes the next window.
+        """
+        until = self._cooldown_until.get(id(client))
+        if until is None:
+            return 0.0
+        remaining = until - time.monotonic()
+        return remaining if remaining > 0.0 else 0.0
+
+    def _start_cooldown(
+        self, client: AsyncLLMClient, exc: Exception, *, extend_only: bool = False
+    ) -> None:
+        """Cool *client* after a chain-level failure (its dispatch raised).
+
+        Window = 60s × 2^(streak-1), capped at 600s. A Retry-After hint
+        parsed from the member's exception (shared parser, capped at 300s)
+        EXTENDS the window when larger — the provider knows its own load.
+        Consecutive cooldowns accumulate: recovering, failing again doubles
+        the window; only a success resets the streak.
+
+        ``extend_only`` (fail-open tours): the dispatch that failed started
+        while EVERY member was already cooling, so the failure adds no new
+        information — refresh the window from the EXISTING streak (base
+        60s when the member has none) WITHOUT incrementing, so a total
+        outage cannot grow every window per call toward the 600s cap and
+        mislead the logs about how long the provider has been down.
+        """
+        if len(self.clients) < 2:
+            # Single-member chains (spend-ledger collapse, dropped
+            # fallbacks) have nothing to skip: the chain does not act.
+            return
+        streak = self._cooldown_streak.get(id(client), 0)
+        if not extend_only:
+            streak += 1
+            self._cooldown_streak[id(client)] = streak
+        if streak >= 1:
+            # Clamp the exponent before exponentiating (Codex PR-63 r1):
+            # a provider down for weeks of capped half-open probes keeps
+            # growing its streak, and 60.0 * 2**1024 overflows the float
+            # BEFORE min() can apply the 600s cap — turning a provider
+            # failure into an OverflowError. 2**10 × 60s already exceeds
+            # the cap, so anything past ten doublings is indistinguishable.
+            exponent = min(streak - 1, 10)
+            window = min(_COOLDOWN_BASE_SECONDS * (2**exponent), _COOLDOWN_MAX_SECONDS)
+        else:
+            # extend_only with no prior streak: defensive — a cooling
+            # member always has one — fall back to the base window.
+            window = _COOLDOWN_BASE_SECONDS
+        retry_after = parse_retry_after_seconds(
+            exc, max_seconds=_COOLDOWN_RETRY_AFTER_MAX_SECONDS
+        )
+        if retry_after is not None:
+            window = max(window, retry_after)
+        self._cooldown_until[id(client)] = time.monotonic() + window
+        logger.info(
+            "LLM provider %s/%s entering cooldown for %.0fs (consecutive cooldowns: %d)",
+            getattr(client, "provider_name", "?"),
+            getattr(client, "model_name", "?"),
+            window,
+            streak,
+        )
+
+    def _clear_cooldown(self, client: AsyncLLMClient) -> None:
+        self._cooldown_until.pop(id(client), None)
+        self._cooldown_streak.pop(id(client), None)
+
+    def _dispatch_order(
+        self,
+    ) -> tuple[list[AsyncLLMClient], list[AsyncLLMClient], bool, dict[int, float]]:
+        """Members to dispatch over, in order, plus the cooling ones skipped.
+
+        Returns ``(order, skipped, fail_open, remaining)`` where *remaining*
+        maps ``id(client)`` → cooldown seconds left AT DECISION TIME.
+        Cooling members are skipped so a persistently-failing primary stops
+        re-charging its retry budget on every call — unless EVERY member is
+        cooling, in which case the chain fails open to the normal order
+        (never an empty-candidates error).
+
+        The remaining seconds are read in a SINGLE pass (review r1): two
+        separate comprehensions call ``_cooldown_remaining`` twice per
+        member, and time advances between them — a member whose cooldown
+        expires exactly between the scans lands in NEITHER list, and the
+        skip notices would report a different count than the split acted
+        on. Callers (``_notify_skips``) must reuse this map.
+        """
+        clients = self.clients
+        remaining = {id(client): self._cooldown_remaining(client) for client in clients}
+        order = [client for client in clients if remaining[id(client)] <= 0.0]
+        skipped = [client for client in clients if remaining[id(client)] > 0.0]
+        if order:
+            # A dispatch with at least one eligible member ends the
+            # all-cooling episode — a later one must announce itself again.
+            self._fail_open_notified = False
+            return order, skipped, False, remaining
+        if not self._fail_open_notified:
+            longest = max(remaining.values(), default=0.0)
+            self._notify(
+                f"all llm fallback members cooling (longest {longest:.0f}s remaining); "
+                "failing open to the normal dispatch order"
+            )
+            self._fail_open_notified = True
+        return clients, [], True, remaining
+
+    def _notify_skips(
+        self,
+        skipped: Sequence[AsyncLLMClient],
+        first: AsyncLLMClient,
+        remaining: dict[int, float],
+    ) -> None:
+        if first is None:  # pragma: no cover - order always has the primary
+            return
+        for client in skipped:
+            self._notify(
+                f"llm provider {getattr(client, 'provider_name', '?')}/"
+                f"{getattr(client, 'model_name', '?')} skipping "
+                f"(cooldown {remaining[id(client)]:.0f}s remaining), "
+                f"dispatching to {getattr(first, 'provider_name', '?')}/"
+                f"{getattr(first, 'model_name', '?')}"
+            )
+
+    def _revived_members(
+        self,
+        skipped: Sequence[AsyncLLMClient],
+        attempted: set[int],
+    ) -> list[AsyncLLMClient]:
+        """Skipped members whose cooldown expired MID-DISPATCH (Codex PR-63 r2).
+
+        ``_dispatch_order`` snapshots eligibility at call start, but a
+        serving member's own retry loop can outlast a skipped member's
+        remaining window — by the time the chain would give up, that
+        member is healthy again and must be re-dispatched instead of
+        failing the call. Members already attempted THIS call are excluded
+        (their cooldown was just (re)started by their own failure, and
+        ``_cooldown_remaining`` would otherwise resurrect them forever on
+        a zero-length window). Fail-open tours pass an empty ``skipped``
+        list, so revival is naturally a no-op there.
+        """
+        return [
+            member
+            for member in skipped
+            if id(member) not in attempted and self._cooldown_remaining(member) <= 0.0
+        ]
+
+    def _announce_failover(
+        self,
+        failed: AsyncLLMClient,
+        nxt: AsyncLLMClient,
+        exc: Exception,
+        *,
+        deltas_emitted: bool,
+    ) -> None:
+        """Notice + log for a member failure that moves the chain onward."""
+        notice = (
+            f"llm provider {getattr(failed, 'provider_name', '?')}/"
+            f"{getattr(failed, 'model_name', '?')} failed "
+            f"({type(exc).__name__}); falling back to "
+            f"{getattr(nxt, 'provider_name', '?')}/"
+            f"{getattr(nxt, 'model_name', '?')}"
+        )
+        if deltas_emitted:
+            notice += " — partial output above is abandoned; the full answer follows"
+        self._notify(notice)
+        logger.warning(
+            "LLM provider %s/%s failed (%s); falling back to %s/%s",
+            getattr(failed, "provider_name", "?"),
+            getattr(failed, "model_name", "?"),
+            self._brief(exc),
+            getattr(nxt, "provider_name", "?"),
+            getattr(nxt, "model_name", "?"),
+        )
 
     @property
     def spend_ledger(self):
@@ -192,7 +430,11 @@ class FallbackChain:
         returned response (and therefore graph state) instead of being
         concatenated onto the abandoned partial output.
         """
-        clients = self.clients
+        # Cooldown-aware dispatch order (issue #57): cooling members are
+        # skipped (with a notice); all-cooling fails open to normal order.
+        clients, skipped, fail_open, remaining = self._dispatch_order()
+        if skipped:
+            self._notify_skips(skipped, clients[0], remaining)
         last_exc: Exception | None = None
         deltas_emitted = False
         original_callback = kwargs.get("on_text_delta")
@@ -201,72 +443,127 @@ class FallbackChain:
             nonlocal deltas_emitted
             deltas_emitted = True
             if original_callback is not None:
-                original_callback(text)
+                try:
+                    original_callback(text)
+                except Exception as exc:
+                    # Consumer-side failure: abort the member's stream by
+                    # re-raising, but TAGGED so the dispatch handler below
+                    # returns it to the caller instead of mistaking it for
+                    # a provider failure (the member did not fail).
+                    _mark_consumer_error(exc)
+                    raise
 
         if original_callback is not None:
             kwargs["on_text_delta"] = _counting_callback
 
+        # Attempted member ids (Codex PR-63 r2): the tail-of-loop revival
+        # check must never re-dispatch a member this call already tried.
+        attempted: set[int] = set()
         for index, client in enumerate(clients):
+            attempted.add(id(client))
             suppressed_this_member = index > 0 and deltas_emitted
             if suppressed_this_member:
                 # Abandoned partial output already reached the consumer —
                 # never interleave a second answer into it.
                 kwargs["on_text_delta"] = None
+            # ONLY a provider failure counts (Codex PR-63 r1): consumer-side
+            # exceptions — the caller's on_text_delta raising through the
+            # counting callback (tagged there), or the suppressed-response
+            # re-emission below (outside this try) — must neither cool the
+            # member nor move the chain to the next one: the member did not
+            # fail, and re-dispatching would double-serve a call whose
+            # partial output the consumer already saw.
             try:
                 response = await client.achat_stream(**kwargs)
-                self._record_served(client)
-                if suppressed_this_member and original_callback is not None:
-                    # The legacy interactive CLI prints ONLY what the delta
-                    # callback delivered (it discards the returned events),
-                    # so suppressed failover text would leave the user with
-                    # nothing but the abandoned fragment — emit the complete
-                    # response once (Codex PR-55 r5). Event/state consumers
-                    # keep the authoritative response object either way.
-                    try:
-                        text = response_text(response)
-                    except Exception:
-                        text = ""
-                    if text:
-                        original_callback(text)
-                return response
             except Exception as exc:
+                # Consumer-side: propagate verbatim — no cooldown, no
+                # failover (the marker is set by _counting_callback).
+                if _is_consumer_error(exc):
+                    raise
                 # Cancellation must never fail over (BaseException is not
                 # caught); only genuine provider failures move the chain.
                 last_exc = exc
+                # The member exhausted its OWN retry policy and failed at
+                # chain level — cool it (issue #57) so the next call skips
+                # it instead of re-paying that budget. This includes the
+                # final member whose failure re-raises: otherwise a total
+                # outage could never reach the all-cooling state that the
+                # fail-open path below resolves. Cancellation never reaches
+                # here (BaseException). In a fail-open tour (every member
+                # was already cooling) the cooldown is extend-only: the
+                # streak does not grow per call.
+                self._start_cooldown(client, exc, extend_only=fail_open)
                 if index + 1 >= len(clients):
+                    # Codex PR-63 r2: a member SKIPPED at dispatch time may
+                    # have cooled back to eligibility while the members
+                    # above burned their retry budgets — re-check before
+                    # giving up. CPython list iterators see ``extend``ed
+                    # elements and the length guard above re-evaluates each
+                    # round, so revived members become tail members (their
+                    # later index keeps the delta-suppression semantics
+                    # below correct: revived members ARE later members).
+                    revived = self._revived_members(skipped, attempted)
+                    if revived:
+                        clients.extend(revived)
+                        continue
                     raise
-                notice = (
-                    f"llm provider {getattr(client, 'provider_name', '?')}/"
-                    f"{getattr(client, 'model_name', '?')} failed "
-                    f"({type(exc).__name__}); falling back to "
-                    f"{getattr(clients[index + 1], 'provider_name', '?')}/"
-                    f"{getattr(clients[index + 1], 'model_name', '?')}"
+                self._announce_failover(
+                    client, clients[index + 1], exc, deltas_emitted=deltas_emitted
                 )
-                if deltas_emitted:
-                    notice += " — partial output above is abandoned; the full answer follows"
-                self._notify(notice)
-                logger.warning(
-                    "LLM provider %s/%s failed (%s); falling back to %s/%s",
-                    getattr(client, "provider_name", "?"),
-                    getattr(client, "model_name", "?"),
-                    self._brief(exc),
-                    getattr(clients[index + 1], "provider_name", "?"),
-                    getattr(clients[index + 1], "model_name", "?"),
-                )
+                continue
+            # Success path — OUTSIDE the provider-failure handler (Codex
+            # PR-63 r1): a raising consumer callback propagates to the
+            # caller instead of cooling the member that served the call.
+            self._record_served(client)
+            if suppressed_this_member and original_callback is not None:
+                # The legacy interactive CLI prints ONLY what the delta
+                # callback delivered (it discards the returned events),
+                # so suppressed failover text would leave the user with
+                # nothing but the abandoned fragment — emit the complete
+                # response once (Codex PR-55 r5). Event/state consumers
+                # keep the authoritative response object either way.
+                try:
+                    text = response_text(response)
+                except Exception:
+                    text = ""
+                if text:
+                    original_callback(text)
+            return response
         raise last_exc  # pragma: no cover - loop always returns or raises
 
     async def achat(self, **kwargs: Any):
         """Non-streaming dispatch through the chain."""
-        clients = self.clients
+        # Cooldown-aware dispatch order (issue #57), same as achat_stream.
+        clients, skipped, fail_open, remaining = self._dispatch_order()
+        if skipped:
+            self._notify_skips(skipped, clients[0], remaining)
         last_exc: Exception | None = None
+        # Attempted member ids (Codex PR-63 r2): the tail-of-loop revival
+        # check must never re-dispatch a member this call already tried.
+        attempted: set[int] = set()
         for index, client in enumerate(clients):
+            attempted.add(id(client))
             try:
                 response = await client.achat(**kwargs)
                 self._record_served(client)
                 return response
             except Exception as exc:
                 last_exc = exc
+                # Chain-level failure → cooldown (issue #57), including the
+                # final re-raise (mirrors achat_stream's rule). Fail-open
+                # tours extend the window without growing the streak.
+                self._start_cooldown(client, exc, extend_only=fail_open)
                 if index + 1 >= len(clients):
+                    # Codex PR-63 r2, same as achat_stream: a skipped
+                    # member's cooldown may have EXPIRED while the
+                    # dispatched members were retrying — revive it (append
+                    # to the iteration list) instead of raising; the for
+                    # loop picks up extended members and the length guard
+                    # re-evaluates each round.
+                    revived = self._revived_members(skipped, attempted)
+                    if revived:
+                        clients.extend(revived)
+                        continue
                     raise
                 self._notify(
                     f"llm provider {getattr(client, 'provider_name', '?')}/"

@@ -13,7 +13,8 @@ from collections import deque
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse, urlunparse
 
@@ -223,13 +224,12 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
-def _exception_chain_text(exc: BaseException) -> str:
-    """Lowercased str() of *exc* plus its __cause__/__context__ chain.
+def _exception_chain_raw(exc: BaseException) -> str:
+    """Original-case str() of *exc* plus its __cause__/__context__ chain.
 
-    genai-pyo3 surfaces transport failures as a terse top-level message
-    ("Web call failed for model ...") whose real detail ("Reqwest error:
-    ... timed out") lives in the nested cause — top-level-only matching
-    misses the actual failure class (Codex PR-40 P1).
+    Same walk as :func:`_exception_chain_text` but WITHOUT lowering, so
+    case-sensitive downstream parses (HTTP-date month names, issue #59)
+    see the provider's original text.
     """
     parts: list[str] = []
     seen: set[int] = set()
@@ -238,7 +238,228 @@ def _exception_chain_text(exc: BaseException) -> str:
         seen.add(id(cur))
         parts.append(str(cur))
         cur = cur.__cause__ or cur.__context__
-    return "\n".join(parts).lower()
+    return "\n".join(parts)
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    """Lowercased str() of *exc* plus its __cause__/__context__ chain.
+
+    genai-pyo3 surfaces transport failures as a terse top-level message
+    ("Web call failed for model ...") whose real detail ("Reqwest error:
+    ... timed out") lives in the nested cause — top-level-only matching
+    misses the actual failure class (Codex PR-40 P1).
+    """
+    return _exception_chain_raw(exc).lower()
+
+
+# --- Retry-After parsing (issue #59) -----------------------------------------
+#
+# Precedence mirrors opencode's retry.ts: milliseconds first
+# (Retry-After-Ms — OpenRouter/Azure style), then a numeric Retry-After
+# (seconds), then HTTP-date. Every parsed value is capped so a hostile or
+# buggy upstream cannot stall the agent for hours.
+
+_RETRY_AFTER_MAX_SECONDS: float = 300.0
+
+# Explicit ms-suffixed header name, checked FIRST so the seconds pattern
+# below can never misread an ms value as seconds (the "retry-after-ms"
+# unit bug: 500 ms must be 0.5 s, never 500 s). The clean-end guard
+# keeps a partial digit run ("retry-after-ms: 1e3" → "1") from parsing
+# (Codex PR-63 r3).
+_RE_RETRY_AFTER_MS = re.compile(
+    r"retry[-_ ]after[-_ ]?ms[:=]?\s*([0-9]+(?:\.[0-9]+)?)(?![a-z0-9.])"
+)
+# Numeric Retry-After with a trailing ms unit ("retry-after: 500 ms").
+_RE_RETRY_AFTER_MS_SUFFIX = re.compile(
+    r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*ms\b(?![a-z0-9.])"
+)
+# Numeric Retry-After (seconds). The number must END cleanly (Codex PR-63
+# r3 P2): the old pattern matched any digit run after the header name, so
+# "retry-after: 5 minutes" half-matched as 5 s and "retry-after: 1e3" as
+# 1 s — both premature retries that re-hit a rate-limited upstream. After
+# an optional GLUED unit (ms/s — "retry-after: 30s" is 30 s, and the
+# rendered "retry-after: 300.000s" suffix must round-trip), no
+# alphanumeric/dot may touch the number AND none may follow intervening
+# whitespace ("5 minutes", "30 seconds"). Text is matched lowercased, so
+# [a-z] covers every letter.
+_RE_RETRY_AFTER_SECONDS = re.compile(
+    r"retry[-_ ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)(?:ms|s)?(?![a-z0-9.]|\s*[a-z0-9.])"
+)
+# Legacy provider-body phrasings kept from the previous parser. The unit
+# is REQUIRED: "try again in 1200ms" reads as 1.2 s while "please wait 5
+# minutes" must not match at all (a unitless number is not a delay the
+# provider actually specified). The trailing guard keeps the bare "s"
+# alternative from eating the first letter of a longer word — "wait 5
+# seconds" is not "wait 5s" (Codex PR-63 r3).
+_RE_TRY_AGAIN = re.compile(r"try again in\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)(?![a-z0-9])")
+_RE_WAIT = re.compile(r"\bwait\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)(?![a-z0-9])")
+# Retry-After as an HTTP-date (RFC 1123 shape; matched on the ORIGINAL-case
+# text because parsedate_to_datetime expects canonical casing).
+_RE_RETRY_AFTER_DATE = re.compile(
+    r"retry[-_ ]after[:=]?\s*"
+    r"((?:mon|tue|wed|thu|fri|sat|sun),\s*\d{1,2}\s+"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{2,4}\s+"
+    r"\d{1,2}:\d{2}:\d{2}(?:\s+(?:gmt|utc|[+-]\d{4}))?)",
+    re.IGNORECASE,
+)
+
+
+def parse_retry_after_seconds(
+    source: BaseException | str,
+    *,
+    max_seconds: float = _RETRY_AFTER_MAX_SECONDS,
+) -> float | None:
+    """Parse a Retry-After hint (in seconds) from an exception chain or text.
+
+    Scans the FULL ``__cause__``/``__context__`` chain when given an
+    exception — genai-pyo3 and the aiohttp transport nest the real detail
+    under a terse wrapper, and a bare ``str(exc)`` misses it (issue #59).
+    Precedence:
+
+    0. a ``clearwing_retry_after`` attribute anywhere on the chain — the
+       aiohttp transport stashes the actual response HEADER there; the
+       header outranks every body-text token, so provider chatter like a
+       body ``retry-after: 1`` can never override a 120s header (Codex
+       PR-63 r1);
+    1. ``Retry-After-Ms`` style header (milliseconds),
+    2. numeric ``Retry-After`` with an ``ms`` unit suffix,
+    3. numeric ``Retry-After`` (seconds),
+    4. legacy body phrasings ("try again in N[s|ms]", "wait N[s|ms]"),
+    5. ``Retry-After`` as an HTTP-date — future timestamps only.
+
+    Returns the delay in seconds capped at *max_seconds* (default 300), or
+    None when nothing parses.
+    """
+    if not isinstance(source, str):
+        cur: BaseException | None = source
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            attr = getattr(cur, "clearwing_retry_after", None)
+            if isinstance(attr, (int, float)) and not isinstance(attr, bool):
+                return min(max(float(attr), 0.0), max_seconds)
+            cur = cur.__cause__ or cur.__context__
+    raw = source if isinstance(source, str) else _exception_chain_raw(source)
+    lowered = raw.lower()
+
+    for pattern, is_ms in (
+        (_RE_RETRY_AFTER_MS, True),
+        (_RE_RETRY_AFTER_MS_SUFFIX, True),
+        (_RE_RETRY_AFTER_SECONDS, False),
+    ):
+        match = pattern.search(lowered)
+        if match:
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                continue
+            if is_ms:
+                value /= 1000.0
+            return min(max(value, 0.0), max_seconds)
+
+    for pattern in (_RE_TRY_AGAIN, _RE_WAIT):
+        match = pattern.search(lowered)
+        if match:
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                continue
+            if match.group(2) == "ms":
+                value /= 1000.0
+            return min(max(value, 0.0), max_seconds)
+
+    date_match = _RE_RETRY_AFTER_DATE.search(raw)
+    if date_match:
+        try:
+            when = parsedate_to_datetime(date_match.group(1))
+        except (TypeError, ValueError):
+            return None
+        if when is None:  # pragma: no cover - parsedate_to_datetime raises instead
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        remaining = (when - datetime.now(timezone.utc)).total_seconds()
+        if remaining > 0:
+            return min(remaining, max_seconds)
+    return None
+
+
+def _retry_after_hint_from_headers(headers: Any) -> float | None:
+    """Extract a Retry-After hint from HTTP response headers (issue #59).
+
+    Case-insensitive lookup over any name→value mapping (aiohttp's
+    CIMultiDict or a plain dict). Precedence: ``Retry-After-Ms``
+    (milliseconds) → ``Retry-After`` (seconds) → ``Retry-After``
+    (HTTP-date, future only). Uncapped — callers cap or embed.
+    """
+    if headers is None:
+        return None
+
+    def _header(name: str) -> str | None:
+        try:
+            items = list(headers.items())
+        except Exception:
+            return None
+        for key, value in items:
+            if str(key).lower() == name:
+                return str(value)
+        return None
+
+    raw_ms = _header("retry-after-ms")
+    if raw_ms is not None:
+        try:
+            return float(raw_ms.strip()) / 1000.0
+        except ValueError:
+            pass
+    raw_after = _header("retry-after")
+    if raw_after is not None:
+        candidate = raw_after.strip()
+        try:
+            return float(candidate)
+        except ValueError:
+            try:
+                when = parsedate_to_datetime(candidate)
+            except (TypeError, ValueError):
+                return None
+            if when is None:  # pragma: no cover - parsedate_to_datetime raises instead
+                return None
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            remaining = (when - datetime.now(timezone.utc)).total_seconds()
+            return remaining if remaining > 0 else None
+    return None
+
+
+def _retry_after_suffix(hint: float | None) -> str:
+    """Render a header-derived Retry-After hint as the ``retry-after: N``
+    text protocol so the downstream parser (and the FallbackChain's
+    cooldown sizing) can recover it from the raised exception's text.
+    The AUTHORITATIVE copy rides on the exception's
+    ``clearwing_retry_after`` attribute (see the aiohttp raise sites) —
+    this text is the human-readable echo, not the source of truth."""
+    if hint is None or hint <= 0:
+        return ""
+    # Fixed-point, never ``:g``: general formatting switches to scientific
+    # notation at ≥ 1e6 ("3e+06"), and the downstream regex would truncate
+    # that to 3 s — breaking the round-trip the suffix exists for.
+    return f" (retry-after: {min(hint, _RETRY_AFTER_MAX_SECONDS):.3f}s)"
+
+
+def _attach_retry_after(exc: BaseException, hint: float | None) -> BaseException:
+    """Stash a header-derived Retry-After on *exc*, out-of-band (Codex
+    PR-63 r1).
+
+    The response header is authoritative: an error BODY may also contain
+    ``retry-after: 1`` (or ``retry-after-ms``) tokens that the chain-text
+    parser would find FIRST, silently overriding the header's 120s with
+    1s. The parser prefers this attribute over any text, so body chatter
+    can never outrank the header."""
+    if hint is not None and hint > 0:
+        try:
+            exc.clearwing_retry_after = min(hint, _RETRY_AFTER_MAX_SECONDS)  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - exotic exception types
+            pass
+    return exc
 
 
 def _non_negative_int_env(name: str, default: int) -> int:
@@ -1628,8 +1849,21 @@ class AsyncLLMClient:
                 async with session.post(url, json=body, headers=headers) as resp:
                     if resp.status >= 400:
                         detail = (await resp.text())[:1000]
-                        raise RuntimeError(
-                            f"OpenAI-compatible fallback failed with HTTP {resp.status}: {detail}"
+                        # Embed any Retry-After hint via the shared text
+                        # protocol so the retry backoff (and the fallback
+                        # chain's cooldown) can honor the header instead of
+                        # losing it with the response object (issue #59);
+                        # the attribute carries the authoritative value
+                        # past any retry-after tokens in the BODY text
+                        # (Codex PR-63 r1).
+                        header_hint = _retry_after_hint_from_headers(resp.headers)
+                        raise _attach_retry_after(
+                            RuntimeError(
+                                f"OpenAI-compatible fallback failed with HTTP "
+                                f"{resp.status}: "
+                                f"{detail}{_retry_after_suffix(header_hint)}"
+                            ),
+                            header_hint,
                         )
                     try:
                         return await self._collect_openai_sse_response(resp, on_text_delta)
@@ -1645,8 +1879,14 @@ class AsyncLLMClient:
             async with session.post(url, json=body, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        f"OpenAI-compatible fallback failed with HTTP {resp.status}: {text[:1000]}"
+                    header_hint = _retry_after_hint_from_headers(resp.headers)
+                    raise _attach_retry_after(
+                        RuntimeError(
+                            f"OpenAI-compatible fallback failed with HTTP "
+                            f"{resp.status}: "
+                            f"{text[:1000]}{_retry_after_suffix(header_hint)}"
+                        ),
+                        header_hint,
                     )
                 try:
                     payload = json.loads(text)
@@ -2474,33 +2714,29 @@ class AsyncLLMClient:
         return "  <- ".join(parts)
 
     def _retry_delay_seconds(self, exc: Exception, attempt: int) -> float:
-        retry_after = self._parse_retry_after_seconds(str(exc))
+        # Retry-After hints are parsed from the FULL exception chain, not a
+        # bare str(exc): the aiohttp transport embeds the header hint in the
+        # raised RuntimeError's text and genai-pyo3 nests the real failure
+        # under a terse wrapper (issue #59). Parsed values are already
+        # capped at 300s by parse_retry_after_seconds.
+        retry_after = parse_retry_after_seconds(exc)
         if retry_after is not None:
-            base_delay = retry_after
-        else:
-            base_delay = min(
-                self.rate_limit_initial_backoff_seconds * (2**attempt),
-                self.rate_limit_max_backoff_seconds,
-            )
+            # Server advice wins over the LOCAL backoff schedule (opencode
+            # retry.ts lets a header suggestion exceed the local max; codex
+            # treats server advice as authoritative): the parser's 300s
+            # absolute cap is the only ceiling, the local
+            # rate_limit_max_backoff_seconds does not apply. No jitter
+            # either — the server named an exact time, and randomizing it
+            # can only land closer to (or past) the limit it just asked us
+            # to clear.
+            return retry_after
+        base_delay = min(
+            self.rate_limit_initial_backoff_seconds * (2**attempt),
+            self.rate_limit_max_backoff_seconds,
+        )
 
         jitter = min(1.0, base_delay * 0.2) * random.random()
         return min(base_delay + jitter, self.rate_limit_max_backoff_seconds)
-
-    def _parse_retry_after_seconds(self, text: str) -> float | None:
-        patterns = [
-            r"retry[- ]after[:=]?\s*([0-9]+(?:\.[0-9]+)?)",
-            r"try again in\s*([0-9]+(?:\.[0-9]+)?)s",
-            r"wait\s*([0-9]+(?:\.[0-9]+)?)s",
-        ]
-        lowered = text.lower()
-        for pattern in patterns:
-            match = re.search(pattern, lowered)
-            if match:
-                try:
-                    return float(match.group(1))
-                except ValueError:
-                    return None
-        return None
 
 
 def extract_json_object(text: str) -> dict[str, Any]:

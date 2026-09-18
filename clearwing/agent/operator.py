@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from clearwing.agent.graph import _create_llm, create_agent
 from clearwing.agent.runtime import Command
 from clearwing.agent.tooling import session_scope
+from clearwing.observability.bookkeeping import book_llm_call, init_session_audit_logger
 from clearwing.observability.telemetry import CostTracker
 from clearwing.providers import ProviderManager
 
@@ -126,6 +127,11 @@ class OperatorAgent:
         # Job session id (set in _arun_impl): keys the per-session cost
         # totals the limit check and result cost field read.
         self._session_id = ""
+        # Session audit trail (built in _arun_impl, runtime-style gating):
+        # the supervisor's own LLM calls land in the same
+        # ~/.clearwing/audit/<session_id>/audit.jsonl as the inner agent's,
+        # so per-session audit sums reconcile with CostTracker (#61).
+        self._audit_logger = None
 
     def run(self) -> OperatorResult:
         """Run the operator loop to completion (sync wrapper over :meth:`arun`)."""
@@ -151,6 +157,11 @@ class OperatorAgent:
 
     async def _arun_impl(self, session_id: str, start: float) -> OperatorResult:
         self._session_id = session_id
+        # Same audit gating as the runtime graph: capability present + a
+        # real session id. Hunters spawned inside this job's session_scope
+        # resolve the same id, so every spend source of the job writes one
+        # audit trail.
+        self._audit_logger = init_session_audit_logger(session_id)
         # Create inner agent
         graph = create_agent(
             model_name=self.config.model,
@@ -413,19 +424,38 @@ class OperatorAgent:
                     usage_cached = (
                         getattr(details, "cached_tokens", None) if details else None
                     )
-                    CostTracker().record_llm_call(
+                    # Single-entry bookkeeping (#61): the supervisor call is
+                    # real spend — priced AND audited together. aask_text
+                    # goes straight to the client — session_scope only
+                    # attributes calls the runtime books — so without
+                    # recording it here the job's limit check and result
+                    # never saw the (possibly expensive operator_model)
+                    # supervisor outlay (PR #44 review P1); without the audit
+                    # half the job's audit trail under-reported the same
+                    # outlay.
+                    book_llm_call(
                         usage_in,
                         usage_out,
+                        tracker=CostTracker(),
                         # Price/attribute the member that actually served the
                         # call: a FallbackChain records it (Codex PR-55 r4) —
                         # otherwise failover spend was booked at the primary's
                         # rate and the job's limit check used a wrong model.
-                        getattr(operator_llm, "served_model_name", None)
+                        model=getattr(operator_llm, "served_model_name", None)
+                        or getattr(operator_llm, "model_name", "unknown"),
+                        # The audit row keeps the model the PROVIDER echoed
+                        # (canonical/versioned name) for forensics accuracy,
+                        # mirroring the runtime/hunter audit_model split
+                        # (Codex PR-63 r1) — pricing stays on the member key.
+                        audit_model=getattr(response, "provider_model_name", None)
+                        or getattr(operator_llm, "served_model_name", None)
                         or getattr(operator_llm, "model_name", "unknown"),
                         cached_tokens=usage_cached if isinstance(usage_cached, int) else 0,
                         provider=getattr(operator_llm, "served_provider_name", None)
                         or getattr(operator_llm, "provider_name", None),
                         session_id=self._session_id,
+                        audit_logger=self._audit_logger,
+                        agent="operator",
                     )
             return response_text(response).strip()
         except Exception as e:
