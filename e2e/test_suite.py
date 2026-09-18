@@ -557,15 +557,22 @@ def test_adjudicate_and_export_gate(tmp_path, capsys):
     with pytest.raises(SystemExit):
         runner.cmd_adjudicate(a2)
     assert "DRAFT -->" in adj.read_text()
-    # fill the four-lens review record -> finalize stamps FINAL -> export works
+    # review record filled but verdict line still empty -> finalize refuses
     adj.write_text(text.replace(
         "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
         "四鏡複審完成：證據核實重算全數通過；對抗方法論確認無替代解釋；流程對照合規；交付一致。"))
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    # verdict line present -> finalize stamps FINAL -> export quotes IT
+    adj.write_text(adj.read_text().replace("verdict: \n", "verdict: PASS  # 翻案：門檻口徑\n", 1)
+                   if "verdict: \n" in adj.read_text()
+                   else adj.read_text().replace("verdict: ", "verdict: PASS  # 翻案\n_", 1))
     runner.cmd_adjudicate(a2)
-    assert "FINAL -->" in adj.read_text()
+    assert "adjudication-status: FINAL" in adj.read_text()
     runner.cmd_export(e)                            # no SystemExit anymore
     out = capsys.readouterr().out
-    assert "FAIL" in out and "cache-min" in out and str(d) in out
+    assert "**PASS**" in out and "machine verdict was FAIL" in out \
+        and "cache-min" in out and str(d) in out
 
 
 # --------------------------------------- cache per-call / degenerate -----
@@ -790,6 +797,55 @@ def test_adjudicate_refuses_overwrite_of_reviewed(tmp_path):
         "<!-- adjudication-status: DRAFT -->", "<!-- adjudication-status: FINAL -->"))
     with pytest.raises(SystemExit):          # FINAL -> refuse regen
         runner.cmd_adjudicate(a)
+
+
+# --------------------------------------- Codex #67 r1 fixes -------------
+
+def test_aside_copy_includes_wal(tmp_path):
+    """P1-A: SQLite WAL mode — copying only memory.db snapshots a stale
+    database; the -wal sidecar must be captured too."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "memory.db").write_bytes(b"db")
+    (home / "memory.db-wal").write_bytes(b"WAL-PENDING-WRITES")
+    dest = tmp_path / "aside"
+    dest.mkdir()
+    copied = runner._aside_copy(home, dest)
+    assert "memory.db-wal" in copied
+    assert (dest / "memory.db-wal").read_bytes() == b"WAL-PENDING-WRITES"
+
+
+def test_probe_majority(monkeypatch):
+    """P2-c: a single lost SYN must never set the recorded baseline."""
+    seq = iter([False, True, True])
+    monkeypatch.setattr(runner, "tcp_probe", lambda h, p, timeout=3.0: next(seq))
+    assert runner.probe_majority("h", 88) is True
+    seq2 = iter([False, False, True])
+    monkeypatch.setattr(runner, "tcp_probe", lambda h, p, timeout=3.0: next(seq2))
+    assert runner.probe_majority("h", 88) is False
+
+
+def test_cache_prefix_median_per_context():
+    """P2-e: an interleaved uncached operator call is NOT a main-prefix
+    miss and must not reset the main line's growth baseline."""
+    calls = [(10000, 9500, 50, "main"), (6000, 0, 60, "operator"),
+             (10100, 9600, 50, "main"), (10200, 9700, 50, "main")]
+    med = analyze.cache_prefix_median(calls)
+    assert med == pytest.approx(95.07, abs=0.01)   # main-only ratios; operator's
+    # single call is its context's first -> excluded entirely
+
+
+def test_r3_manual_not_clobbered_by_reanalyze(monkeypatch, tmp_path):
+    """P2-b: a half-filled r3-manual.md is human state — `cw-e2e analyze`
+    re-render must not destroy it."""
+    monkeypatch.setattr(analyze, "RESULTS", tmp_path)
+    d = _write_min_run(tmp_path, "20260101-000000-full",
+                       extra_summary={"session_id": "abc12345"})
+    ver = {"git": {"head": "x" * 40, "webapi_commit": "y", "branch": "b"}}
+    analyze.render(d, "full", ver, [("k", True, "")])
+    (d / "r3-manual.md").write_text("# HUMAN IN-PROGRESS REVIEW\n- finding A\n")
+    analyze.render(d, "full", ver, [("k", True, "")])     # re-render
+    assert "HUMAN IN-PROGRESS REVIEW" in (d / "r3-manual.md").read_text()
 
 
 # ---------------------------------------------------- P4 R3 manual ------

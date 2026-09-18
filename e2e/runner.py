@@ -69,6 +69,23 @@ def check_target(target: str) -> str:
     return target
 
 
+ASIDE_FILES = ("memory.db", "memory.db-wal", "memory.db-shm", "knowledge_graph.json")
+
+
+def _aside_copy(home: Path, dest: Path) -> list[str]:
+    """Copy the memory state trio + KG. SQLite runs in WAL mode
+    (semantic_memory.py:95 / episodic_memory.py:66) — copying only
+    memory.db snapshots a STALE database and the contamination control
+    would miss mutations living in memory.db-wal (Codex #67 r1 P1)."""
+    copied = []
+    for name in ASIDE_FILES:
+        src = home / name
+        if src.exists():
+            dest.joinpath(name).write_bytes(src.read_bytes())
+            copied.append(name)
+    return copied
+
+
 def cost_cap_of(sc: dict, tier: dict) -> float:
     """Scenario cap > tier cap > suite default. Never index tier["cost_cap"]
     directly — it is an eagerly-evaluated default and deep-fallback defines
@@ -538,6 +555,15 @@ def scenario_pytest(run_dir: Path) -> dict:
             "non_env_failures": non_env, "note": exit_note, "pass": bool(ok)}
 
 
+def probe_majority(host: str, port: int, tries: int = 3) -> bool:
+    """Majority-of-N probe: a single lost SYN must never become the
+    recorded baseline or the post-run verdict (Codex #67 r1 P2)."""
+    votes = [tcp_probe(host, port) for _ in range(tries)]
+    if tries > 1:
+        time.sleep(0)      # votes are sequential already; gap added by timeout cost
+    return sum(votes) * 2 > len(votes)
+
+
 def tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
     import socket
     try:
@@ -704,10 +730,7 @@ def verify(run_dir: Path | None, strict: bool = True) -> dict:
         # copy is the cross-round contamination control the manual protocol kept
         aside = run_dir / "state" / "aside-pre"
         aside.mkdir(exist_ok=True)
-        for name in ("memory.db", "knowledge_graph.json"):
-            src = home / name
-            if src.exists():
-                (aside / name).write_bytes(src.read_bytes())   # ~2.4MB total, gitignored
+        _aside_copy(home, aside)          # ~2.4MB total, gitignored
         suite_hash = hashlib.sha256()
         for f in ("runner.py", "chaos.py", "surgery.py", "analyze.py", "suite.yaml", "SPEC.md"):
             suite_hash.update((E2E_ROOT / f).read_bytes())
@@ -716,7 +739,7 @@ def verify(run_dir: Path | None, strict: bool = True) -> dict:
             "memory_db": _sz("memory.db"), "knowledge_graph": _sz("knowledge_graph.json"),
             "pids_8899": pids,
             "suite_sha256": suite_hash.hexdigest()[:16],
-            "target_snapshot": {t: {p: tcp_probe(t, p) for p in (88, 445, 3389)} for t in SUITE["targets"]},
+            "target_snapshot": {t: {p: probe_majority(t, p) for p in (88, 445, 3389)} for t in SUITE["targets"]},
         }, indent=1))
 
     for name, ok, note in checks:
@@ -861,11 +884,10 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
     post = run_dir / "state" / "aside-post"
     if pre.exists():
         post.mkdir(exist_ok=True)
+        _aside_copy(Path.home() / ".clearwing", post)
         diffs = []
-        for name in ("memory.db", "knowledge_graph.json"):
-            src = Path.home() / ".clearwing" / name
-            if (pre / name).exists() and src.exists():
-                (post / name).write_bytes(src.read_bytes())
+        for name in ASIDE_FILES:
+            if (pre / name).exists() and (post / name).exists():
                 pre_b, post_b = (pre / name).read_bytes(), (post / name).read_bytes()
                 if pre_b != post_b:
                     diffs.append(f"{name}:{len(pre_b)}->{len(post_b)}B")
@@ -875,8 +897,10 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
     # Single-probe flaps (one lost SYN) would false-FAIL a healthy run, so a
     # difference is re-confirmed up to 3x before it counts (review N4).
     def _probe_confirmed(tgt, port, want_open):
+        # post side: re-probe with majority policy; only a CONFIRMED
+        # difference from the (already majority-confirmed) baseline counts
         for _ in range(3):
-            if bool(tcp_probe(tgt, int(port))) == bool(want_open):
+            if probe_majority(tgt, int(port)) == bool(want_open):
                 return True
             time.sleep(1)
         return False
@@ -1005,8 +1029,8 @@ def _run_dir_facts(d: Path) -> dict:
     import re as _re
     facts = {"path": str(d), "verdict": "?", "cost": None, "seconds": None,
              "failed_gates": [], "scenarios": [], "r3_pending": False}
-    if d.name.endswith("-full") and not (d / "r3-done").exists():
-        facts["r3_pending"] = True
+    if re.search(r"-full(-\d+)?$", d.name) and not (d / "r3-done").exists():
+        facts["r3_pending"] = True   # collision-suffixed …-full-1 counts (Codex #67 r1)
     rp = d / "report.md"
     if rp.exists():
         m = _re.search(r"— (PASS|FAIL|REGRESSION|SKIPPED)", rp.read_text().splitlines()[0])
@@ -1068,8 +1092,12 @@ def cmd_adjudicate(args) -> None:
         if len(body) < 30:
             die("review-record section is empty/too short — the four-lens review "
                 "(REVIEW.md) must be pasted before finalize (SPEC §9 hard rule)")
+        mv = re.search(r"^verdict:[ \t]*(\S+)", text, re.M)
+        if not mv or not mv.group(1).strip():
+            die("final verdict line is empty — set `verdict: PASS|FAIL|REGRESSION|MIXED` "
+                "in the adjudication (export quotes THIS value, not report.md)")
         adj.write_text(text.replace(ADJ_STATUS.format("DRAFT"), ADJ_STATUS.format("FINAL")))
-        log(f"adjudication FINAL: {adj}")
+        log(f"adjudication FINAL: {adj} verdict={mv.group(1).strip()}")
         return
 
     if adj.exists():
@@ -1081,6 +1109,9 @@ def cmd_adjudicate(args) -> None:
         body = re.sub(r"<!--.*?-->", "", m.group(1) if m else "", flags=re.S)
         if len(re.sub(r"[\s#|>*-]", "", body)) >= 30:
             die(f"{adj} already carries a human review record — regenerating would "
+                "destroy it; delete it consciously first (SPEC §2.7)")
+        if re.search(r"^verdict:[ \t]*\S", existing, re.M):
+            die(f"{adj} already carries a human final verdict — regenerating would "
                 "destroy it; delete it consciously first (SPEC §2.7)")
     lines = [
         "# cw-e2e adjudication — round " + time.strftime("%Y-%m-%d %H:%M"), "",
@@ -1108,6 +1139,10 @@ def cmd_adjudicate(args) -> None:
         "| gate | run/scenario | conclusion | evidence | limits |", "|---|---|---|---|---|",
         "", "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)", "",
         "- ", "",
+        "## final verdict (HUMAN — 翻案後的最終判定；未翻案則照抄機器判定)", "",
+        "verdict: ",
+        "<!-- PASS | FAIL | REGRESSION | MIXED(多 run) — finalize 要求非空；export 引用此值而非 report.md -->",
+        "",
         "## review record (四鏡複審輸出 — REVIEW.md；finalize 前必填)", "",
         "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
         "", "## rev2 log", "", "- (rev1 generated)", "",
@@ -1129,9 +1164,14 @@ def cmd_export(args) -> None:
         die("adjudication is still DRAFT — finalize it (non-empty review record "
             "required) before exporting external-facing content")
     facts = _run_dir_facts(d)
+    mv = re.search(r"^verdict:[ \t]*(\S+)", adj.read_text(), re.M)
+    final_verdict = mv.group(1).strip() if mv else facts["verdict"]
+    machine_note = "" if final_verdict == facts["verdict"] else \
+        f" (machine verdict was {facts['verdict']} — adjudicated; see overrides)"
     out = [f"cw-e2e round summary (auto-export {time.strftime('%F %T')} — "
            f"adjudicated, review on record)", "",
-           f"- verdict: **{facts['verdict']}** · ${facts['cost']} · run dir `{facts['path']}`"]
+           f"- verdict: **{final_verdict}**{machine_note} · ${facts['cost']} · "
+           f"run dir `{facts['path']}`"]
     g = json.loads((d / "gates.json").read_text()) if (d / "gates.json").exists() else []
     failed = [x["gate"] for x in g if not x["pass"]]
     out.append(f"- failed gates: {', '.join(failed) or 'none'}"
@@ -1157,8 +1197,14 @@ def cmd_run(args) -> None:
     # P3.4 (tier-aware, review N5): only quick/full contain --base-url
     # scenarios (probe + chaos); deep tiers run via_config/self-instance and
     # a profile-less `verify` preflight stays legal (--force bypasses)
-    if tier_name in ("quick", "full") and not args.force:
-        check_llm_profile()
+    selected = [sc for sc in tier["scenarios"]
+                if not args.only or sc["name"] == args.only]
+    needs_profile = any(
+        sc["type"] == "probe_partial_fill"
+        or (sc["type"] == "chaos" and not sc.get("via_config"))
+        for sc in selected)
+    if needs_profile and not args.force:
+        check_llm_profile()          # scenario-aware (Codex #67 r1): --only fc-approval stays legal
     with SuiteLock():
         run_dir = new_run_dir(tier_name + ("-partial" if args.only else ""))
         log(f"run dir: {run_dir}")

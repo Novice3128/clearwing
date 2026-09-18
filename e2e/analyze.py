@@ -82,7 +82,7 @@ def audit_metrics(sid: str, home: Path) -> dict | None:
             tin += ti
             tout += to
             tcached += tc
-            per_call.append((ti, tc, to))
+            per_call.append((ti, tc, to, e.get("agent") or "main"))
             costs.append(float(d.get("cost_usd") or 0))
     real = (tin - tcached) * PRICING["input"] / 1e6 + tcached * PRICING["cached_input"] / 1e6 \
         + tout * PRICING["output"] / 1e6
@@ -92,23 +92,28 @@ def audit_metrics(sid: str, home: Path) -> dict | None:
             "calls": per_call}
 
 
-def cache_prefix_median(per_call: list[tuple[int, int, int]]) -> float | None:
-    """Median cache ratio over STABLE-PREFIX calls (growth ≤20% vs previous
-    call's input). Growth calls legitimately carry fresh content (scan
-    blobs, compaction rewrites) and are excluded; the first call has no
-    prefix to compare and is excluded too. Aggregate cache% is run-shape
-    dominated (same build measured 54.2% and 98.6%) — the per-call caliber
-    is the regression detector (2026-09-18 four-lens review)."""
+def cache_prefix_median(per_call: list[tuple]) -> float | None:
+    """Median cache ratio over STABLE-PREFIX calls, computed WITHIN each
+    agent context. Contexts are tracked separately (Codex #67 r1 P2): an
+    interleaved 6k uncached operator call must not count as a main-prefix
+    miss, nor must it reset the main line's growth baseline. Growth calls
+    (>20% vs the previous call of the SAME context) legitimately carry
+    fresh content (scan blobs, compaction rewrites) and are excluded;
+    each context's first call has no prefix and is excluded. Aggregate
+    cache% is run-shape dominated (same build measured 54.2% and 98.6%)
+    — the per-call caliber is the regression detector."""
     ratios = []
-    prev_in = None
-    for ti, tc, _to in per_call:
+    prev_in: dict[str, int] = {}
+    for row in per_call:
+        ti, tc, agent = row[0], row[1], (row[3] if len(row) > 3 else "main")
         if ti < 5000:
-            continue            # auxiliary contexts (summarizer/operator, ~450
-                                # tokens) have no shared prefix by design — their
-                                # 0% cache is not degradation (n=2 replay lesson)
-        if prev_in is not None and ti <= prev_in * 1.2:
+            continue            # tiny auxiliary contexts (~450 tokens) have no
+                                # shared prefix by design — 0% cache there is not
+                                # degradation (n=2 replay lesson)
+        prev = prev_in.get(agent)
+        if prev is not None and ti <= prev * 1.2:
             ratios.append(100 * tc / max(ti, 1))
-        prev_in = ti
+        prev_in[agent] = ti
     if len(ratios) < 2:
         return None
     import statistics
@@ -424,7 +429,10 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         samples = int(SUITE["tiers"]["full"].get("analysis", {}).get("fact_check_samples", 0))
     except (KeyError, AttributeError, TypeError, ValueError):
         samples = 0
-    if samples and tier_name == "full" and not (run_dir / "r3-done").exists():
+    r3p = run_dir / "r3-manual.md"
+    # P2-b (Codex #67 r1): a half-filled manual is HUMAN state — re-running
+    # `analyze` must not destroy it; only generate when absent entirely
+    if samples and tier_name == "full" and not r3p.exists() and not (run_dir / "r3-done").exists():
         sids = [sc["summary"].get("session_id") for sc in scenarios
                 if (sc["summary"] or {}).get("session_id")][:samples]
         r3 = [
