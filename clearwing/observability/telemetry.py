@@ -286,6 +286,23 @@ class CostTracker:
         with self._lock:
             return self._session_tokens.get(session_id, (0, 0))
 
+    def session_snapshot(self, session_id: str | None) -> tuple[float, int, int]:
+        """``(cost_usd, input_tokens, output_tokens)`` for *session_id*,
+        read under ONE lock acquisition.
+
+        Frames that report session-scoped totals must show cost and tokens
+        from the same point in time: reading :meth:`session_total` and
+        :meth:`session_tokens` separately lets a concurrent booking land
+        between the two locked reads, producing a frame whose token total
+        includes a call its cost total does not.
+        """
+        if not session_id:
+            return (0.0, 0, 0)
+        with self._lock:
+            cost = self._session_totals.get(session_id, 0.0)
+            in_tokens, out_tokens = self._session_tokens.get(session_id, (0, 0))
+            return (cost, in_tokens, out_tokens)
+
     def forget_session(self, session_id: str | None) -> None:
         """Drop *session_id*'s per-session cost/token entries.
 

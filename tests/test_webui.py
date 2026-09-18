@@ -947,10 +947,11 @@ class TestReportDownloadEndpoint:
 
 
 class _FakeCostGraph:
-    """Stands in for create_agent(): its astream fires COST_UPDATE events on
-    the process-wide bus (the way the real runtime's tracker does) and yields
-    one assistant state event. Emits: own-session call, foreign-session call,
-    own-session call."""
+    """Stands in for create_agent(): its astream books REAL tracker spend
+    under this session's id (the runtime shape — ``record_llm_call`` books
+    under the tracker's lock and then emits the COST_UPDATE frame carrying
+    the process-global running total), plus one foreign-session emission.
+    Emits: own-session call, foreign-session call, own-session call."""
 
     session_id = None
 
@@ -959,32 +960,30 @@ class _FakeCostGraph:
 
     async def astream(self, input_data, config, stream_mode="values"):
         from clearwing.core.events import EventBus, EventType
+        from clearwing.observability.telemetry import CostTracker
 
         del input_data, config, stream_mode
         bus = EventBus()
-        emissions = [
-            (0.01, 1000, 100, self.session_id),
-            (0.02, 2000, 200, "someone-elses-session"),
-            (0.03, 3000, 300, self.session_id),
-        ]
-        for cost, in_, out, origin in emissions:
-            bus.emit(
-                EventType.COST_UPDATE,
-                {
-                    "input_tokens": in_,
-                    "output_tokens": out,
-                    "cached_tokens": 0,
-                    "cost": cost,
-                    # Process-global running total (polluted by other
-                    # sessions in a long-lived webui) — the adapter must
-                    # rewrite this per session (issue #10).
-                    "total_cost_usd": 99.0 + cost,
-                    "model": "glm-5.3",
-                    "provider": "openai",
-                    "session_id": origin,
-                    "elapsed_ms": 10,
-                },
-            )
+        tracker = CostTracker()
+        tracker.record_llm_call(1000, 100, "glm-5.3", session_id=self.session_id)
+        bus.emit(
+            EventType.COST_UPDATE,
+            {
+                "input_tokens": 2000,
+                "output_tokens": 200,
+                "cached_tokens": 0,
+                "cost": 0.02,
+                # Process-global running total (polluted by other
+                # sessions in a long-lived webui) — the adapter must
+                # rewrite this per session (issue #10).
+                "total_cost_usd": 99.02,
+                "model": "glm-5.3",
+                "provider": "openai",
+                "session_id": "someone-elses-session",
+                "elapsed_ms": 10,
+            },
+        )
+        tracker.record_llm_call(3000, 300, "glm-5.3", session_id=self.session_id)
         yield {
             "messages": [SimpleNamespace(type="ai", content="done", text="done")]
         }
@@ -993,6 +992,11 @@ class _FakeCostGraph:
 class TestCostSessionScoping:
     def test_cost_update_frames_are_session_scoped(self, client):
         import json
+
+        from clearwing.observability.telemetry import CostTracker
+
+        call1 = CostTracker.estimate_cost(1000, 100, "glm-5.3")
+        call2 = CostTracker.estimate_cost(3000, 300, "glm-5.3")
 
         with patch("clearwing.ui.web.app.create_agent", _FakeCostGraph):
             with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
@@ -1009,16 +1013,25 @@ class TestCostSessionScoping:
         # The foreign session's frame never reaches this socket at all —
         # only this session's two own frames do.
         assert len(cost_frames) == 2
-        # Session-scoped totals replace the tracker's process-global ones.
-        assert cost_frames[0]["data"]["total_cost_usd"] == pytest.approx(0.01)
-        assert cost_frames[1]["data"]["total_cost_usd"] == pytest.approx(0.04)
+        # Session-scoped totals replace the tracker's process-global ones:
+        # the tracker-authoritative snapshot (Codex PR-62 r3) after each
+        # booked call.
+        assert cost_frames[0]["data"]["total_cost_usd"] == pytest.approx(call1)
+        assert cost_frames[1]["data"]["total_cost_usd"] == pytest.approx(call1 + call2)
         assert cost_frames[1]["data"]["total_tokens"] == 4400
         # Per-call fields and attribution ride along untouched.
-        assert cost_frames[1]["data"]["cost"] == 0.03
+        assert cost_frames[1]["data"]["cost"] == pytest.approx(call2)
         assert cost_frames[1]["data"]["model"] == "glm-5.3"
 
     def test_session_report_carries_scoped_totals(self, client):
         import json
+
+        from clearwing.observability.telemetry import CostTracker
+
+        expected = sum(
+            CostTracker.estimate_cost(tokens, out, "glm-5.3")
+            for tokens, out in ((1000, 100), (3000, 300))
+        )
 
         with patch("clearwing.ui.web.app.create_agent", _FakeCostGraph):
             with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
@@ -1033,13 +1046,18 @@ class TestCostSessionScoping:
 
         report_url = complete["data"]["report_url"]
         report = client.get(report_url, headers=AUTH).text
-        # Session-scoped cost (0.01 + 0.03) and session-scoped tokens
-        # (4400) — not the last call's per-call token count.
-        assert "| Cost | $0.0400 |" in report
+        # Session-scoped cost (the tracker snapshot over both booked
+        # calls) and session-scoped tokens (4400) — not the last call's
+        # per-call token count.
+        assert f"| Cost | ${expected:.4f} |" in report
         assert "| Tokens | 4400 |" in report
 
     def test_second_start_rearms_session_totals(self, client):
         import json
+
+        from clearwing.observability.telemetry import CostTracker
+
+        first_call = CostTracker.estimate_cost(1000, 100, "glm-5.3")
 
         with patch("clearwing.ui.web.app.create_agent", _FakeCostGraph):
             with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
@@ -1054,10 +1072,15 @@ class TestCostSessionScoping:
                         if msg["type"] == "complete":
                             break
                 # Both rounds start from a fresh budget: each session's
-                # first frame is 0.01/1100, not the previous session's tail.
-                # (2 frames per round — the foreign frame is dropped.)
-                assert first_costs[0]["data"]["total_cost_usd"] == pytest.approx(0.01)
-                assert first_costs[2]["data"]["total_cost_usd"] == pytest.approx(0.01)
+                # first frame reflects only its own first booked call,
+                # not the previous session's tail. (2 frames per round —
+                # the foreign frame is dropped.)
+                assert first_costs[0]["data"]["total_cost_usd"] == pytest.approx(
+                    first_call
+                )
+                assert first_costs[2]["data"]["total_cost_usd"] == pytest.approx(
+                    first_call
+                )
                 assert first_costs[2]["data"]["total_tokens"] == 1100
 
 
@@ -1437,8 +1460,8 @@ class TestCompleteFrameTruth:
 
 
 class TestPumpResilience:
-    """#11: a transient send failure must not kill the event pump for the
-    rest of the session."""
+    """#11: a transient send failure must not kill the outbound writer for
+    the rest of the session."""
 
     def test_pump_survives_transient_send_failure(self, client, monkeypatch):
         import asyncio
@@ -1447,16 +1470,18 @@ class TestPumpResilience:
 
         monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
 
-        real_send_json = FastAPIWebSocket.send_json
+        # Since #45 every frame leaves via the single writer's send_text
+        # (pre-serialized JSON), so the flaky transport is injected there.
+        real_send_text = FastAPIWebSocket.send_text
         calls = {"n": 0}
 
-        async def flaky_send_json(self_ws, data, mode="text"):
+        async def flaky_send_text(self_ws, data):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("transient send failure")
-            return await real_send_json(self_ws, data, mode=mode)
+            return await real_send_text(self_ws, data)
 
-        monkeypatch.setattr(FastAPIWebSocket, "send_json", flaky_send_json)
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", flaky_send_text)
 
         class _EmittingSlowGraph:
             def __init__(self, **kwargs):

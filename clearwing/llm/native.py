@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import urljoin
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import jsonschema
@@ -149,6 +149,63 @@ _LAST_FINISH_REASON: ContextVar[str | None] = ContextVar("last_finish_reason", d
 def last_finish_reason() -> str | None:
     """Provider finish/stop reason for the last completion in this Task."""
     return _LAST_FINISH_REASON.get()
+
+
+# Advice appended to pathless-base_url warnings and 404 errors (issue #60).
+# Deliberately actionable, not fail-fast: root-mounted gateways are legal,
+# so we never rewrite the URL or refuse to construct — we tell the operator
+# what to change when the endpoint 404s.
+_PATHLESS_BASE_URL_ADVICE = (
+    "has no path component; requests will hit /chat/completions at the host "
+    "root. Most OpenAI-compatible gateways serve /v1 — set the full path "
+    "(e.g. http://host:8787/v1) if a 404 occurs."
+)
+
+
+def _url_for_path(base: str, path: str) -> str:
+    """Join *base* and *path* with exactly one ``/`` (codex-rs parity).
+
+    Right-trims slashes off *base*, left-trims them off *path*, and joins
+    with a single separator — unlike ``urljoin`` this never re-interprets
+    the base (``http://h/v1`` and ``http://h/v1/`` both yield
+    ``http://h/v1/chat/completions``). An empty *path* returns *base*
+    unchanged, so callers passing a fully-resolved URL are inert.
+
+    A *base* carrying a query or fragment is NOT supported: the query is
+    not stripped and rides along verbatim (garbage in, garbage out).
+    """
+    if not path:
+        return base
+    return f"{base.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _is_pathless_base_url(base_url: str) -> bool:
+    """True when *base_url* carries no path component.
+
+    ``""``, ``"/"`` and ``"//"`` all count: a host followed by any number
+    of bare slashes still mounts endpoints at the host root.
+    """
+    return urlparse(base_url).path.strip("/") == ""
+
+
+def _redact_url_credentials(url: str) -> str:
+    """Display-only form of *url* safe for warnings and error messages.
+
+    aiohttp honors userinfo in the request URL as HTTP basic auth, so the
+    real request path keeps the original *url* — this helper exists solely
+    for logs and error text, where embedded credentials must not leak.
+    The display form is ALWAYS rebuilt from scheme/host/port/path: any
+    ``user:pass@`` userinfo is stripped AND query/fragment are dropped —
+    even without userinfo a query can carry a credential (presigned
+    gateway URLs like ``https://host?api_key=secret``), so a parsed URL
+    is never returned as-is.
+    """
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return url
+    hostinfo = parts.netloc.rsplit("@", 1)[1] if "@" in parts.netloc else parts.netloc
+    return urlunparse((parts.scheme, hostinfo, parts.path, "", "", ""))
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -588,6 +645,29 @@ class AsyncLLMClient:
         self.base_url = base_url
         self.pricing = pricing
         self._default_headers: dict[str, str] | None = None
+
+        # Issue #60: an openai chat-completions base_url with no path
+        # component (http://host:8787) makes every request hit
+        # /chat/completions at the host root, which most OpenAI-compatible
+        # gateways 404 (they serve /v1). Detection lives HERE — every
+        # endpoint source (CLI flags, CLEARWING_* env, config.yaml, the
+        # manager's default branch) funnels through this constructor — and
+        # it is a warning only: a gateway genuinely mounted at the root
+        # keeps working exactly as before. Other adapter families
+        # (openai_resp/openai_codex/ollama/gemini/anthropic*) build their
+        # URLs the same base-plus-fixed-path way; they are exempt only
+        # because custom pathless gateway configs are rare there (the
+        # ollama preset is pathless by design).
+        if (
+            provider_name == "openai"
+            and self.base_url
+            and _is_pathless_base_url(self.base_url)
+        ):
+            logger.warning(
+                "base_url %r %s",
+                _redact_url_credentials(self.base_url),
+                _PATHLESS_BASE_URL_ADVICE,
+            )
 
         # `openai_codex` is clearwing's label for the OAuth-authenticated
         # Responses API (the ChatGPT "Codex CLI" flow). It's not a distinct
@@ -1537,10 +1617,7 @@ class AsyncLLMClient:
         if self._default_headers:
             headers.update(self._default_headers)
 
-        url = urljoin(
-            self.base_url if self.base_url.endswith("/") else f"{self.base_url}/",
-            "chat/completions",
-        )
+        url = _url_for_path(self.base_url or "", "chat/completions")
         timeout = aiohttp.ClientTimeout(
             total=_LLM_TOTAL_TIMEOUT_SECONDS,
             sock_connect=min(30.0, _LLM_CONNECT_TIMEOUT_SECONDS),
@@ -2025,6 +2102,11 @@ class AsyncLLMClient:
                             exc._clearwing_attempts = attempt  # type: ignore[attr-defined]
                         except Exception:
                             pass
+                    # Single choke point for every transport's terminal
+                    # raise (native genai and the aiohttp fallback alike,
+                    # issue #60): a 404 from a pathless base_url gets the
+                    # actionable advice appended to its message.
+                    self._annotate_pathless_404(exc)
                     raise
                 if is_billable_ambiguous and (
                     self._spend_ledger is not None and self._spend_ledger.enforcing
@@ -2226,6 +2308,70 @@ class AsyncLLMClient:
         if self._SERVER_STATUS_ANCHOR.search(text):
             return True
         return any(phrase in text for phrase in self._SERVER_ERROR_PHRASES)
+
+    # Issue #60: same anchored-marker discipline as the 5xx classifier, but
+    # for the terminal (never retried) 404 that a pathless base_url usually
+    # produces. The anchor keeps a bare "404" inside a response body from
+    # classifying — the STATUS must match, not the digits.
+    _NOT_FOUND_STATUS_ANCHOR = re.compile(
+        r"(?:status(?:\s*code)?|http|error(?:\s*code)?)\s*[:=]?\s*['\"]?404\b",
+        re.IGNORECASE,
+    )
+
+    def _is_not_found_error(self, exc: Exception) -> bool:
+        """True for HTTP 404 failures — structured attrs, then anchored text.
+
+        Structured statuses are AUTHORITATIVE (Codex PR-62 r3): every
+        status/status_code/http_status on the chain is collected first,
+        and when ANY exists the verdict is exactly "some layer says 404"
+        — an explicit 400/500 must not be misclassified by body text
+        that happens to mention "HTTP 404". The anchored-text fallback
+        only runs when the chain carries no structured status at all.
+        """
+        cur: BaseException | None = exc
+        seen: set[int] = set()
+        statuses: list[int | str] = []
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            for attr in ("status", "status_code", "http_status"):
+                value = getattr(cur, attr, None)
+                # bool is an int subclass but is not a status (kept from
+                # the original guard).
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, str)):
+                    statuses.append(value)
+            cur = cur.__cause__ or cur.__context__
+        if statuses:
+            return any(s == 404 or s == "404" for s in statuses)
+        return bool(self._NOT_FOUND_STATUS_ANCHOR.search(_exception_chain_text(exc)))
+
+    def _annotate_pathless_404(self, exc: Exception) -> None:
+        """Append the pathless-base_url advice to a 404 error (issue #60).
+
+        Only fires for the openai chat-completions adapter whose base_url
+        has no path component, and only on the final (non-retried) raise —
+        404 semantics stay exactly as they were. Best-effort: a message
+        mutation must never break the raise path.
+        """
+        if self.provider_name != "openai" or not self.base_url:
+            return
+        if not _is_pathless_base_url(self.base_url):
+            return
+        if not self._is_not_found_error(exc):
+            return
+        try:
+            text = str(exc)
+            if _PATHLESS_BASE_URL_ADVICE in text:
+                return
+            exc.args = (
+                f"{text} (base_url {_redact_url_credentials(self.base_url)!r} "
+                f"{_PATHLESS_BASE_URL_ADVICE})",
+            )
+        except Exception:
+            logger.debug(
+                "Failed to annotate 404 with pathless base_url advice", exc_info=True
+            )
 
 # Transport failures where the request never completed a round-trip, so the
 # provider never generated (and never billed) — safe to retry. These come
