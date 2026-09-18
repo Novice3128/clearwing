@@ -67,6 +67,7 @@ def audit_metrics(sid: str, home: Path) -> dict | None:
         return None
     calls = tin = tout = tcached = 0
     costs = []
+    per_call: list[tuple[int, int, int]] = []      # (input, cached, output)
     for line in f.read_text().splitlines():
         try:
             e = json.loads(line)
@@ -75,22 +76,50 @@ def audit_metrics(sid: str, home: Path) -> dict | None:
         if e.get("event_type") == "llm_call":
             calls += 1
             d = e.get("details") or {}
-            tin += int(d.get("input_tokens") or 0)
-            tout += int(d.get("output_tokens") or 0)
-            tcached += int(d.get("cached_tokens") or 0)
+            ti = int(d.get("input_tokens") or 0)
+            tc = int(d.get("cached_tokens") or 0)
+            to = int(d.get("output_tokens") or 0)
+            tin += ti
+            tout += to
+            tcached += tc
+            per_call.append((ti, tc, to))
             costs.append(float(d.get("cost_usd") or 0))
     real = (tin - tcached) * PRICING["input"] / 1e6 + tcached * PRICING["cached_input"] / 1e6 \
         + tout * PRICING["output"] / 1e6
     return {"llm_calls": calls, "tokens_in": tin, "tokens_out": tout, "tokens_cached": tcached,
             "audit_cost_sum": round(sum(costs), 4), "real_cost_cache_aware": round(real, 4),
-            "no_cache_upper_bound": round((tin * PRICING["input"] + tout * PRICING["output"]) / 1e6, 4)}
+            "no_cache_upper_bound": round((tin * PRICING["input"] + tout * PRICING["output"]) / 1e6, 4),
+            "calls": per_call}
+
+
+def cache_prefix_median(per_call: list[tuple[int, int, int]]) -> float | None:
+    """Median cache ratio over STABLE-PREFIX calls (growth ≤20% vs previous
+    call's input). Growth calls legitimately carry fresh content (scan
+    blobs, compaction rewrites) and are excluded; the first call has no
+    prefix to compare and is excluded too. Aggregate cache% is run-shape
+    dominated (same build measured 54.2% and 98.6%) — the per-call caliber
+    is the regression detector (2026-09-18 four-lens review)."""
+    ratios = []
+    prev_in = None
+    for ti, tc, _to in per_call:
+        if ti < 5000:
+            continue            # auxiliary contexts (summarizer/operator, ~450
+                                # tokens) have no shared prefix by design — their
+                                # 0% cache is not degradation (n=2 replay lesson)
+        if prev_in is not None and ti <= prev_in * 1.2:
+            ratios.append(100 * tc / max(ti, 1))
+        prev_in = ti
+    if len(ratios) < 2:
+        return None
+    import statistics
+    return statistics.median(ratios)
 
 
 # ------------------------------------------------------------- gates ------
 
 def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
              hud: dict | None, expect: dict | None = None,
-             flag_baseline: int | None = None) -> list[dict]:
+             flag_max: int | None = None) -> list[dict]:
     """Gate evaluation. severity policy (SPEC §4, aligned after review):
     reconcile / audit-completeness / cache gates are HARD (they were 'ratio'
     before — breaches could not flip the verdict, which contradicted SPEC).
@@ -125,9 +154,27 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
 
     cache_pct = 100 * summary.get("tokens_cached", 0) / max(summary.get("tokens_in", 1), 1)
     if tier_name == "full" and summary.get("tokens_in", 0) > 100000:
-        add("cache-nonzero", cache_pct > 1, f"cache={cache_pct:.1f}%")
-        add("cache-min", cache_pct >= SUITE["thresholds"]["ratio"]["cache_min_pct"],
-            f"cache={cache_pct:.1f}%")
+        # aggregate cache% stays as a liveness check only — the regression
+        # detector is the per-call caliber below (four-lens review: same
+        # build measured 54.2% and 98.6% aggregate)
+        add("cache-nonzero", cache_pct > 1, f"cache={cache_pct:.1f}% (aggregate, shape-dependent)")
+    if audit and audit.get("calls"):
+        med = cache_prefix_median(audit["calls"])
+        if med is not None:
+            add("cache-prefix-median",
+                med >= SUITE["thresholds"]["hard"].get("cache_prefix_median_min", 90),
+                f"prefix-median={med:.1f}% want>="
+                f"{SUITE['thresholds']['hard'].get('cache_prefix_median_min', 90)}% "
+                f"(aggregate {cache_pct:.1f}% is informational)")
+        # degenerate-output detector (t3-warm-chain-2: 23.7k-in, 0% cache,
+        # 3-token reply — silently passed the old >100k-bound gates). Caliber
+        # = CALL signature, not session totals: warm-chain-1/-3 legitimately
+        # end with 3-token replies ON FULL CACHE (94%/99.8%) — terse-but-
+        # cached is healthy recall behavior (review N3 replay lesson)
+        tiny = [c for c in audit["calls"] if c[0] > 10000 and c[1] == 0 and c[2] < 10]
+        add("degenerate-output", not tiny,
+            f"degenerate_calls={len(tiny)} "
+            "(a >10k-in, 0-cache call replying <10 tokens)")
     if summary.get("cost_updates"):
         if audit is None:
             # Metered LLM spend with NO audit trail used to skip both the
@@ -147,11 +194,14 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
                 f"cost_updates={summary['cost_updates']} vs audit_calls={audit['llm_calls']}"
                 + (f" — MISSING {missing} llm_call(s) from audit" if missing > 0 else ""))
 
-    if flag_baseline is not None and tier_name == "full":
+    if flag_max is not None and tier_name == "full":
         faces = summary.get("flag_faces")
         if faces is not None:
-            add("flag-faces-baseline", faces <= flag_baseline,
-                f"faces={faces} baseline={flag_baseline} (#35-family false-flag drift)")
+            # baseline 9 measured same-build spread 8↔14 (2026-09-18) — a
+            # hard <=9 gate flagged pure #35-family volatility; the range
+            # keeps the drift ceiling without the noise
+            add("flag-faces-max", faces <= flag_max,
+                f"faces={faces} max={flag_max} (observed same-build spread 8-14)")
     if hud and hud.get("type") == "hud":
         add("hud-render-match", hud.get("pass", False), str(hud))
 
@@ -235,9 +285,9 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         cj = run_dir / "cleanup.json"
         if cj.exists():
             cleanup = [tuple(x) for x in json.loads(cj.read_text())]
-    flag_baseline = None
+    flag_max = None
     try:
-        flag_baseline = SUITE["tiers"]["full"].get("analysis", {}).get("flag_baseline")
+        flag_max = SUITE["tiers"]["full"].get("analysis", {}).get("flag_max", 15)
     except (KeyError, AttributeError):
         pass
     all_gates: list[dict] = []
@@ -251,7 +301,7 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         audit = audit_metrics(sid, s.get("home") or home_default) if sid else None
         if s.get("invariants") is not None:      # real WS run — full gate set
             gates = evaluate(s, fm, tier_name, audit, None,
-                             expect=sc.get("expect"), flag_baseline=flag_baseline)
+                             expect=sc.get("expect"), flag_max=flag_max)
         elif s.get("status") in ("skipped", "crashed"):
             gates = evaluate(s, fm, tier_name, None, None)
         else:                                     # probe/hud/cli/pytest — pass/fail only
@@ -291,7 +341,12 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         if not ok:
             all_gates.append({"gate": f"cleanup-{name}", "pass": False,
                               "severity": "hard", "detail": str(note)[:100]})
-    all_gates.extend(trend_gate(ledger, previous_full(run_dir)))
+    if "-partial" in run_dir.name:
+        all_gates.append({"gate": "baseline", "pass": True, "severity": "trend",
+                          "detail": "partial run (--only) — trend gates suppressed "
+                          "(subset vs whole-tier baseline is not comparable)"})
+    else:
+        all_gates.extend(trend_gate(ledger, previous_full(run_dir)))
     # frame-type census: NEW frame types from product features become VISIBLE here
     census: dict[str, int] = {}
     for sc in scenarios:
@@ -309,6 +364,14 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
     # REGRESSION — a ±30%-band breach rendered as clean PASS lost the
     # outcome class entirely (Codex r1).
     overall = "FAIL" if hard_fail else ("REGRESSION" if trend_fail else "PASS")
+    if hard_fail and "-partial" not in run_dir.name:
+        # §9 trigger hint: a FAIL re-adjudicated to non-regression is exactly
+        # the "判定翻案" review case, and any external posting needs the
+        # review first — the adjudication/export layer enforces it.
+        lines_hint = ("\n> §9 觸發：本 run 有 hard-gate FAIL。任何翻案判定或對外輸出前，"
+                      "先 `cw-e2e adjudicate <run-dir>` 完成複審紀錄（export 會強制檢查）。\n")
+    else:
+        lines_hint = ""
     partial = "-partial" in run_dir.name
     try:
         suite_sha = json.loads((run_dir / "state/pre-state.json").read_text()).get("suite_sha256", "?")
@@ -330,6 +393,7 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         f"${(ledger['tokens_in'] * PRICING['input'] + ledger['tokens_out'] * PRICING['output']) / 1e6:.2f}"
         f" · tokens in/out {ledger['tokens_in']:,}/{ledger['tokens_out']:,} · wall {ledger['seconds']}s",
         f"- verdict: **{overall}** — {verdict_line}",
+        lines_hint,
         "",
         "| scenario | sid | s | statuses | err | $ | cache% | dup | late | flags | mem | failed gates |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
@@ -353,6 +417,32 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
               "judgements carry limits (n, warm/cold, scope)._"]
     (run_dir / "report.md").write_text("\n".join(lines) + "\n")
     (run_dir / "gates.json").write_text(json.dumps(all_gates, indent=1))
+    # P4.1 R3 manual fact-check template — suite.yaml's fact_check_samples
+    # promised this since v1 but nothing consumed it (four-lens review G2).
+    # Completion marker: `touch <run_dir>/r3-done`; adjudicate surfaces it.
+    try:
+        samples = int(SUITE["tiers"]["full"].get("analysis", {}).get("fact_check_samples", 0))
+    except (KeyError, AttributeError, TypeError, ValueError):
+        samples = 0
+    if samples and tier_name == "full" and not (run_dir / "r3-done").exists():
+        sids = [sc["summary"].get("session_id") for sc in scenarios
+                if (sc["summary"] or {}).get("session_id")][:samples]
+        r3 = [
+            "# R3 人工抽核（Full）— " + run_dir.name, "",
+            "> 完成抽核後 `touch " + str(run_dir / "r3-done") + "`；",
+            "> adjudicate 對發版級宣稱（Full×2＋deep-cold）檢查此標記。", "",
+            "## 待抽核報告（samples=" + str(samples) + "）", "",
+        ]
+        for sid in sids:
+            r3.append(f"- sid `{sid}` → `~/.clearwing/results/sessions/{sid}/report.md`")
+        r3 += [
+            "", "## 抽核欄位（v3 fp-verification 紀律）", "",
+            "1. 執行摘要數字 vs 工具活動表（tool calls/errors/cost 對拍）",
+            "2. CVE/弱點聲稱的證據抽樣（宣稱 vs frames.jsonl 工具輸出）",
+            "3. 權限/結果聲稱與卡點誠實性", "",
+            "## 紀錄", "", "- （填寫後 touch r3-done）", "",
+        ]
+        (run_dir / "r3-manual.md").write_text("\n".join(r3))
     _log(f"report: {run_dir / 'report.md'} — overall {overall} "
          f"({len(hard_fail)} hard failures, {sum(1 for g in all_gates if not g['pass'])} total failed)")
     return {"overall": overall, "gates": all_gates}
