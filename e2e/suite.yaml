@@ -27,10 +27,9 @@ thresholds:
   hard:
     dup_pairs_max: 0
     late_frames_max: 0
-    cache_zero_fail: true         # Full only
+    cache_prefix_median_min: 90   # per-call stable-prefix median (regression caliber)
   ratio:
     reconcile_max_pct: 0.5        # audit x PRICING vs meter
-    cache_min_pct: 80             # Full only
   trend:
     duration_band_pct: 30
     cost_band_pct: 30
@@ -103,7 +102,7 @@ tiers:
       - {name: probe-partial-fill, type: probe_partial_fill}
       - {name: report-cli, type: report_cli}
     analysis:
-      flag_baseline: 9            # hex32 false-flag faces observed 2026-09-17 (gate: flag-faces-baseline)
+      flag_max: 15                 # same-build spread 8-14 observed 2026-09-18; baseline 9 kept as history
       fact_check_samples: 3       # MANUAL R3 report fact-check (not automated)
 
   deep-cold:

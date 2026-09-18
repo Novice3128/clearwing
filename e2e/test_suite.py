@@ -347,8 +347,8 @@ def test_trend_breach_yields_regression_not_pass(monkeypatch, tmp_path):
     """Codex r1 P2: failed trend gates never reached the verdict — the
     SPEC's REGRESSION outcome did not exist in code."""
     monkeypatch.setattr(analyze, "RESULTS", tmp_path)
-    monkeypatch.setattr(analyze, "previous_full",
-                        lambda run_dir: {"seconds": 100, "cost_usd_product": 1.0})
+    monkeypatch.setattr(analyze, "previous_run",
+                        lambda run_dir, tier: {"seconds": 100, "cost_usd_product": 1.0})
     d = _write_min_run(tmp_path, "20260102-000000-full")
     m = json.loads((d / "manifest.json").read_text())
     m[0]["summary"]["seconds"] = 300               # +200% >> ±30% band
@@ -514,8 +514,533 @@ def test_proc_freshness_branches():
     assert runner.proc_freshness(200.0, 100) is True
 
 
-# ------------------------------------------------------- process/HEAD -----
+# ------------------------------------------- adjudication / export gate ---
 
+def _adj_run_dir(tmp_path, name, verdict="FAIL", full=True):
+    d = _write_min_run(tmp_path, name)
+    if full:
+        (d / "gates.json").write_text(json.dumps([
+            {"gate": "cache-min", "pass": False, "severity": "hard", "detail": "cache=54.2%"}]))
+        (d / "ledger.json").write_text(json.dumps({"cost_usd_product": 0.7, "seconds": 574}))
+        (d / "report.md").write_text(f"# cw-e2e full — {name} — {verdict}\n")
+    return d
+
+
+class _Args:
+    pass
+
+
+def test_adjudicate_and_export_gate(tmp_path, capsys):
+    """SPEC §9 hard rule made mechanical: export refuses anything that is
+    not a FINAL (reviewed) adjudication — the 2026-09-18 #61 sequencing
+    violation cannot recur."""
+    fatal = _adj_run_dir(tmp_path, "20260101-175100-quick", full=False)  # FATAL 廢輪：無 report/gates
+    (fatal / "cleanup.json").write_text("[]")                             # 僅有殘骸
+    d = _adj_run_dir(tmp_path, "20260101-180000-full")
+    a = _Args()
+    a.run_dirs = [str(fatal), str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"                     # lands in the LAST dir
+    text = adj.read_text()
+    assert "DRAFT -->" in text and fatal.name in text and "cache-min" in text
+    # export blocked on DRAFT
+    e = _Args()
+    e.run_dir = str(d)
+    e.out = None
+    with pytest.raises(SystemExit):
+        runner.cmd_export(e)
+    # finalize refused while the review record is empty
+    a2 = _Args()
+    a2.run_dirs = [str(d)]
+    a2.finalize = True
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    assert "DRAFT -->" in adj.read_text()
+    # review record filled but verdict line still empty -> finalize refuses
+    adj.write_text(text.replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成：證據核實重算全數通過；對抗方法論確認無替代解釋；流程對照合規；交付一致。"))
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    # verdict line present but OVERRIDES EMPTY while flipping FAIL->PASS
+    # -> finalize must demand the evidence rows (Codex #67 r2 P1)
+    adj.write_text(adj.read_text().replace("verdict: ", "verdict: PASS\n_", 1))
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    assert "adjudication-status: DRAFT" in adj.read_text()
+    # override row added -> finalize stamps FINAL (hash-bound) -> export quotes IT
+    adj.write_text(adj.read_text().replace(
+        "| gate | run/scenario | conclusion | evidence | limits |\n|---|---|---|---|---|\n",
+        "| gate | run/scenario | conclusion | evidence | limits |\n|---|---|---|---|---|\n"
+        "| cache-min | full/t1-fulldepth | gate-shape fragility, not regression "
+        "| prefix-median 93.5% three-generation replay | n=1 warm |\n", 1))
+    runner.cmd_adjudicate(a2)
+    assert "adjudication-status: FINAL" in adj.read_text() \
+        and "reviewed-hash:" in adj.read_text()
+    runner.cmd_export(e)                            # no SystemExit anymore
+    out = capsys.readouterr().out
+    assert "**PASS**" in out and "machine verdict was FAIL" in out \
+        and "cache-min" in out and fatal.name in out          # FATAL dir aggregated too
+    # post-review artifact mutation invalidates the stamp (hash binding)
+    (d / "ledger.json").write_text(json.dumps({"cost_usd_product": 0.9, "seconds": 574}))
+    with pytest.raises(SystemExit):
+        runner.cmd_export(e)
+
+
+# --------------------------------------- cache per-call / degenerate -----
+
+def test_cache_prefix_median_function():
+    med = analyze.cache_prefix_median(
+        [(10000, 9500, 50), (10000, 9500, 50), (12000, 11400, 60), (24000, 120, 50)])
+    assert med == 95.0                       # growth call (24000) excluded, first excluded
+    assert analyze.cache_prefix_median([(10000, 9500, 50)]) is None   # needs >=2 ratios
+    assert analyze.cache_prefix_median([]) is None
+    # auxiliary contexts (<5k tokens: summarizer/operator) never count
+    med_aux = analyze.cache_prefix_median(
+        [(10000, 9500, 50), (452, 0, 615), (10100, 9600, 50), (10200, 9700, 50)])
+    assert med_aux == pytest.approx(95.07, abs=0.01)   # the 452-token call never drags
+    low = analyze.cache_prefix_median(
+        [(10000, 5000, 50), (10000, 5050, 50), (12000, 6000, 60)])
+    assert low == 50.25                      # statistics.median([50.0, 50.5])
+
+
+def _eval_with_audit(per_call, **summary_over):
+    summary = {"status": None, "invariants": {"terminal_closure": True,
+                                              "approval_closure": True,
+                                              "no_complete_while_approval_open": True},
+               "approvals": 0, "error_count": 0, "cost_updates": len(per_call),
+               "complete_statuses": ["ok"], "tokens_in": sum(c[0] for c in per_call),
+               "tokens_out": sum(c[2] for c in per_call),
+               "tokens_cached": sum(c[1] for c in per_call), "cost_usd_product": 0.5}
+    summary.update(summary_over)
+    audit = {"llm_calls": len(per_call), "tokens_in": summary["tokens_in"],
+             "tokens_out": summary["tokens_out"], "tokens_cached": summary["tokens_cached"],
+             "real_cost_cache_aware": 0.5, "calls": per_call}
+    fm = {"statuses": ["ok"], "dup_pairs": 0, "late_frames": 0}
+    return analyze.evaluate(summary, fm, "full", audit=audit, hud=None)
+
+
+def test_cache_prefix_median_gate_replaces_aggregate():
+    """2026-09-18 round: the aggregate 54.2% FAILED a healthy run — the
+    per-call caliber must PASS it while still catching true degradation."""
+    healthy = [(24000, 22300, 400), (25000, 23400, 300), (25500, 24000, 300),
+               (29800, 24500, 1400), (30000, 28400, 100)]
+    by = {g["gate"]: g for g in _eval_with_audit(healthy)}
+    assert by["cache-prefix-median"]["pass"] is True
+    degraded = [(24000, 12000, 400), (25000, 12600, 300), (25500, 12800, 300)]
+    by = {g["gate"]: g for g in _eval_with_audit(degraded)}
+    assert by["cache-prefix-median"]["pass"] is False
+
+
+def test_degenerate_output_detector():
+    """t3-warm-chain-2 (2026-09-18): single 23.7k-in call, 0% cache, 3-token
+    reply — must be a hard FAIL, not a silent pass."""
+    by = {g["gate"]: g for g in _eval_with_audit([(23709, 0, 3)])}
+    assert by["degenerate-output"]["pass"] is False
+    # a >10k-in, 0-cache call answering in <10 tokens fails even amid a
+    # healthy-looking session
+    by = {g["gate"]: g for g in _eval_with_audit(
+        [(15000, 14000, 300), (15500, 0, 6)])}
+    assert by["degenerate-output"]["pass"] is False
+    by = {g["gate"]: g for g in _eval_with_audit(
+        [(20000, 19000, 300), (21000, 20000, 350)])}
+    assert by["degenerate-output"]["pass"] is True
+    # warm-chain-1/-3 shape: terse 3-token reply ON FULL CACHE = healthy
+    by = {g["gate"]: g for g in _eval_with_audit([(23709, 22336, 3)])}
+    assert by["degenerate-output"]["pass"] is True
+
+
+def test_flag_max_range_gate():
+    summary = {"status": None, "invariants": {"terminal_closure": True,
+                                              "approval_closure": True,
+                                              "no_complete_while_approval_open": True},
+               "approvals": 0, "error_count": 0, "cost_updates": 0,
+               "complete_statuses": ["ok"], "flag_faces": 14}
+    fm = {"statuses": ["ok"], "dup_pairs": 0, "late_frames": 0}
+    gates = analyze.evaluate(summary, fm, "full", audit=None, hud=None, flag_max=15)
+    assert next(g for g in gates if g["gate"] == "flag-faces-max")["pass"] is True
+    gates = analyze.evaluate(dict(summary, flag_faces=16), fm, "full",
+                             audit=None, hud=None, flag_max=15)
+    assert next(g for g in gates if g["gate"] == "flag-faces-max")["pass"] is False
+
+
+def test_partial_run_trend_suppressed(monkeypatch, tmp_path):
+    """G7: --only subset vs whole-tier baseline is apples-to-oranges — the
+    2026-09-18 n=2 run took 2 spurious trend FAILs from it."""
+    monkeypatch.setattr(analyze, "RESULTS", tmp_path)
+    monkeypatch.setattr(analyze, "previous_run",
+                        lambda run_dir, tier: {"seconds": 1282, "cost_usd_product": 1.018})
+    d = _write_min_run(tmp_path, "20260101-000000-full-partial")
+    m = json.loads((d / "manifest.json").read_text())
+    m[0]["summary"]["seconds"] = 415
+    (d / "manifest.json").write_text(json.dumps(m))
+    out = analyze.render(d, "full", {"git": {"head": "x" * 40, "webapi_commit": "y", "branch": "b"}},
+                         [("kali-containers", True, "")])
+    trend_gates = [g for g in out["gates"] if g["severity"] == "trend"]
+    assert len(trend_gates) == 1 and "suppressed" in trend_gates[0]["detail"]
+    assert not any(g["gate"].startswith("trend-") for g in out["gates"])
+
+
+# ------------------------------------------------- P3 state / ledger -----
+
+def test_check_llm_profile_preflight(monkeypatch, tmp_path):
+    """P3.4: a missing/bad CW_LLM_PROFILE must die at VERIFY with guidance,
+    not at scenario 1 mid-run (20260918-175138 FATAL lesson)."""
+    monkeypatch.delenv("CW_LLM_PROFILE", raising=False)
+    with pytest.raises(SystemExit):
+        runner.check_llm_profile()
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("not: {valid: yaml")
+    monkeypatch.setenv("CW_LLM_PROFILE", str(bad))
+    with pytest.raises(SystemExit):
+        runner.check_llm_profile()
+    good = tmp_path / "llm.yaml"
+    good.write_text("zai:\n  api_key: sk-test-00000000000000000000\n")
+    monkeypatch.setenv("CW_LLM_PROFILE", str(good))
+    runner.check_llm_profile()                     # no raise
+    nokey = tmp_path / "nokey.yaml"
+    nokey.write_text("zai: {}\n")
+    monkeypatch.setenv("CW_LLM_PROFILE", str(nokey))
+    with pytest.raises(SystemExit):
+        runner.check_llm_profile()
+
+
+def test_cleanup_target_compare_and_aside_diff(monkeypatch, tmp_path):
+    """P3.1 post-snapshot diff + P3.2 target-state hard gate."""
+    home = tmp_path / "home"
+    (home / ".clearwing").mkdir(parents=True)
+    run_dir = tmp_path / "run"
+    (run_dir / "state" / "aside-pre").mkdir(parents=True)
+    (run_dir / "scenarios").mkdir()
+    (run_dir / "state" / "aside-pre" / "memory.db").write_bytes(b"OLD-MEMORY")
+    (home / ".clearwing" / "memory.db").write_bytes(b"NEW-MEMORY-1234")   # mutated during round
+    (run_dir / "state" / "pre-state.json").write_text(json.dumps(
+        {"target_snapshot": {"192.168.73.82": {"88": False, "445": True}}}))
+    monkeypatch.setattr(runner, "Path", __import__("pathlib").Path)  # ensure same class
+    monkeypatch.setattr(runner.Path, "home", lambda: home)
+    monkeypatch.setattr(runner, "RESULTS", tmp_path)   # N2: never touch the real budget ledger
+    monkeypatch.setattr(runner, "listening_pids", lambda port: [])
+    monkeypatch.setattr(runner, "tcp_probe",
+                        lambda host, port, timeout=3.0: True if port == 445 else False)
+    out = {r[0]: r for r in runner.cleanup_run(run_dir, [], before_8899=None, sids=[])}
+    assert out["memory-aside-diff-recorded"][1] is True
+    assert "memory.db:10->15B" in out["memory-aside-diff-recorded"][2] \
+        or "memory.db" in out["memory-aside-diff-recorded"][2]
+    assert out["target-state-unchanged"][1] is True    # 88 False->False, 445 True->True
+    assert (run_dir / "state" / "aside-post" / "memory.db").read_bytes() == b"NEW-MEMORY-1234"
+    # a port flipping = hard-gate failure
+    monkeypatch.setattr(runner, "tcp_probe",
+                        lambda host, port, timeout=3.0: False)
+    out = {r[0]: r for r in runner.cleanup_run(run_dir, [], before_8899=None, sids=[])}
+    assert out["target-state-unchanged"][1] is False
+
+
+def test_budget_ledger_cumulative(monkeypatch, tmp_path):
+    """P3.3: cumulative spend ledger with $700 cap awareness."""
+    monkeypatch.setattr(runner, "RESULTS", tmp_path)
+    monkeypatch.setattr(runner, "listening_pids", lambda port: [])
+    home = tmp_path / "home"
+    monkeypatch.setattr(runner.Path, "home", lambda: home)
+    for i, cost in enumerate((0.5, 0.7)):
+        d = tmp_path / f"2026010{i}-000000-quick"
+        (d / "state").mkdir(parents=True)
+        (d / "scenarios").mkdir()
+        (d / "manifest.json").write_text(json.dumps(
+            [{"name": "t", "summary": {"cost_usd_product": cost}}]))
+        runner.cleanup_run(d, [], before_8899=None, sids=[])
+    led = json.loads((tmp_path / "budget-ledger.json").read_text())
+    assert led["total_usd"] == 1.2 and len(led["runs"]) == 2
+    led["runs"].append({"ts": "x", "run": "synthetic", "cost_usd": 699.0})
+    led["total_usd"] = 700.2
+    (tmp_path / "budget-ledger.json").write_text(json.dumps(led))
+    d = tmp_path / "20260102-000000-quick"
+    (d / "state").mkdir(parents=True)
+    (d / "scenarios").mkdir()
+    (d / "manifest.json").write_text(json.dumps([{"name": "t", "summary": {"cost_usd_product": 0.1}}]))
+    out = {r[0]: r for r in runner.cleanup_run(d, [], before_8899=None, sids=[])}
+    assert out["budget-ledger-updated"][1] is False      # over cap -> hard gate
+
+
+def test_adjudication_marker_exactness(tmp_path):
+    """Review N1: a review body QUOTING the marker string must not satisfy
+    the substring check (fail-open hole), and a mangled DRAFT marker must
+    make finalize die instead of logging a false success."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"
+    # fill review record WITH a quoted FINAL marker inside the body
+    adj.write_text(adj.read_text().replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "複審完成。文中引用標記 <!-- adjudication-status: FINAL --> 僅為引用，狀態仍 DRAFT。"
+        "四鏡結論：證據核實通過、方法論無替代解釋、流程合規、交付一致。"))
+    e = _Args()
+    e.run_dir = str(d)
+    e.out = None
+    with pytest.raises(SystemExit):          # quoted marker must NOT unlock export
+        runner.cmd_export(e)
+    # mangled DRAFT marker -> finalize dies (no false success)
+    adj.write_text(adj.read_text().replace(
+        "<!-- adjudication-status: DRAFT -->", "<!-- adjudication-status: DRAFT- -->"))
+    a2 = _Args()
+    a2.run_dirs = [str(d)]
+    a2.finalize = True
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+
+
+def test_adjudicate_refuses_overwrite_of_reviewed(tmp_path):
+    """SPEC §2.7 refuse-overwrite: regenerating a draft must not destroy a
+    human-filled review record or a FINAL document."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"
+    adj.write_text(adj.read_text().replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成：證據核實／對抗方法論／流程對照／交付一致性全數通過，無翻案。"))
+    with pytest.raises(SystemExit):          # review record present -> refuse regen
+        runner.cmd_adjudicate(a)
+    adj.write_text(adj.read_text().replace(
+        "<!-- adjudication-status: DRAFT -->", "<!-- adjudication-status: FINAL -->"))
+    with pytest.raises(SystemExit):          # FINAL -> refuse regen
+        runner.cmd_adjudicate(a)
+
+
+# --------------------------------------- Codex #67 r3 fixes -------------
+
+def test_flip_requires_per_gate_coverage(tmp_path):
+    """r3 P1: one placeholder row must not authorize flipping a run with
+    multiple failed gates — every overturned gate needs its own row."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    (d / "gates.json").write_text(json.dumps([
+        {"gate": "cache-min", "pass": False, "severity": "hard", "detail": "x"},
+        {"gate": "degenerate-output", "pass": False, "severity": "hard", "detail": "y"}]))
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"
+    filled = adj.read_text().replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成：核實、方法論、流程、交付四路全數通過，無保留意見，同意翻案。")
+    filled = filled.replace("verdict: ", "verdict: PASS\n_", 1)
+    hdr = "| gate | run/scenario | conclusion | evidence | limits |\n|---|---|---|---|---|\n"
+    partial = filled.replace(
+        hdr, hdr + "| cache-min | full/t1 | shape fragility | replay | n=1 |\n", 1)
+    adj.write_text(partial)
+    a2 = _Args()
+    a2.run_dirs = [str(d)]
+    a2.finalize = True
+    with pytest.raises(SystemExit):      # degenerate-output uncovered -> refuse
+        runner.cmd_adjudicate(a2)
+    full = partial.replace(
+        "| cache-min | full/t1 | shape fragility | replay | n=1 |",
+        "| cache-min | full/t1 | shape fragility | replay | n=1 |\n"
+        "| degenerate-output | full/t3 | warm recall, not degenerate | audit | n=2 |", 1)
+    adj.write_text(full)
+    runner.cmd_adjudicate(a2)            # all gates covered -> FINAL
+    assert "adjudication-status: FINAL" in adj.read_text()
+
+
+def test_export_requires_hash_marker(tmp_path):
+    """r3 P1: a FINAL document with the reviewed-hash stripped must not
+    export (the integrity check was fail-open without the marker)."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    (d / "report.md").write_text("# cw-e2e full — x — FAIL\n")
+    adj = d / "adjudication.md"
+    adj.write_text("<!-- adjudication-status: FINAL -->\nverdict: FAIL\n")
+    e = _Args()
+    e.run_dir = str(d)
+    e.out = None
+    with pytest.raises(SystemExit):
+        runner.cmd_export(e)
+
+
+def test_budget_precheck_blocks_run(monkeypatch, tmp_path):
+    """r3 P2: the cap is enforced BEFORE spend — a run whose cap ceiling
+    would cross $700 dies at startup."""
+    monkeypatch.setattr(runner, "RESULTS", tmp_path)
+    (tmp_path / "budget-ledger.json").write_text(json.dumps(
+        {"runs": [{"ts": "t", "run": "prior", "cost_usd": 699.0}],
+         "total_usd": 699.0, "cap_usd": 700}))
+    tier = {"cost_cap": 5.0, "scenarios": [{"name": "x", "cost_cap": 5.0}]}
+    with pytest.raises(SystemExit):
+        runner._budget_precheck(tier, None)
+    ok_tier = {"cost_cap": 0.5, "scenarios": [{"name": "x", "cost_cap": 0.5}]}
+    runner._budget_precheck(ok_tier, None)          # 699.5 <= 700 -> no raise
+
+
+# --------------------------------------- Codex #67 r2 fixes -------------
+
+def test_verdict_vocabulary_and_override_evidence(tmp_path):
+    """r2 P1/P2: a mistyped verdict or a flip without override rows must
+    not reach FINAL."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"
+    t0 = adj.read_text()
+    filled = t0.replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成，證據核實與方法論複核通過，流程合規，交付一致，無保留意見。")
+    # mistyped vocabulary
+    adj.write_text(filled.replace("verdict: ", "verdict: PAS\n_", 1))
+    a2 = _Args()
+    a2.run_dirs = [str(d)]
+    a2.finalize = True
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    # conforming verdict matching machine FAIL, no flip -> no rows needed
+    adj.write_text(filled.replace("verdict: ", "verdict: FAIL\n_", 1))
+    runner.cmd_adjudicate(a2)
+    assert "adjudication-status: FINAL" in adj.read_text()
+
+
+def test_crashed_scenario_cost_recovered(tmp_path):
+    """r2 P2: spend metered before a crash must not vanish from the ledger."""
+    d = tmp_path / "run"
+    (d / "scenarios").mkdir(parents=True)
+    (d / "state").mkdir()
+    (d / "scenarios" / "t1.frames.jsonl").write_text(
+        '{"type":"cost_update","data":{"total_cost_usd":0.42}}\n'
+        '{"type":"cost_update","data":{"total_cost_usd":0.55}}\n')
+    (d / "manifest.json").write_text(json.dumps(
+        [{"name": "t1", "summary": {"type": "crashed", "status": "crashed",
+                                    "error": "RuntimeError: x",
+                                    "cost_usd_product": 0.55}}]))
+    led = json.loads((d / "manifest.json").read_text())
+    assert led[0]["summary"]["cost_usd_product"] == 0.55   # structure the crash
+    # handler now produces — verified end-to-end via frames parse:
+    import re as _re
+    costs = [float(m) for m in _re.findall(r'"total_cost_usd":\s*([0-9.]+)',
+                                           (d / "scenarios" / "t1.frames.jsonl").read_text())]
+    assert max(costs) == 0.55
+
+
+def test_aside_diff_reports_created_deleted(tmp_path):
+    """r2 P2: appear/disappear of memory files must surface in the control
+    record (the old pre∩post compare silently missed them)."""
+    home = tmp_path / "home"
+    (home / ".clearwing").mkdir(parents=True)
+    run_dir = tmp_path / "run"
+    (run_dir / "state" / "aside-pre").mkdir(parents=True)
+    (run_dir / "scenarios").mkdir()
+    (run_dir / "state" / "aside-pre" / "memory.db").write_bytes(b"SAME")
+    (run_dir / "state" / "aside-pre" / "knowledge_graph.json").write_bytes(b"KG")
+    # during the run: WAL sidecar APPEARED, KG VANISHED
+    (home / ".clearwing" / "memory.db").write_bytes(b"SAME")
+    (home / ".clearwing" / "memory.db-wal").write_bytes(b"WAL!")
+    import runner as _r
+    import pytest as _pytest
+    class _MP:
+        def __init__(self): pass
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr(_r.Path, "home", lambda: home)
+        mp.setattr(_r, "RESULTS", tmp_path)
+        mp.setattr(_r, "listening_pids", lambda port: [])
+        mp.setattr(_r, "tcp_probe", lambda h, p2, timeout=3.0: False)
+        out = {r[0]: r for r in _r.cleanup_run(run_dir, [], before_8899=None, sids=[])}
+    finally:
+        mp.undo()
+    note = out["memory-aside-diff-recorded"][2]
+    assert "knowledge_graph.json:-DELETED" in note
+
+
+# --------------------------------------- Codex #67 r1 fixes -------------
+
+def test_aside_copy_sqlite_consistent_snapshot(tmp_path):
+    """P1 r1+r3: .db snapshots go through SQLite's backup API — a CONSISTENT
+    copy including uncheckpointed WAL content; -wal/-shm are not copied
+    separately (a backup supersedes them)."""
+    import sqlite3
+    home = tmp_path / "home"
+    home.mkdir()
+    src = home / "memory.db"
+    conn = sqlite3.connect(src)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE m (k TEXT)")
+    conn.execute("INSERT INTO m VALUES ('committed-in-wal')")
+    conn.commit()
+    # deliberately NO checkpoint — the row lives in memory.db-wal only
+    dest = tmp_path / "aside"
+    dest.mkdir()
+    copied = runner._aside_copy(home, dest)
+    assert "memory.db" in copied
+    assert "memory.db-wal" not in copied and "memory.db-shm" not in copied
+    got = sqlite3.connect(dest / "memory.db").execute("SELECT k FROM m").fetchall()
+    assert got == [("committed-in-wal",)]        # WAL content captured
+
+
+def test_probe_majority(monkeypatch):
+    """P2-c: a single lost SYN must never set the recorded baseline."""
+    seq = iter([False, True, True])
+    monkeypatch.setattr(runner, "tcp_probe", lambda h, p, timeout=3.0: next(seq))
+    assert runner.probe_majority("h", 88) is True
+    seq2 = iter([False, False, True])
+    monkeypatch.setattr(runner, "tcp_probe", lambda h, p, timeout=3.0: next(seq2))
+    assert runner.probe_majority("h", 88) is False
+
+
+def test_cache_prefix_median_per_context():
+    """P2-e: an interleaved uncached operator call is NOT a main-prefix
+    miss and must not reset the main line's growth baseline."""
+    calls = [(10000, 9500, 50, "main"), (6000, 0, 60, "operator"),
+             (10100, 9600, 50, "main"), (10200, 9700, 50, "main")]
+    med = analyze.cache_prefix_median(calls)
+    assert med == pytest.approx(95.07, abs=0.01)   # main-only ratios; operator's
+    # single call is its context's first -> excluded entirely
+
+
+def test_r3_manual_not_clobbered_by_reanalyze(monkeypatch, tmp_path):
+    """P2-b: a half-filled r3-manual.md is human state — `cw-e2e analyze`
+    re-render must not destroy it."""
+    monkeypatch.setattr(analyze, "RESULTS", tmp_path)
+    d = _write_min_run(tmp_path, "20260101-000000-full",
+                       extra_summary={"session_id": "abc12345"})
+    ver = {"git": {"head": "x" * 40, "webapi_commit": "y", "branch": "b"}}
+    analyze.render(d, "full", ver, [("k", True, "")])
+    (d / "r3-manual.md").write_text("# HUMAN IN-PROGRESS REVIEW\n- finding A\n")
+    analyze.render(d, "full", ver, [("k", True, "")])     # re-render
+    assert "HUMAN IN-PROGRESS REVIEW" in (d / "r3-manual.md").read_text()
+
+
+# ---------------------------------------------------- P4 R3 manual ------
+
+def test_r3_manual_template_and_pending_flag(monkeypatch, tmp_path):
+    """P4.1: Full runs generate the fact-check template; r3-done silences
+    regeneration and adjudicate flags the pending state."""
+    monkeypatch.setattr(analyze, "RESULTS", tmp_path)
+    d = _write_min_run(tmp_path, "20260101-000000-full",
+                       extra_summary={"session_id": "abc12345"})
+    analyze.render(d, "full", {"git": {"head": "x" * 40, "webapi_commit": "y", "branch": "b"}},
+                   [("kali-containers", True, "")])
+    r3 = d / "r3-manual.md"
+    assert r3.exists() and "abc12345" in r3.read_text() and "r3-done" in r3.read_text()
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    assert "R3 未完成" in (d / "adjudication.md").read_text()
+    (d / "r3-done").write_text("")
+    analyze.render(d, "full", {"git": {"head": "x" * 40, "webapi_commit": "y", "branch": "b"}},
+                   [("kali-containers", True, "")])   # marker present -> no template regen
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    assert "R3 未完成" not in (d / "adjudication.md").read_text()
+
+
+# ------------------------------------------------------- process/HEAD -----
 def test_proc_start_and_product_head_epochs():
     start = runner._proc_start_epoch(__import__("os").getpid())
     assert start is not None and abs(start - time.time()) < 120

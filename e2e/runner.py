@@ -69,6 +69,41 @@ def check_target(target: str) -> str:
     return target
 
 
+ASIDE_FILES = ("memory.db", "memory.db-wal", "memory.db-shm", "knowledge_graph.json")
+
+
+def _aside_copy(home: Path, dest: Path) -> list[str]:
+    """Snapshot memory state + KG. .db files go through SQLite's backup API
+    — a CONSISTENT snapshot including uncheckpointed WAL content (plain
+    file copies can tear when the live process checkpoints mid-copy, and
+    copying db+wal separately is not atomic either; Codex #67 r1+r3 P1).
+    knowledge_graph.json is a plain file."""
+    copied = []
+    for name in ASIDE_FILES:
+        src = home / name
+        if not src.exists():
+            continue
+        out = dest / name
+        if name.endswith(".db"):
+            try:
+                import sqlite3
+                src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=5)
+                dst_conn = sqlite3.connect(str(out))
+                with dst_conn:
+                    src_conn.backup(dst_conn)
+                src_conn.close()
+                dst_conn.close()
+                copied.append(name)
+                continue
+            except Exception:        # noqa: BLE001 — fall back to byte copy
+                pass                  # (non-SQLite db file or lock timeout)
+        if name.endswith(("-wal", "-shm")):
+            continue                  # superseded by the backup API snapshot
+        out.write_bytes(src.read_bytes())
+        copied.append(name)
+    return copied
+
+
 def cost_cap_of(sc: dict, tier: dict) -> float:
     """Scenario cap > tier cap > suite default. Never index tier["cost_cap"]
     directly — it is an eagerly-evaluated default and deep-fallback defines
@@ -413,8 +448,27 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
 def llm_api_key() -> str:
     p = os.environ.get(SUITE["env"]["llm_profile"])
     if not p:
-        die(f"env ${SUITE['env']['llm_profile']} (yaml path) required for --base-url runs")
+        die(f"env ${SUITE['env']['llm_profile']} (yaml path) required for --base-url runs "
+            "(probe/chaos scenarios need it — export CW_LLM_PROFILE=<yaml> BEFORE the run, "
+            "not after verify; the 20260918-175138 attempt died at scenario 1 this way)")
     return yaml.safe_load(Path(p).expanduser().read_text())["zai"]["api_key"]
+
+
+def check_llm_profile() -> None:
+    """P3.4: fail EARLY (verify stage) when CW_LLM_PROFILE is missing or
+    malformed — Quick/Full both contain --base-url scenarios, so a missing
+    profile is a guaranteed mid-run FATAL (20260918-175138 lesson)."""
+    p = os.environ.get(SUITE["env"]["llm_profile"])
+    if not p:
+        die(f"env ${SUITE['env']['llm_profile']} required (Quick/Full probe+chaos scenarios "
+            "call the LLM directly) — export CW_LLM_PROFILE=<llm yaml path> first")
+    try:
+        cfg = yaml.safe_load(Path(p).expanduser().read_text())
+        ok = isinstance(cfg, dict) and isinstance(cfg.get("zai"), dict) and bool(cfg["zai"].get("api_key"))
+    except (OSError, yaml.YAMLError):
+        ok = False
+    if not ok:
+        die(f"${SUITE['env']['llm_profile']} unreadable or lacks zai.api_key: {p}")
 
 
 def run_ws_scenario(sc: dict, run_dir: Path, tier: dict, ws_url: str, keyfile: Path,
@@ -517,6 +571,17 @@ def scenario_pytest(run_dir: Path) -> dict:
         f"(non-env failures: {non_env or 'none'}) {exit_note}")
     return {"type": "pytest", "tail": tail, "exit": p.returncode,
             "non_env_failures": non_env, "note": exit_note, "pass": bool(ok)}
+
+
+def probe_majority(host: str, port: int, tries: int = 3) -> bool:
+    """Majority-of-N probe: a single lost SYN must never become the
+    recorded baseline or the post-run verdict (Codex #67 r1 P2)."""
+    votes = []
+    for i in range(tries):
+        if i:
+            time.sleep(0.5)     # back-to-back SYNs all landing inside one
+        votes.append(tcp_probe(host, port))   # transient window would defeat
+    return sum(votes) * 2 > len(votes)        # the majority (Codex #67 r3)
 
 
 def tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -680,6 +745,12 @@ def verify(run_dir: Path | None, strict: bool = True) -> dict:
             audit_n = len(list((home / "audit").iterdir()))
         except OSError:
             audit_n = -1
+        # P3.1 memory/KG aside-backup (v2 SOP② mechanized): the round MUTATES
+        # member memory (2026-09-18 measured 221k->282k / 1.69M->2.10M) — the
+        # copy is the cross-round contamination control the manual protocol kept
+        aside = run_dir / "state" / "aside-pre"
+        aside.mkdir(exist_ok=True)
+        _aside_copy(home, aside)          # ~2.4MB total, gitignored
         suite_hash = hashlib.sha256()
         for f in ("runner.py", "chaos.py", "surgery.py", "analyze.py", "suite.yaml", "SPEC.md"):
             suite_hash.update((E2E_ROOT / f).read_bytes())
@@ -688,7 +759,7 @@ def verify(run_dir: Path | None, strict: bool = True) -> dict:
             "memory_db": _sz("memory.db"), "knowledge_graph": _sz("knowledge_graph.json"),
             "pids_8899": pids,
             "suite_sha256": suite_hash.hexdigest()[:16],
-            "target_snapshot": {t: {p: tcp_probe(t, p) for p in (88, 445, 3389)} for t in SUITE["targets"]},
+            "target_snapshot": {t: {p: probe_majority(t, p) for p in (88, 445, 3389)} for t in SUITE["targets"]},
         }, indent=1))
 
     for name, ok, note in checks:
@@ -757,7 +828,9 @@ def scenario_hud(sc: dict, run_dir: Path, ws_url: str, keyfile: Path) -> dict:
     match = all(v is not None for v in (hc, rc, ht, rt)) and hc > 0 and rc > 0 \
         and abs(hc - rc) <= max(0.01 * rc, 1e-4) and abs(ht - rt) <= max(0.01 * rt, 1)
     result = {"type": "hud", "session_id": sid, "hud_cost": hud_cost, "hud_tokens": hud_tokens,
-              "report_cost": rep_cost, "report_tokens": rep_tokens, "pass": bool(match)}
+              "report_cost": rep_cost, "report_tokens": rep_tokens, "pass": bool(match),
+              # ledger-visible spend: the HUD turn billed real tokens (Codex #67 r6)
+              "cost_usd_product": hc, "seconds": 0}
     (run_dir / "scenarios" / "hud-proof.json").write_text(json.dumps(result, indent=1))
     log(f"  -> HUD footer {hud_cost}/{hud_tokens} vs report {rep_cost}/{rep_tokens} match={match}")
     return result
@@ -796,9 +869,65 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
     if before_8899 is not None:
         out.append(("live-8899-pids-unchanged", listening_pids(8899) == before_8899,
                     f"before={before_8899} now={listening_pids(8899)}"))
-    # Secret scan — VALUE-based (the regex alone missed JSON/repr/header
-    # forms): byte-search artifacts for the actual webui + LLM key values,
-    # held in memory, never printed; only hit FILENAMES are reported.
+
+    # ---- P3 state-integrity block runs BEFORE the keyscan so that the
+    # aside-POST snapshots it creates are themselves scanned (Codex #67 r4)
+    pre = run_dir / "state" / "aside-pre"
+    post = run_dir / "state" / "aside-post"
+    if pre.exists():
+        post.mkdir(exist_ok=True)
+        _aside_copy(Path.home() / ".clearwing", post)
+        diffs = []
+        for name in ASIDE_FILES:
+            was, now = (pre / name).exists(), (post / name).exists()
+            if was and now:
+                pre_b, post_b = (pre / name).read_bytes(), (post / name).read_bytes()
+                if pre_b != post_b:
+                    diffs.append(f"{name}:{len(pre_b)}->{len(post_b)}B")
+            elif now and not was:
+                diffs.append(f"{name}:+CREATED")
+            elif was and not now:
+                diffs.append(f"{name}:-DELETED")
+        out.append(("memory-aside-diff-recorded", True,
+                    f"changed: {diffs or 'none'} (control copies in state/aside-*)"))
+    # post-run target-state comparison vs pre-state.json snapshot; a difference
+    # is majority-confirmed 3x before it counts (one lost SYN != state change)
+    def _probe_confirmed(tgt, port, want_open):
+        for _ in range(3):
+            if probe_majority(tgt, int(port)) == bool(want_open):
+                return True
+            time.sleep(1)
+        return False
+    try:
+        pre_state = json.loads((run_dir / "state" / "pre-state.json").read_text())
+        changed = []
+        for tgt, ports in (pre_state.get("target_snapshot") or {}).items():
+            for port, was_open in ports.items():
+                if not _probe_confirmed(tgt, port, was_open):
+                    changed.append(f"{tgt}:{port} {was_open}->{not was_open}")
+        out.append(("target-state-unchanged", not changed, f"{changed or 'stable'}"))
+    except (OSError, ValueError, TypeError):
+        out.append(("target-state-unchanged", False, "pre-state.json unreadable"))
+    # cumulative budget ledger (results/ is gitignored)
+    try:
+        led_p = RESULTS / "budget-ledger.json"
+        ledger = json.loads(led_p.read_text()) if led_p.exists() else {"runs": [], "cap_usd": 700}
+        run_cost = 0.0
+        man = run_dir / "manifest.json"
+        if man.exists():
+            run_cost = round(sum((s.get("summary") or {}).get("cost_usd_product") or 0
+                                 for s in json.loads(man.read_text())), 4)
+        ledger["runs"].append({"ts": time.strftime("%F %T"), "run": run_dir.name,
+                               "cost_usd": run_cost})
+        ledger["total_usd"] = round(sum(r["cost_usd"] for r in ledger["runs"]), 4)
+        led_p.write_text(json.dumps(ledger, indent=1))
+        out.append(("budget-ledger-updated", ledger["total_usd"] <= ledger["cap_usd"],
+                    f"cumulative ${ledger['total_usd']} / cap ${ledger['cap_usd']}"))
+    except Exception as e:  # noqa: BLE001
+        out.append(("budget-ledger-updated", False, f"ledger error: {e}"))
+
+    # ---- value-based secret scan LAST, over artifacts INCLUDING the aside
+    # snapshots just created (memory content may embed keys)
     secrets: list[bytes] = []
     try:
         if keyfile is not None:
@@ -825,7 +954,17 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
             if any(s and s in data for s in secrets) or re.search(
                     rb"api_key[=:?&]\s*['\"]?[A-Za-z0-9_-]{20,}", data):
                 hits.append(str(f))
+    for f in list(run_dir.glob("state/aside-*/*")):   # memory snapshots:
+        if not f.is_file():                            # suffix-blind scan
+            continue
+        try:
+            data = f.read_bytes()
+        except OSError:
+            continue
+        if any(s and s in data for s in secrets):
+            hits.append(str(f))
     out.append(("artifact-keyscan", not hits, f"{hits[:3]} ({len(secrets)} value-probes)"))
+
     s, _ = http_get(f"{SUITE['webui']['live']}/api/health")
     out.append(("live-health-final", s == 200, f"HTTP {s}"))
     for name, ok, note in out:
@@ -905,6 +1044,304 @@ def dispatch(sc: dict, ctx: dict) -> dict:
     die(f"unknown scenario type {t!r}")
 
 
+# ---------------------------------------------------- adjudication layer ---
+
+ADJ_STATUS = "<!-- adjudication-status: {} -->"
+ADJ_VERDICTS = ("PASS", "FAIL", "REGRESSION", "MIXED")
+
+
+def _adj_override_rows(text: str) -> list[str]:
+    """Data rows of the overridden-gates table (non-header, pipe rows)."""
+    m = re.search(r"## overridden gates[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
+    rows = []
+    for line in (m.group(1) if m else "").splitlines():
+        s = line.strip()
+        if s.startswith("|") and not set(s) <= {"|", "-", " ", ":"} and "---" not in s \
+                and not s.startswith("| gate") and not s.startswith("| run "):
+            rows.append(s)
+    return rows
+
+
+def _adj_reviewed_hash(dirs: list[Path]) -> str:
+    """Content hash binding a FINAL adjudication to the exact machine
+    artifacts it reviewed (Codex #67 r2 P1): report/gates/ledger of every
+    indexed run dir. A post-review `analyze` re-render or any artifact
+    change invalidates the stamp and export refuses."""
+    import hashlib
+    h = hashlib.sha256()
+    for d in dirs:
+        for name in ("report.md", "gates.json", "ledger.json"):
+            f = Path(d) / name
+            h.update(name.encode())
+            h.update(f.read_bytes() if f.exists() else b"<absent>")
+    return h.hexdigest()[:16]
+
+
+def _adj_final_verdict(text: str) -> str | None:
+    """Verdict parsed ONLY from the '## final verdict' section — a
+    verdict-looking line quoted elsewhere must not be picked up
+    (Codex #67 r6 P1)."""
+    m = re.search(r"## final verdict[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
+    if not m:
+        return None
+    mv = re.search(r"^verdict:[ \t]*(\S+)", m.group(1), re.M)
+    return mv.group(1) if mv else None
+
+
+def _adj_indexed_dirs(text: str) -> list[Path]:
+    """Run dirs recorded in the adjudication's run index (backtick paths)."""
+    m = re.search(r"## run index.*?(?=\n## )", text, re.S)
+    return [Path(x) for x in re.findall(r"`([^`]+)`", m.group(0))] if m else []
+
+
+def _adj_status(text: str) -> str | None:
+    """Line-anchored status parse — a marker QUOTED inside a review body
+    must never satisfy the gate (review N1: full-text substring was
+    fail-open)."""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("<!-- adjudication-status: ") and s.endswith(" -->"):
+            return s[len("<!-- adjudication-status: "):-len(" -->")]
+    return None
+
+
+def _run_dir_facts(d: Path) -> dict:
+    """Machine-readable summary of one run dir (verdict, ledger, failed gates)."""
+    import re as _re
+    facts = {"path": str(d), "verdict": "?", "cost": None, "seconds": None,
+             "failed_gates": [], "scenarios": [], "r3_pending": False}
+    if re.search(r"-full(-\d+)?$", d.name) and not (d / "r3-done").exists():
+        facts["r3_pending"] = True   # collision-suffixed …-full-1 counts (Codex #67 r1)
+    rp = d / "report.md"
+    if rp.exists():
+        first = (rp.read_text().splitlines() or [""])[0]   # empty-report safe
+        m = _re.search(r"— (PASS|FAIL|REGRESSION|SKIPPED)", first)
+        if m:
+            facts["verdict"] = m.group(1)
+    try:
+        led = json.loads((d / "ledger.json").read_text())
+        facts["cost"], facts["seconds"] = led.get("cost_usd_product"), led.get("seconds")
+    except (OSError, ValueError):
+        pass
+    try:
+        gates = json.loads((d / "gates.json").read_text())
+        facts["failed_gates"] = sorted({g["gate"] for g in gates if not g["pass"]})
+    except (OSError, ValueError):
+        pass
+    try:
+        for sc in json.loads((d / "manifest.json").read_text()):
+            s = sc.get("summary") or {}
+            facts["scenarios"].append({
+                "name": sc.get("name"), "sid": s.get("session_id"),
+                "statuses": (s.get("complete_statuses") or [])[-2:],
+                "cost": s.get("cost_usd_product"), "type": s.get("type", "ws")})
+    except (OSError, ValueError):
+        pass
+    return facts
+
+
+def cmd_adjudicate(args) -> None:
+    """Round-level adjudication document (SPEC §9 hard rule).
+
+    Draft: auto-fills run index (ALL run dirs of the round incl. FATAL
+    ones), per-scenario verdicts, failed gates. The HUMAN then fills the
+    overridden-gates table (gate flips need 論據) and the review-record
+    section (four-lens output per REVIEW.md). --finalize refuses until the
+    review record is non-empty and then stamps FINAL — the marker
+    `cw-e2e export` requires before producing any external-facing draft
+    (the 2026-09-18 #61 sequencing violation made mechanical)."""
+    dirs = [Path(p).resolve() for p in args.run_dirs]
+    for d in dirs:
+        if not d.is_dir():
+            die(f"run dir not found: {d}")
+    out_dir = dirs[-1]
+    adj = out_dir / "adjudication.md"
+
+    if args.finalize:
+        if not adj.exists():
+            die(f"no adjudication.md in {out_dir} — run the draft step first")
+        text = adj.read_text()
+        status = _adj_status(text)
+        if status == "FINAL":
+            log("already FINAL")
+            return
+        if status != "DRAFT":
+            die(f"adjudication.md status marker is {status!r} (mangled?) — refusing; "
+                "restore the marker line or regenerate the draft consciously")
+        m = re.search(r"## review record[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
+        body = re.sub(r"<!--.*?-->", "", m.group(1) if m else "", flags=re.S)
+        body = re.sub(r"[\s#|>*-]", "", body)
+        if len(body) < 30:
+            die("review-record section is empty/too short — the four-lens review "
+                "(REVIEW.md) must be pasted before finalize (SPEC §9 hard rule)")
+        verdict = _adj_final_verdict(text)
+        if not verdict:
+            die("final verdict line is empty — set `verdict: PASS|FAIL|REGRESSION|MIXED` "
+                "in the '## final verdict' section (export quotes THIS value)")
+        if verdict not in ADJ_VERDICTS:
+            die(f"verdict {verdict!r} not in {ADJ_VERDICTS} (Codex #67 r2)")
+        ih_now = __import__("hashlib").sha256(
+            "|".join(str(x) for x in (_adj_indexed_dirs(text) or dirs)).encode()
+        ).hexdigest()[:16]
+        ih_orig = re.search(r"<!-- index-hash: ([0-9a-f]+) -->", text)
+        if ih_orig and ih_orig.group(1) != ih_now:
+            die("run index was edited after the draft (dropped/added runs?) — the "
+                "adjudication no longer covers what it claims; regenerate consciously")
+        idx_dirs = _adj_indexed_dirs(text) or dirs
+        facts = [_run_dir_facts(x) for x in idx_dirs]   # the ROUND, not the
+        machine = sorted({f["verdict"] for f in facts if f["verdict"] != "?"})  # CLI arg
+        flipped = machine and verdict not in machine and not (len(machine) > 1)
+        if flipped:
+            rows = _adj_override_rows(text)
+            if not rows:
+                die(f"final verdict {verdict} flips the machine verdict {machine} but the "
+                    "overridden-gates table is EMPTY — a flip must carry its 論據 rows "
+                    "(gate | run/scenario | conclusion | evidence | limits)")
+            covered = {r.strip("|").split("|")[0].strip().lower() for r in rows}
+            failed = {g.lower() for f in facts for g in f["failed_gates"]}
+            uncovered = failed - covered
+            if uncovered:
+                die(f"flip evidence incomplete: failed gate(s) {sorted(uncovered)} have no "
+                    "override row — every overturned gate needs its own row")
+        stamp_dirs = _adj_indexed_dirs(text) or dirs   # same set export will use
+        stamp = (f"<!-- reviewed-hash: {_adj_reviewed_hash(stamp_dirs)} -->")
+        adj.write_text(text.replace(ADJ_STATUS.format("DRAFT"),
+                                    ADJ_STATUS.format("FINAL") + "\n" + stamp))
+        log(f"adjudication FINAL: {adj} verdict={verdict} reviewed-hash bound")
+        return
+
+    if adj.exists():
+        existing = adj.read_text()
+        if _adj_status(existing) == "FINAL":
+            die(f"{adj} is FINAL — regenerating would destroy the review record; "
+                "delete it consciously first (SPEC §2.7 refuse-overwrite)")
+        m = re.search(r"## review record[^\n]*\n(.*?)(?=\n## |\Z)", existing, re.S)
+        body = re.sub(r"<!--.*?-->", "", m.group(1) if m else "", flags=re.S)
+        if len(re.sub(r"[\s#|>*-]", "", body)) >= 30:
+            die(f"{adj} already carries a human review record — regenerating would "
+                "destroy it; delete it consciously first (SPEC §2.7)")
+        if _adj_final_verdict(existing):
+            die(f"{adj} already carries a human final verdict — regenerating would "
+                "destroy it; delete it consciously first (SPEC §2.7)")
+        if _adj_override_rows(existing):
+            die(f"{adj} already carries human override rows — regenerating would "
+                "destroy them; delete it consciously first (SPEC §2.7)")
+        lm = re.search(r"## limits[^\n]*\n(.*?)(?=\n## |\Z)", existing, re.S)
+        lbody = (lm.group(1) if lm else "").strip()
+        if lbody and lbody != "-":
+            die(f"{adj} already carries human limits — regenerating would "
+                "destroy them; delete it consciously first (SPEC §2.7)")
+    lines = [
+        "# cw-e2e adjudication — round " + time.strftime("%Y-%m-%d %H:%M"), "",
+        ADJ_STATUS.format("DRAFT"), "",
+        # index bound at DRAFT time: finalize refuses if the run list was
+        # hand-edited (dropping a run would dodge its gates AND its spend)
+        f"<!-- index-hash: {__import__('hashlib').sha256('|'.join(str(x) for x in dirs).encode()).hexdigest()[:16]} -->",
+        "",
+        "## run index (ALL run dirs of this round, incl. FATAL attempts)", "",
+    ]
+    total_cost = 0.0
+    for d in dirs:
+        f = _run_dir_facts(d)
+        total_cost += f["cost"] or 0
+        lines.append(f"- `{f['path']}` — **{f['verdict']}** · ${f['cost'] if f['cost'] is not None else '?'}"
+                     f" · {f['seconds'] if f['seconds'] is not None else '?'}s"
+                     + (f" · failed gates: {', '.join(f['failed_gates'])}" if f["failed_gates"] else "")
+                     + (" · **R3 未完成**（無 r3-done — 發版級宣稱前必完成抽核）" if f["r3_pending"] else ""))
+    lines += ["", f"- round cost: ${total_cost:.4f}", "",
+              "## scenario verdicts (auto)", "",
+              "| run | scenario | sid | statuses | $ |", "|---|---|---|---|---|"]
+    for d in dirs:
+        f = _run_dir_facts(d)
+        for sc in f["scenarios"]:
+            lines.append(f"| {d.name} | {sc['name']} | {sc['sid'] or '-'} | "
+                         f"{sc['statuses']} | {sc['cost'] if sc['cost'] is not None else '-'} |")
+    lines += [
+        "", "## overridden gates (HUMAN — a flipped verdict MUST live here with 論據)", "",
+        "| gate | run/scenario | conclusion | evidence | limits |", "|---|---|---|---|---|",
+        "", "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)", "",
+        "- ", "",
+        "## final verdict (HUMAN — 翻案後的最終判定；未翻案則照抄機器判定)", "",
+        "verdict: ",
+        "<!-- PASS | FAIL | REGRESSION | MIXED(多 run) — finalize 要求非空；export 引用此值而非 report.md -->",
+        "",
+        "## review record (四鏡複審輸出 — REVIEW.md；finalize 前必填)", "",
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "", "## rev2 log", "", "- (rev1 generated)", "",
+    ]
+    adj.write_text("\n".join(lines))
+    log(f"adjudication DRAFT: {adj} — fill overrides/limits/review-record, "
+        "then `cw-e2e adjudicate --finalize <run-dir>`")
+
+
+def cmd_export(args) -> None:
+    """External-facing draft generator, GATED on a FINAL adjudication
+    (SPEC §9: no external posting before the review record exists)."""
+    d = Path(args.run_dir).resolve()
+    adj = d / "adjudication.md"
+    if not adj.exists():
+        die(f"no adjudication.md in {d} — run `cw-e2e adjudicate` and complete the "
+            "review record first (SPEC §9 hard rule: 對外開單前必複審)")
+    text = adj.read_text()
+    if _adj_status(text) != "FINAL":
+        die("adjudication is still DRAFT — finalize it (non-empty review record "
+            "required) before exporting external-facing content")
+    indexed = _adj_indexed_dirs(text) or [d]
+    hm = re.search(r"<!-- reviewed-hash: ([0-9a-f]+) -->", text)
+    if not hm:
+        die("FINAL adjudication carries no reviewed-hash (deleted? pre-feature "
+            "document?) — re-finalize to bind it to the reviewed artifacts")
+    if hm.group(1) != _adj_reviewed_hash(indexed):
+        die("reviewed artifacts changed since finalize (analyze re-run or "
+            "report/gates/ledger mutation) — re-review and re-finalize; export "
+            "refuses to mix an old verdict with fresh machine facts")
+    all_facts = [_run_dir_facts(x) for x in indexed]
+    total_cost = round(sum(f["cost"] or 0 for f in all_facts), 4)
+    machine = sorted({f["verdict"] for f in all_facts if f["verdict"] != "?"})
+    final_verdict = _adj_final_verdict(text) or "MIXED"
+    machine_note = "" if final_verdict in machine or not machine else \
+        f" (machine verdict was {'/'.join(machine)} — adjudicated; see overrides)"
+    out = [f"cw-e2e round summary (auto-export {time.strftime('%F %T')} — "
+           f"adjudicated, review on record)", "",
+           f"- verdict: **{final_verdict}**{machine_note} · round ${total_cost} · "
+           f"{len(all_facts)} run dir(s)"]
+    for f in all_facts:
+        out.append(f"  - `{f['path']}` — {f['verdict']} · ${f['cost']} · "
+                   + (f"failed: {', '.join(f['failed_gates'])}" if f["failed_gates"] else "clean"))
+    if any(f["r3_pending"] for f in all_facts):
+        out.append("- ⚠️ R3 人工抽核未完成（r3-manual.md 待填、無 r3-done）——"
+                   "發版級宣稱（Full×2＋deep-cold）不應引用本輪")
+    text = "\n".join(out)
+    if args.out:
+        Path(args.out).write_text(text + "\n")
+        log(f"exported: {args.out}")
+    else:
+        print(text)
+
+
+def _budget_precheck(tier: dict, only: str | None) -> None:
+    """Enforce the program cap BEFORE spending (Codex #67 r3): the cleanup
+    ledger check comes too late for a run that starts at $699."""
+    cap = 700
+    led_p = RESULTS / "budget-ledger.json"
+    if led_p.exists():
+        try:
+            led = json.loads(led_p.read_text())
+            spent, cap = led.get("total_usd", 0), led.get("cap_usd", 700)
+        except (OSError, ValueError):
+            die(f"budget ledger unreadable: {led_p} — fail-closed; fix or remove "
+                "the ledger before running (Codex #67 r6)")
+    else:
+        spent = 0
+    # repeats multiply their cap (t3-warm-chain ×3 counted ONCE undercounts)
+    est = sum(cost_cap_of(sc, tier) * int(sc.get("repeat", 1))
+              for sc in tier["scenarios"] if not only or sc["name"] == only)
+    if spent + est > cap:
+        die(f"budget pre-check: cumulative ${spent:.2f} + this run's cap ceiling "
+            f"${est:.2f} would exceed the ${cap} program cap — reduce scope or get "
+            "the cap raised (ledger: e2e/results/budget-ledger.json)")
+
+
 def cmd_run(args) -> None:
     tier_name = args.tier
     tier = SUITE["tiers"][tier_name]
@@ -912,10 +1349,30 @@ def cmd_run(args) -> None:
         die("deep-fallback mutates the real config + restarts the self instance — "
             "pass --approve-fallback (SPEC §2.6)")
     keyfile = keyfile_from_env(args.keyfile)
+    # P3.4 (tier-aware, review N5): only quick/full contain --base-url
+    # scenarios (probe + chaos); deep tiers run via_config/self-instance and
+    # a profile-less `verify` preflight stays legal (--force bypasses)
+    selected = [sc for sc in tier["scenarios"]
+                if not args.only or sc["name"] == args.only]
+    needs_profile = any(
+        sc["type"] == "probe_partial_fill"
+        or (sc["type"] == "chaos" and not sc.get("via_config"))
+        for sc in selected)
+    if needs_profile and not args.force:
+        check_llm_profile()          # scenario-aware (Codex #67 r1): --only fc-approval stays legal
+    _budget_precheck(tier, args.only)
     with SuiteLock():
         run_dir = new_run_dir(tier_name + ("-partial" if args.only else ""))
         log(f"run dir: {run_dir}")
         ver = verify(run_dir, strict=not args.force)
+        if args.force:
+            forced = [c for c in ver.get("checks", []) if not c[1]]
+            (run_dir / "state" / "forced-gates.json").write_text(json.dumps(
+                {"forced": forced,
+                 "rationale": "OPERATOR: fill in why each forced gate was overridden"},
+                indent=1, ensure_ascii=False))
+            log(f"forced gates persisted ({len(forced)}) — fill the rationale slot "
+                "in state/forced-gates.json")
         ctx = {"run_dir": run_dir, "tier": tier, "ws_url": ws_from_base(SUITE["webui"]["live"]),
                "keyfile": keyfile, "home": None, "results": [], "containers": [], "sids": [], "last_sid": None}
         spawn = None
@@ -947,9 +1404,24 @@ def cmd_run(args) -> None:
                                                "expect": sc.get("expect")})
                 except Exception as e:  # noqa: BLE001 — one scenario must not kill the run
                     log(f"  -> scenario CRASHED: {type(e).__name__}: {e}")
-                    ctx["results"].append({"name": sc["name"],
-                                           "summary": {"type": "crashed", "status": "crashed",
-                                                       "error": f"{type(e).__name__}: {e}"},
+                    crashed = {"type": "crashed", "status": "crashed",
+                               "error": f"{type(e).__name__}: {e}"}
+                    # spend already metered before the crash must not vanish
+                    # from the ledger (Codex #67 r2): recover the running
+                    # total from the frames log the driver managed to write
+                    for fl in sorted((run_dir / "scenarios").glob(
+                            f"{sc['name']}*.frames.jsonl")):   # suffixed repeats too
+                        try:
+                            import re as _re2
+                            costs = [float(m) for m in _re2.findall(
+                                r'"total_cost_usd":\s*([0-9.]+)',
+                                fl.read_text(errors="ignore"))]
+                            if costs:
+                                crashed["cost_usd_product"] = max(
+                                    crashed.get("cost_usd_product") or 0, max(costs))
+                        except (OSError, ValueError):
+                            pass
+                    ctx["results"].append({"name": sc["name"], "summary": crashed,
                                            "expect": sc.get("expect")})
                 (run_dir / "manifest.json").write_text(
                     json.dumps(ctx["results"], ensure_ascii=False, indent=1, default=str))
@@ -996,6 +1468,14 @@ def main() -> None:
     a = sub.add_parser("analyze", help="re-render analysis+report for an existing run dir")
     a.add_argument("run_dir")
     s = sub.add_parser("selftest", help="offline regression suite (no LLM cost, no live deps)")
+    adj = sub.add_parser("adjudicate", help="round-level adjudication doc (SPEC §9 hard rule)")
+    adj.add_argument("run_dirs", nargs="+", help="ALL run dirs of the round, oldest first "
+                                                 "(adjudication.md lands in the LAST)")
+    adj.add_argument("--finalize", action="store_true",
+                     help="validate review record and stamp FINAL (unlocks export)")
+    exp = sub.add_parser("export", help="external-facing draft — requires FINAL adjudication")
+    exp.add_argument("run_dir")
+    exp.add_argument("--out", help="write to file instead of stdout")
     args = ap.parse_args()
     if args.cmd == "verify":
         verify(None, strict=not args.force)
@@ -1009,6 +1489,10 @@ def main() -> None:
         p = subprocess.run([str(REPO_ROOT / ".venv/bin/python"), "-m", "pytest",
                             str(E2E_ROOT / "test_suite.py"), "-q"])
         sys.exit(p.returncode)
+    elif args.cmd == "adjudicate":
+        cmd_adjudicate(args)
+    elif args.cmd == "export":
+        cmd_export(args)
 
 
 if __name__ == "__main__":
