@@ -17,7 +17,15 @@ FIFO queue and one writer coroutine:
   frames never regress below it (Codex PR-62 r2);
 - cost frames' accumulate→publish sequence is serialized under the
   session lock: the wire totals arrive in monotonically non-decreasing
-  order (Codex PR-62 r2).
+  order (Codex PR-62 r2);
+- totals are tracker-authoritative in EVERY turn window (Codex PR-62
+  r3): the runtime books before emitting, so assigning from the session
+  snapshot cannot double-count a handler that straddles a turn
+  boundary;
+- a terminal frame whose flush handshake was cancelled by `stop` is
+  skipped by the writer — the client's first terminal frame is the
+  authoritative `stopped`, never the cancelled turn's stale
+  agent_message/complete (Codex PR-62 r3).
 """
 
 from __future__ import annotations
@@ -505,11 +513,17 @@ class TestOutOfTurnCostScoping:
 
 
 class TestSessionCostThreadSafety:
-    """#48-2: the session accumulator is written from worker threads; the
-    lock makes the accumulated totals exact under concurrency."""
+    """#48-2 + Codex PR-62 r3: cost frames are written from worker
+    threads; the lock serializes snapshot-read and publish, and the
+    tracker-authoritative snapshot makes the delivered totals exact under
+    concurrency — the final frame equals the booked total, no lost or
+    double-counted call."""
 
     def test_concurrent_worker_emissions_accumulate_exactly(self, client):
+        from clearwing.observability.telemetry import CostTracker
+
         threads_n, per_thread = 8, 50
+        per_call = CostTracker.estimate_cost(1, 0, "fake-model")
 
         class _HammerGraph:
             def __init__(self, **kwargs):
@@ -520,22 +534,17 @@ class TestSessionCostThreadSafety:
                 return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
 
             async def astream(self, input_msg, config, stream_mode="values"):
+                from clearwing.observability.telemetry import CostTracker
+
                 del input_msg, config, stream_mode
 
+                # The runtime shape (Codex PR-62 r3): each worker books a
+                # real tracker call under the session id — record_llm_call
+                # books FIRST and then emits the frame itself.
                 def worker():
                     for _ in range(per_thread):
-                        _emit_cost(
-                            {
-                                "input_tokens": 1,
-                                "output_tokens": 0,
-                                "cost": 0.01,
-                                "total_cost_usd": 0.0,
-                                "total_tokens": 0,
-                                "model": "fake-model",
-                                "provider": "openai",
-                                "session_id": self.session_id,
-                                "elapsed_ms": 0,
-                            }
+                        CostTracker().record_llm_call(
+                            1, 0, "fake-model", session_id=self.session_id
                         )
 
                 workers = [
@@ -564,7 +573,7 @@ class TestSessionCostThreadSafety:
         # Every emission's frame was delivered BEFORE complete (FIFO).
         assert len(cost_frames) == total_emissions
         last = cost_frames[-1]["data"]
-        assert last["total_cost_usd"] == pytest.approx(total_emissions * 0.01)
+        assert last["total_cost_usd"] == pytest.approx(total_emissions * per_call)
         assert last["total_tokens"] == total_emissions
 
 
@@ -592,11 +601,12 @@ class _BookingGraph:
 
 
 class TestLateBookingRebase:
-    """Codex PR-62 r2 (Finding 1): an LLM call attributed to this session
-    that completes AFTER the turn ended must re-base the in-turn
-    accumulator to the tracker's water level — the next turn's in-turn
-    frames add onto the late-booked base instead of the stale one, so the
-    wire totals never regress below spend that already happened."""
+    """Codex PR-62 r2/r3: an LLM call attributed to this session that
+    completes AFTER the turn ended must still be captured — every frame's
+    totals come from the tracker-authoritative session snapshot, so the
+    next turn's in-turn frames sit on the late-booked water level instead
+    of a stale base, and the wire totals never regress below spend that
+    already happened."""
 
     def test_next_turn_accumulates_from_late_booked_water_level(self, client):
         from clearwing.observability.telemetry import CostTracker
@@ -673,14 +683,88 @@ class TestLateBookingRebase:
                 assert ws.receive_json()["type"] == "complete"
 
 
+class TestTrackerAuthoritativeTotals:
+    """Codex PR-62 r3: the tracker's session snapshot is authoritative in
+    EVERY turn window. An in-turn frame's own per-call cost/token fields
+    are informational and are never ADDED into the running totals — a
+    handler delayed across a turn boundary could otherwise double-count a
+    call an out-of-turn frame had already captured into the snapshot."""
+
+    def test_in_turn_frame_totals_come_from_tracker_not_frame_fields(self, client):
+        from clearwing.observability.telemetry import CostTracker
+
+        real_call = CostTracker.estimate_cost(500, 50, "fake-model")
+
+        class _LyingFrameGraph:
+            def __init__(self, **kwargs):
+                self.session_id = kwargs.get("session_id")
+
+            def get_state(self, config):
+                del config
+                return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+
+            async def astream(self, input_msg, config, stream_mode="values"):
+                from clearwing.observability.telemetry import CostTracker
+
+                del input_msg, config, stream_mode
+                # One real, booked call (the runtime shape: book first,
+                # the frame is emitted by record_llm_call itself)…
+                CostTracker().record_llm_call(
+                    500, 50, "fake-model", session_id=self.session_id
+                )
+                # …then an emission whose per-call fields LIE (never booked
+                # in the tracker): pre-fix the in-turn branch +=-ed them
+                # into the running totals; the snapshot must ignore them.
+                _emit_cost(
+                    {
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 1_000_000,
+                        "cost": 999.0,
+                        "total_cost_usd": 999.0,
+                        "total_tokens": 999,
+                        "model": "fake-model",
+                        "provider": "openai",
+                        "session_id": self.session_id,
+                        "elapsed_ms": 0,
+                    }
+                )
+                yield {"messages": [_AI("done")]}
+
+        with patch("clearwing.ui.web.app.create_agent", _LyingFrameGraph):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                ws.send_json({"type": "message", "content": "run"})
+                frames = []
+                while True:
+                    frame = json.loads(ws.receive_text())
+                    if frame["type"] == "cost_update":
+                        frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+        assert len(frames) == 2
+        booked, lying = (f["data"] for f in frames)
+        assert booked["total_cost_usd"] == pytest.approx(real_call)
+        assert booked["total_tokens"] == 550
+        # The lying frame's totals are rewritten to the SAME tracker water
+        # level — its own cost/token fields never enter the totals.
+        assert lying["total_cost_usd"] == pytest.approx(real_call)
+        assert lying["total_tokens"] == 550
+        assert lying["total_cost_usd"] != pytest.approx(real_call + 999.0)
+        # Per-call fields still ride along untouched.
+        assert lying["cost"] == 999.0
+
+
 class TestCostFramePublishOrdering:
-    """Codex PR-62 r2 (Finding 2): accumulate and publish are ONE
+    """Codex PR-62 r2 (Finding 2): snapshot-read and publish are ONE
     serialized sequence under the session lock — the enqueue (wire) order
-    of concurrent cost frames matches their accumulation order, so the
+    of concurrent cost frames matches their snapshot order, so the
     delivered totals sequence never regresses."""
 
     def test_concurrent_cost_frames_wire_totals_monotonic(self, client):
         import sys
+
+        from clearwing.observability.telemetry import CostTracker
 
         threads_n, per_thread = 8, 50
 
@@ -693,28 +777,22 @@ class TestCostFramePublishOrdering:
                 return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
 
             async def astream(self, input_msg, config, stream_mode="values"):
+                from clearwing.observability.telemetry import CostTracker
+
                 del input_msg, config, stream_mode
 
-                # Distinct per-thread costs widen any out-of-order dip the
+                # The runtime shape (Codex PR-62 r3): each worker books a
+                # real tracker call (book first, emit after). Distinct
+                # per-thread token counts widen any out-of-order dip the
                 # test could observe.
-                def worker(cost):
+                def worker(tokens):
                     for _ in range(per_thread):
-                        _emit_cost(
-                            {
-                                "input_tokens": 1,
-                                "output_tokens": 0,
-                                "cost": cost,
-                                "total_cost_usd": 0.0,
-                                "total_tokens": 0,
-                                "model": "fake-model",
-                                "provider": "openai",
-                                "session_id": self.session_id,
-                                "elapsed_ms": 0,
-                            }
+                        CostTracker().record_llm_call(
+                            tokens, 0, "fake-model", session_id=self.session_id
                         )
 
                 workers = [
-                    threading.Thread(target=worker, args=(0.01 * (t + 1),), daemon=True)
+                    threading.Thread(target=worker, args=(t + 1,), daemon=True)
                     for t in range(threads_n)
                 ]
                 for w in workers:
@@ -725,11 +803,11 @@ class TestCostFramePublishOrdering:
 
         with patch("clearwing.ui.web.app.create_agent", _ConcurrentCostGraph):
             # Shrink the GIL switch interval: the pre-fix race window
-            # (lock released after the arithmetic, enqueue scheduled only
+            # (lock released after the snapshot read, enqueue scheduled only
             # after dumps) is a handful of bytecodes wide and almost never
-            # hit at the default 5ms interval — at ~1µs a preempted
-            # holder is the common case, so the monotonicity assertion
-            # actually exercises the serialization it guards.
+            # hit at the default 5ms interval — at ~1µs a preempted holder
+            # is the common case, so the monotonicity assertion actually
+            # exercises the serialization it guards.
             old_interval = sys.getswitchinterval()
             sys.setswitchinterval(1e-6)
             try:
@@ -751,15 +829,19 @@ class TestCostFramePublishOrdering:
         costs = [f["data"]["total_cost_usd"] for f in cost_frames]
         tokens = [f["data"]["total_tokens"] for f in cost_frames]
         # Monotonic non-decreasing: the single writer delivers in enqueue
-        # order, and (post-fix) enqueue order == accumulation order — a
+        # order, and (post-fix) enqueue order == snapshot-read order — a
         # smaller total never follows a larger one on the wire.
         assert all(b >= a for a, b in zip(costs, costs[1:]))
         assert all(b >= a for a, b in zip(tokens, tokens[1:]))
         # Final consistency: the last delivered frame carries the exact
-        # accumulated totals for every emission.
-        expected_total = 0.01 * sum(range(1, threads_n + 1)) * per_thread
-        assert costs[-1] == pytest.approx(expected_total)
-        assert tokens[-1] == total_emissions
+        # tracker-authoritative totals for every booking.
+        expected_cost = sum(
+            CostTracker.estimate_cost(t + 1, 0, "fake-model") * per_thread
+            for t in range(threads_n)
+        )
+        expected_tokens = sum((t + 1) * per_thread for t in range(threads_n))
+        assert costs[-1] == pytest.approx(expected_cost)
+        assert tokens[-1] == expected_tokens
 
 
 class TestWriterFailureTeardown:
@@ -884,6 +966,131 @@ class TestWriterDeathWithoutWaiters:
                 "connection down via the writer_task.done() guard — not "
                 "wait forever on a future nothing will resolve"
             )
+
+
+class TestCancelledTerminalFrameResidue:
+    """Codex PR-62 r3 (Finding 1): a terminal frame whose flush handshake
+    was cancelled by `stop` must never reach the wire. The turn parks on
+    `await fut` while the writer sits in a send-retry backoff; the stop
+    cancels the turn task, which cancels the awaited future — the entry
+    stays in the queue, and the writer must SKIP it instead of delivering
+    a stale agent_message/complete ahead of the authoritative
+    `stopped` + `complete(status=stopped)` handshake."""
+
+    def test_stale_terminal_frame_skipped_after_stop_cancels_flush(
+        self, client, monkeypatch
+    ):
+        import threading
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        from clearwing.ui.web import app as app_module
+
+        # A wide retry interval: the writer's next failed-attempt sweep
+        # (which resolves every pending handshake False and would end the
+        # turn EARLY instead of stranding a cancelled entry) must stay a
+        # safe distance past the stop's round trip.
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 1.0)
+
+        # Turn-side anchor: add_agent records the reply text immediately
+        # BEFORE the dedup gate and the inline agent_message enqueue — the
+        # turn is parked on that frame's flush handshake one loop slot
+        # later. Stop-side anchor: the stop handler records the operator
+        # stop in the transcript AFTER the cancelled turn task was joined
+        # and BEFORE enqueueing `stopped`.
+        parked = threading.Event()
+        stopped_recorded = threading.Event()
+        real_add_agent = app_module.SessionTranscript.add_agent
+        real_add_error = app_module.SessionTranscript.add_error
+
+        def signaling_add_agent(transcript_self, content):
+            real_add_agent(transcript_self, content)
+            parked.set()
+
+        def signaling_add_error(transcript_self, message):
+            real_add_error(transcript_self, message)
+            if "stopped by operator" in str(message):
+                stopped_recorded.set()
+
+        monkeypatch.setattr(
+            app_module.SessionTranscript, "add_agent", signaling_add_agent
+        )
+        monkeypatch.setattr(
+            app_module.SessionTranscript, "add_error", signaling_add_error
+        )
+
+        # Congestion, then recovery: every send fails while the flag is
+        # down (the writer sits in its retry backoff on the echo frame)
+        # and succeeds again once it flips back up.
+        real_send_text = FastAPIWebSocket.send_text
+        congested = {"now": False}
+
+        async def congested_send_text(self_ws, data):
+            if congested["now"]:
+                raise RuntimeError("simulated send congestion")
+            return await real_send_text(self_ws, data)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", congested_send_text)
+
+        # > 200 chars: the bus echo is a 200-char preview that never
+        # equals the full text, so the dedup gate cannot suppress the
+        # inline send the turn parks on.
+        text = "stale-terminal-frame-probe " * 40
+        with patch(
+            "clearwing.ui.web.app.create_agent",
+            lambda **kwargs: _EchoThenFinishGraph(text),
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                assert ws.receive_json()["type"] == "started"
+
+                congested["now"] = True
+                ws.send_json({"type": "message", "content": "run"})
+                assert parked.wait(timeout=10), (
+                    "turn never reached its inline agent_message enqueue"
+                )
+                # Stop NOW — inside the retry window, with the turn parked
+                # on the inline frame's flush handshake and the stale
+                # entry already queued behind the stuck echo.
+                ws.send_json({"type": "stop"})
+                # Once the stop is recorded the turn task has been
+                # cancelled and joined: its handshake future is cancelled
+                # and the entry is stranded in the queue. Only now may
+                # the transport recover.
+                assert stopped_recorded.wait(timeout=10), (
+                    "stop handler never cancelled+joined the turn"
+                )
+                congested["now"] = False
+
+                frames = []
+                while True:
+                    frame = _receive_json_with_timeout(ws)
+                    frames.append(frame)
+                    if frame["type"] == "complete":
+                        break
+
+        stopped_frame = next(f for f in frames if f["type"] == "stopped")
+        # The turn really was cancelled mid-park (not ended early by a
+        # failed-send sweep): the residue scenario was exercised.
+        assert stopped_frame["data"]["cancelled_turn"] is True
+        types = [f["type"] for f in frames]
+        stopped_at = types.index("stopped")
+        # The first terminal frame is the authoritative stopped — no
+        # complete (and no stale agent_message) may precede it.
+        assert "complete" not in types[:stopped_at]
+        contents = [
+            f["data"]["content"] for f in frames if f["type"] == "agent_message"
+        ]
+        # The stale inline agent_message was skipped with its cancelled
+        # handshake; only the echo's 200-char preview was delivered.
+        assert text not in contents
+        assert text[:200] in contents
+        # The handshake completes as stopped, and no complete frame ever
+        # claims status ok.
+        assert frames[-1]["data"]["status"] == "stopped"
+        assert all(
+            f["data"].get("status") != "ok" for f in frames if f["type"] == "complete"
+        )
 
 
 class TestSessionSnapshotAtomicity:

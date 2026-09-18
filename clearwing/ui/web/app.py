@@ -610,25 +610,28 @@ def create_app():
 
         # Session-scoped cost totals (issue #10): CostTracker is a
         # process-wide singleton whose running totals accumulate across
-        # webui sessions. While THIS session's turn is running, accumulate
-        # the per-call cost/tokens and rewrite a shallow copy for the wire
-        # and the transcript; the shared bus payload itself stays untouched
-        # (metrics gauges keep reading the process-global totals).
-        # The accumulator is written from worker threads (on_event handlers
-        # run in the emitting thread) and reset from the event loop (start
-        # frames), so every access takes the lock (issue #48: the unlocked
-        # read-modify-write could drop concurrent bookings).
+        # webui sessions. The per-session snapshot from the tracker is
+        # authoritative: every cost_update frame this connection
+        # forwards carries it (rewritten into a shallow copy for the
+        # wire and the transcript), while the shared bus payload stays
+        # untouched (metrics gauges keep reading the process-global
+        # totals). The accumulator is written from worker threads
+        # (on_event handlers run in the emitting thread) and reset from
+        # the event loop (start frames), so every access takes the lock
+        # (issue #48: the unlocked read-modify-write could drop
+        # concurrent bookings).
         session_cost = {"cost_usd": 0.0, "tokens": 0}
         session_cost_lock = threading.Lock()
 
         # Codex PR-62 r2 (Finding 2): for cost_update frames the ENTIRE
-        # sequence — accumulate, assemble, dumps, schedule the enqueue,
+        # sequence — scope-rewrite, assemble, dumps, schedule the enqueue,
         # record the transcript — runs under this lock (see the
         # cost_update branch in `on_event`). The enqueue order IS the wire
-        # order (single writer, FIFO), so accumulation and publish must be
-        # one serialized step: with the lock around the arithmetic only, a
-        # worker holding a SMALLER total could schedule its enqueue after a
-        # worker holding a larger one, and the wire totals would regress.
+        # order (single writer, FIFO), so the snapshot read and publish
+        # must be one serialized step: with the lock around the arithmetic
+        # only, a worker holding a SMALLER total could schedule its
+        # enqueue after a worker holding a larger one, and the wire totals
+        # would regress.
         def _session_scope_cost_update_locked(data: dict) -> dict | None:
             """Returns the frame to enqueue, or None to drop it.
 
@@ -638,54 +641,57 @@ def create_app():
 
             Frames now carry an attribution id (the runtime since PR #39,
             hunts since issue #41): only frames whose id matches THIS
-            session accumulate here — a mismatching id (another webui
+            session are scoped here — a mismatching id (another webui
             session, a standalone hunt's sh-* id) is dropped so concurrent
             sessions never swallow each other's spend. Emissions without a
             session id (older callers) keep the transitional behaviour and
-            still accumulate while this turn runs. Outside this session's
-            turn the bus is unattributable: matching/unscoped frames are
-            still forwarded, but with the tracker's totals for THIS session
-            (issue #48: they used to carry the emitter's process-global
-            running totals), foreign frames are dropped.
+            still accumulate while this turn runs.
+
+            Totals are TRACKER-AUTHORITATIVE (Codex PR-62 r3): the runtime
+            books every call under the tracker's lock BEFORE emitting its
+            frame (``CostTracker.record_llm_call``), so whichever turn
+            window the handler runs in, the session snapshot already
+            includes the call. Both branches therefore ASSIGN from one
+            locked snapshot instead of the in-turn branch ``+=``-ing the
+            frame's own per-call fields: a handler delayed across a turn
+            boundary could not double-count a call an out-of-turn frame
+            already captured (the r2 rebase race), and whatever order the
+            handlers run in, the wire totals are rewritten to the same
+            authoritative water level. A sessionless (None) id keeps the
+            legacy in-turn ``+=`` transitional semantics — the tracker has
+            no bucket to read there (out-of-turn it snapshots to zero,
+            the accepted r1 behaviour).
             """
             origin = data.get("session_id")
             if origin is not None and origin != session_id:
                 return None
-            if not turn_state["active"]:
-                # One locked snapshot, not two independent reads: a
-                # booking landing between separate session_total and
-                # session_tokens calls would yield a frame whose tokens
-                # include a call its cost does not (Codex PR-62 r1).
-                scoped_cost, in_tokens, out_tokens = telemetry.CostTracker().session_snapshot(
-                    session_id
-                )
-                # Late-booking reconciliation (Codex PR-62 r2, Finding 1):
-                # the tracker is authoritative, so the out-of-turn frame
-                # not only carries the snapshot but RE-BASES the in-turn
-                # accumulator onto it. Without this, a call that completed
-                # after the turn ended would be reported once and then
-                # forgotten — the next turn's in-turn frames would add
-                # onto the stale base and the wire/report totals would
-                # regress below spend that already happened. The raw
-                # (unrounded) snapshot is stored; display keeps the
-                # in-turn branch's round(..., 10) semantics.
-                session_cost["cost_usd"] = scoped_cost
-                session_cost["tokens"] = in_tokens + out_tokens
-                scoped = dict(data)
-                scoped["total_cost_usd"] = round(scoped_cost, 10)
-                scoped["total_tokens"] = in_tokens + out_tokens
-                return scoped
-            call_cost = data.get("cost")
-            per_call_tokens = (data.get("input_tokens") or 0) + (
-                data.get("output_tokens") or 0
-            )
-            if isinstance(call_cost, (int, float)):
-                session_cost["cost_usd"] += float(call_cost)
-            if isinstance(per_call_tokens, int) and per_call_tokens > 0:
-                session_cost["tokens"] += per_call_tokens
             scoped = dict(data)
-            scoped["total_cost_usd"] = round(session_cost["cost_usd"], 10)
-            scoped["total_tokens"] = session_cost["tokens"]
+            if session_id is None and turn_state["active"]:
+                # Legacy no-id transition: accumulate the frame's own
+                # per-call fields while this turn runs (unchanged).
+                call_cost = data.get("cost")
+                per_call_tokens = (data.get("input_tokens") or 0) + (
+                    data.get("output_tokens") or 0
+                )
+                if isinstance(call_cost, (int, float)):
+                    session_cost["cost_usd"] += float(call_cost)
+                if isinstance(per_call_tokens, int) and per_call_tokens > 0:
+                    session_cost["tokens"] += per_call_tokens
+                scoped["total_cost_usd"] = round(session_cost["cost_usd"], 10)
+                scoped["total_tokens"] = session_cost["tokens"]
+                return scoped
+            # One locked snapshot, not two independent reads: a booking
+            # landing between separate session_total and session_tokens
+            # calls would yield a frame whose tokens include a call its
+            # cost does not (Codex PR-62 r1). For a None id out of turn
+            # this is (0, 0, 0) — the accepted r1 behaviour.
+            scoped_cost, in_tokens, out_tokens = telemetry.CostTracker().session_snapshot(
+                session_id
+            )
+            session_cost["cost_usd"] = scoped_cost
+            session_cost["tokens"] = in_tokens + out_tokens
+            scoped["total_cost_usd"] = round(scoped_cost, 10)
+            scoped["total_tokens"] = in_tokens + out_tokens
             return scoped
 
         def _record_in_transcript(event_name: str, data: Any) -> None:
@@ -790,7 +796,7 @@ def create_app():
                             # lock across the scope-rewrite AND the whole
                             # publish sequence (assembly, dumps, enqueue
                             # scheduling, transcript) so the wire order of
-                            # cost frames always matches the accumulation
+                            # cost frames always matches the snapshot-read
                             # order — totals never regress. Safe to call
                             # under the lock: call_soon_threadsafe is
                             # non-blocking, and the transcript's
@@ -1019,6 +1025,24 @@ def create_app():
             # which cancels this task.
             while True:
                 text, payload, fut = await outbound_queue.get()
+                if fut is not None and fut.cancelled():
+                    # Codex PR-62 r3 (Finding 1): this entry's flush
+                    # handshake was CANCELLED — the coroutine that
+                    # enqueued it (a turn task killed by `stop`) is gone
+                    # and no longer claims the frame. `_send_frame`'s
+                    # finally already removed the future from
+                    # flush_futures, but the entry kept the object, so
+                    # cancelled() is still observable here. Sending it
+                    # would deliver a STALE terminal frame — the
+                    # cancelled turn's agent_message/complete — after
+                    # the receive loop moved on, ahead of the stop
+                    # handshake's authoritative `stopped` +
+                    # `complete(status=stopped)`: a client treating the
+                    # first complete as authoritative would read a
+                    # wrong turn state. Skip it; a cancelled flush
+                    # sentinel is equally dead (its waiter is gone) and
+                    # skipping it changes nothing on the wire.
+                    continue
                 if payload is None:
                     # Flush sentinel: everything enqueued before it has been
                     # delivered (the writer is strictly sequential — a

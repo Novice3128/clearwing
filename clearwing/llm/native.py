@@ -2319,18 +2319,31 @@ class AsyncLLMClient:
     )
 
     def _is_not_found_error(self, exc: Exception) -> bool:
-        """True for HTTP 404 failures — structured attrs, then anchored text."""
+        """True for HTTP 404 failures — structured attrs, then anchored text.
+
+        Structured statuses are AUTHORITATIVE (Codex PR-62 r3): every
+        status/status_code/http_status on the chain is collected first,
+        and when ANY exists the verdict is exactly "some layer says 404"
+        — an explicit 400/500 must not be misclassified by body text
+        that happens to mention "HTTP 404". The anchored-text fallback
+        only runs when the chain carries no structured status at all.
+        """
         cur: BaseException | None = exc
         seen: set[int] = set()
+        statuses: list[int | str] = []
         while cur is not None and id(cur) not in seen:
             seen.add(id(cur))
             for attr in ("status", "status_code", "http_status"):
                 value = getattr(cur, attr, None)
+                # bool is an int subclass but is not a status (kept from
+                # the original guard).
                 if isinstance(value, bool):
                     continue
-                if value == 404 or value == "404":
-                    return True
+                if isinstance(value, (int, str)):
+                    statuses.append(value)
             cur = cur.__cause__ or cur.__context__
+        if statuses:
+            return any(s == 404 or s == "404" for s in statuses)
         return bool(self._NOT_FOUND_STATUS_ANCHOR.search(_exception_chain_text(exc)))
 
     def _annotate_pathless_404(self, exc: Exception) -> None:

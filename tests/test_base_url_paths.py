@@ -291,6 +291,53 @@ class TestPathless404Advice:
         assert "has no path component" in str(excinfo.value)
 
     @pytest.mark.asyncio
+    async def test_structured_non_404_status_beats_404_body_text(self):
+        # Codex PR-62 r3: an explicit structured status anywhere in the
+        # chain is AUTHORITATIVE — a 400 whose body text happens to say
+        # "HTTP 404" must not gain the pathless-base_url advice (400 is
+        # not retried, so this raises on the first attempt).
+        client = _openai_client("http://host:8787")
+
+        async def op():
+            exc = RuntimeError("upstream body said: HTTP 404: not found")
+            exc.status = 400
+            raise exc
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await client._with_retries(op)
+        assert "has no path component" not in str(excinfo.value)
+
+    def test_structured_status_is_authoritative_over_anchored_text(self):
+        # Direct classifier probes (avoids the 5xx retry backoff):
+        # - structured 500 + "HTTP 404" body text → NOT a 404;
+        # - the same 500 wrapping a 404 cause → 404 in SOME layer wins;
+        # - a structured "404" string counts too;
+        # - no structured status anywhere → anchored text decides.
+        client = _openai_client("http://host:8787")
+
+        outer = RuntimeError("gateway exploded; body mentioned HTTP 404")
+        outer.status = 500
+        assert client._is_not_found_error(outer) is False
+
+        inner = RuntimeError("not found")
+        inner.status_code = 404
+        chained = RuntimeError("gateway exploded; body mentioned HTTP 404")
+        chained.status = 500
+        chained.__cause__ = inner
+        assert client._is_not_found_error(chained) is True
+
+        string_status = RuntimeError("request failed")
+        string_status.http_status = "404"
+        assert client._is_not_found_error(string_status) is True
+
+        text_only = RuntimeError("failed with HTTP 404: not found")
+        assert client._is_not_found_error(text_only) is True
+
+        bool_status = RuntimeError("failed with HTTP 404: not found")
+        bool_status.status = True  # bool is not a status — text anchor decides
+        assert client._is_not_found_error(bool_status) is True
+
+    @pytest.mark.asyncio
     async def test_non_404_error_gets_no_advice(self):
         client = _openai_client("http://host:8787")
 
