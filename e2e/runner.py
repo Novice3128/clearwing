@@ -867,9 +867,65 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
     if before_8899 is not None:
         out.append(("live-8899-pids-unchanged", listening_pids(8899) == before_8899,
                     f"before={before_8899} now={listening_pids(8899)}"))
-    # Secret scan — VALUE-based (the regex alone missed JSON/repr/header
-    # forms): byte-search artifacts for the actual webui + LLM key values,
-    # held in memory, never printed; only hit FILENAMES are reported.
+
+    # ---- P3 state-integrity block runs BEFORE the keyscan so that the
+    # aside-POST snapshots it creates are themselves scanned (Codex #67 r4)
+    pre = run_dir / "state" / "aside-pre"
+    post = run_dir / "state" / "aside-post"
+    if pre.exists():
+        post.mkdir(exist_ok=True)
+        _aside_copy(Path.home() / ".clearwing", post)
+        diffs = []
+        for name in ASIDE_FILES:
+            was, now = (pre / name).exists(), (post / name).exists()
+            if was and now:
+                pre_b, post_b = (pre / name).read_bytes(), (post / name).read_bytes()
+                if pre_b != post_b:
+                    diffs.append(f"{name}:{len(pre_b)}->{len(post_b)}B")
+            elif now and not was:
+                diffs.append(f"{name}:+CREATED")
+            elif was and not now:
+                diffs.append(f"{name}:-DELETED")
+        out.append(("memory-aside-diff-recorded", True,
+                    f"changed: {diffs or 'none'} (control copies in state/aside-*)"))
+    # post-run target-state comparison vs pre-state.json snapshot; a difference
+    # is majority-confirmed 3x before it counts (one lost SYN != state change)
+    def _probe_confirmed(tgt, port, want_open):
+        for _ in range(3):
+            if probe_majority(tgt, int(port)) == bool(want_open):
+                return True
+            time.sleep(1)
+        return False
+    try:
+        pre_state = json.loads((run_dir / "state" / "pre-state.json").read_text())
+        changed = []
+        for tgt, ports in (pre_state.get("target_snapshot") or {}).items():
+            for port, was_open in ports.items():
+                if not _probe_confirmed(tgt, port, was_open):
+                    changed.append(f"{tgt}:{port} {was_open}->{not was_open}")
+        out.append(("target-state-unchanged", not changed, f"{changed or 'stable'}"))
+    except (OSError, ValueError, TypeError):
+        out.append(("target-state-unchanged", False, "pre-state.json unreadable"))
+    # cumulative budget ledger (results/ is gitignored)
+    try:
+        led_p = RESULTS / "budget-ledger.json"
+        ledger = json.loads(led_p.read_text()) if led_p.exists() else {"runs": [], "cap_usd": 700}
+        run_cost = 0.0
+        man = run_dir / "manifest.json"
+        if man.exists():
+            run_cost = round(sum((s.get("summary") or {}).get("cost_usd_product") or 0
+                                 for s in json.loads(man.read_text())), 4)
+        ledger["runs"].append({"ts": time.strftime("%F %T"), "run": run_dir.name,
+                               "cost_usd": run_cost})
+        ledger["total_usd"] = round(sum(r["cost_usd"] for r in ledger["runs"]), 4)
+        led_p.write_text(json.dumps(ledger, indent=1))
+        out.append(("budget-ledger-updated", ledger["total_usd"] <= ledger["cap_usd"],
+                    f"cumulative ${ledger['total_usd']} / cap ${ledger['cap_usd']}"))
+    except Exception as e:  # noqa: BLE001
+        out.append(("budget-ledger-updated", False, f"ledger error: {e}"))
+
+    # ---- value-based secret scan LAST, over artifacts INCLUDING the aside
+    # snapshots just created (memory content may embed keys)
     secrets: list[bytes] = []
     try:
         if keyfile is not None:
@@ -896,76 +952,19 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
             if any(s and s in data for s in secrets) or re.search(
                     rb"api_key[=:?&]\s*['\"]?[A-Za-z0-9_-]{20,}", data):
                 hits.append(str(f))
-    for f in list(run_dir.glob("state/aside-*/*")):   # memory snapshots may
-        if not f.is_file():                            # embed secrets; they are
-            continue                                   # NOT covered by the suffix
-        try:                                           # allowlist (Codex #67 r3 P1)
+    for f in list(run_dir.glob("state/aside-*/*")):   # memory snapshots:
+        if not f.is_file():                            # suffix-blind scan
+            continue
+        try:
             data = f.read_bytes()
         except OSError:
             continue
         if any(s and s in data for s in secrets):
             hits.append(str(f))
     out.append(("artifact-keyscan", not hits, f"{hits[:3]} ({len(secrets)} value-probes)"))
+
     s, _ = http_get(f"{SUITE['webui']['live']}/api/health")
     out.append(("live-health-final", s == 200, f"HTTP {s}"))
-    # P3.1 post snapshot + diff vs aside-pre (v2 SOP② mechanized)
-    pre = run_dir / "state" / "aside-pre"
-    post = run_dir / "state" / "aside-post"
-    if pre.exists():
-        post.mkdir(exist_ok=True)
-        _aside_copy(Path.home() / ".clearwing", post)
-        diffs = []
-        for name in ASIDE_FILES:
-            was, now = (pre / name).exists(), (post / name).exists()
-            if was and now:
-                pre_b, post_b = (pre / name).read_bytes(), (post / name).read_bytes()
-                if pre_b != post_b:
-                    diffs.append(f"{name}:{len(pre_b)}->{len(post_b)}B")
-            elif now and not was:
-                diffs.append(f"{name}:+CREATED")       # appeared during the run —
-            elif was and not now:
-                diffs.append(f"{name}:-DELETED")       # a mutation the old
-        # pre∩post-only compare silently missed (Codex #67 r2)
-        out.append(("memory-aside-diff-recorded", True,
-                    f"changed: {diffs or 'none'} (control copies in state/aside-*)"))
-    # P3.2 post-run target-state comparison vs pre-state.json snapshot.
-    # Single-probe flaps (one lost SYN) would false-FAIL a healthy run, so a
-    # difference is re-confirmed up to 3x before it counts (review N4).
-    def _probe_confirmed(tgt, port, want_open):
-        # post side: re-probe with majority policy; only a CONFIRMED
-        # difference from the (already majority-confirmed) baseline counts
-        for _ in range(3):
-            if probe_majority(tgt, int(port)) == bool(want_open):
-                return True
-            time.sleep(1)
-        return False
-    try:
-        pre_state = json.loads((run_dir / "state" / "pre-state.json").read_text())
-        changed = []
-        for tgt, ports in (pre_state.get("target_snapshot") or {}).items():
-            for port, was_open in ports.items():
-                if not _probe_confirmed(tgt, port, was_open):
-                    changed.append(f"{tgt}:{port} {was_open}->{not was_open}")
-        out.append(("target-state-unchanged", not changed, f"{changed or 'stable'}"))
-    except (OSError, ValueError, TypeError):
-        out.append(("target-state-unchanged", False, "pre-state.json unreadable"))
-    # P3.3 cumulative budget ledger (results/ is gitignored)
-    try:
-        led_p = RESULTS / "budget-ledger.json"
-        ledger = json.loads(led_p.read_text()) if led_p.exists() else {"runs": [], "cap_usd": 700}
-        run_cost = 0.0
-        man = run_dir / "manifest.json"
-        if man.exists():
-            run_cost = round(sum((s.get("summary") or {}).get("cost_usd_product") or 0
-                                 for s in json.loads(man.read_text())), 4)
-        ledger["runs"].append({"ts": time.strftime("%F %T"), "run": run_dir.name,
-                               "cost_usd": run_cost})
-        ledger["total_usd"] = round(sum(r["cost_usd"] for r in ledger["runs"]), 4)
-        led_p.write_text(json.dumps(ledger, indent=1))
-        out.append(("budget-ledger-updated", ledger["total_usd"] <= ledger["cap_usd"],
-                    f"cumulative ${ledger['total_usd']} / cap ${ledger['cap_usd']}"))
-    except Exception as e:  # noqa: BLE001
-        out.append(("budget-ledger-updated", False, f"ledger error: {e}"))
     for name, ok, note in out:
         log(f"cleanup {'PASS' if ok else 'WARN'} {name} {note}")
     return out
