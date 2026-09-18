@@ -189,21 +189,22 @@ def _is_pathless_base_url(base_url: str) -> bool:
 
 
 def _redact_url_credentials(url: str) -> str:
-    """Display-only form of *url* with any ``user:pass@`` userinfo removed.
+    """Display-only form of *url* safe for warnings and error messages.
 
     aiohttp honors userinfo in the request URL as HTTP basic auth, so the
     real request path keeps the original *url* — this helper exists solely
-    for warnings and error messages, where embedded credentials must not
-    leak into logs. Query and fragment are dropped along the way; only
-    scheme/host/port/path are preserved for display.
+    for logs and error text, where embedded credentials must not leak.
+    The display form is ALWAYS rebuilt from scheme/host/port/path: any
+    ``user:pass@`` userinfo is stripped AND query/fragment are dropped —
+    even without userinfo a query can carry a credential (presigned
+    gateway URLs like ``https://host?api_key=secret``), so a parsed URL
+    is never returned as-is.
     """
     try:
         parts = urlparse(url)
     except ValueError:
         return url
-    if "@" not in parts.netloc:
-        return url
-    hostinfo = parts.netloc.rsplit("@", 1)[1]
+    hostinfo = parts.netloc.rsplit("@", 1)[1] if "@" in parts.netloc else parts.netloc
     return urlunparse((parts.scheme, hostinfo, parts.path, "", "", ""))
 
 

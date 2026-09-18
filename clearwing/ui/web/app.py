@@ -578,6 +578,13 @@ def create_app():
         #   attempt fails — the same single-strike signal the old inline
         #   `_safe_send` callers used to detect a gone client.
         outbound_queue: asyncio.Queue = asyncio.Queue()
+        # The single writer task (created after the handler's helpers are
+        # defined, before the receive loop starts). _send_frame and
+        # _flush_writer consult it: once the writer is done, no queued
+        # frame or sentinel will ever be processed, so new flush
+        # handshakes must fail fast instead of parking forever (the
+        # done-callback only drains futures that were pending at death).
+        writer_task: asyncio.Task | None = None
         # Flush futures currently pending in the queue. The writer resolves
         # them all False the moment a send attempt fails: they provably
         # cannot be delivered until the stuck frame goes out, and without
@@ -633,10 +640,15 @@ def create_app():
             if origin is not None and origin != session_id:
                 return None
             if not turn_state["active"]:
-                tracker = telemetry.CostTracker()
+                # One locked snapshot, not two independent reads: a
+                # booking landing between separate session_total and
+                # session_tokens calls would yield a frame whose tokens
+                # include a call its cost does not (Codex PR-62 r1).
+                scoped_cost, in_tokens, out_tokens = telemetry.CostTracker().session_snapshot(
+                    session_id
+                )
                 scoped = dict(data)
-                scoped["total_cost_usd"] = round(tracker.session_total(session_id), 10)
-                in_tokens, out_tokens = tracker.session_tokens(session_id)
+                scoped["total_cost_usd"] = round(scoped_cost, 10)
                 scoped["total_tokens"] = in_tokens + out_tokens
                 return scoped
             call_cost = data.get("cost")
@@ -877,6 +889,12 @@ def create_app():
             # already-scheduled echo and deliver after `complete`
             # (issue #45's symptom, cross-thread flavor).
             await asyncio.sleep(0)
+            if writer_task is None or writer_task.done():
+                # No consumer will ever pick this frame up (the writer died
+                # or was torn down): report the same single-strike False a
+                # failed send gives, instead of registering a future that
+                # nothing will resolve.
+                return False
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
             flush_futures.add(fut)
             try:
@@ -896,6 +914,10 @@ def create_app():
             False on its next failed attempt rather than parking here
             forever.
             """
+            if writer_task is None or writer_task.done():
+                # Same fast-fail as _send_frame: a dead writer never
+                # reaches the sentinel, and awaiting it would park here.
+                return
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
             flush_futures.add(fut)
             try:
@@ -1480,7 +1502,12 @@ def create_app():
                 await writer_task
             except asyncio.CancelledError:
                 pass
-            except Exception:
+            except BaseException:
+                # The writer died on its own (e.g. a poisoned transport
+                # raising a BaseException that _safe_send_text's Exception
+                # guard cannot swallow) — its death was already logged by
+                # the done-callback; joining must not abort the teardown
+                # still ahead (transcript write, bus unsubscribe).
                 logger.debug("Outbound writer shutdown error", exc_info=True)
             if transcript is not None:
                 try:

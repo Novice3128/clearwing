@@ -353,3 +353,22 @@ class TestRedactUrlCredentials:
             _redact_url_credentials("http://u%40x:pass@host:8787")
             == "http://host:8787"
         )
+
+    def test_query_secret_dropped_even_without_userinfo(self):
+        # Codex PR-62 r1 (P1): a presigned-gateway base_url carries its
+        # credential in the QUERY, not the userinfo — the display form
+        # must drop it. The old early-return leaked the full URL.
+        assert (
+            _redact_url_credentials("https://host:8787?api_key=sekrit")
+            == "https://host:8787"
+        )
+
+    def test_fragment_dropped_even_without_userinfo(self):
+        assert _redact_url_credentials("https://host:8787/#tok=abc") == "https://host:8787/"
+
+    def test_pathless_query_secret_warning_and_404_do_not_leak(self, caplog):
+        # End-to-end guard for the same leak through both new surfaces:
+        # the construction warning and the 404 annotation.
+        with caplog.at_level("WARNING"):
+            _openai_client("https://host:8787?api_key=sekrit")
+        assert not any("sekrit" in r.message for r in caplog.records)

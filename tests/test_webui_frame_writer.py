@@ -16,6 +16,7 @@ FIFO queue and one writer coroutine:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import threading
 from types import SimpleNamespace
@@ -30,6 +31,31 @@ from clearwing.ui.web.app import create_app  # noqa: E402
 
 API_KEY = "test-key-8f3a"
 AUTH = {"X-API-Key": API_KEY}
+
+
+def _receive_json_with_timeout(ws, *, timeout: float = 10.0) -> dict:
+    """receive_json with a hard wall-clock cap (Codex PR-62 r1).
+
+    A frame-count cap cannot advance past a blocking receive: when a
+    regression means the expected frame never arrives at all, the first
+    receive blocks forever and the suite hangs instead of failing. The
+    receive runs on a worker thread. On timeout, fail IMMEDIATELY with a
+    non-blocking pool shutdown: the worker only unblocks when the test's
+    `websocket_connect` context exits (its ExitStack cancels the session
+    task, which closes the receive stream) — ws.close() alone does NOT
+    unblock it (starlette parks the session task after teardown), so
+    waiting for the worker here would deadlock before the failure is
+    even reported."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(ws.receive_json)
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        pool.shutdown(wait=False)
+        pytest.fail(f"no frame arrived within {timeout}s")
+    finally:
+        pool.shutdown(wait=False)
+
 
 
 @pytest.fixture
@@ -438,11 +464,11 @@ class TestOutOfTurnCostScoping:
                     }
                 )
                 out_of_turn = None
-                # Frame-count cap instead of an open-ended loop: if the
-                # adapter ever stops forwarding the frame, fail fast
-                # instead of parking on receive forever.
+                # Time- AND count-bounded receive: if the adapter ever
+                # stops forwarding the frame (or nothing arrives at all),
+                # fail fast instead of parking on a blocking receive.
                 for _ in range(20):
-                    frame = json.loads(ws.receive_text())
+                    frame = _receive_json_with_timeout(ws, timeout=10.0)
                     if frame["type"] == "cost_update":
                         out_of_turn = frame
                         break
@@ -595,3 +621,91 @@ class TestWriterFailureTeardown:
                 "handler must tear down when a terminal frame's send keeps "
                 "failing — not hang on a dead socket"
             )
+
+
+class TestWriterDeathWithoutWaiters:
+    """Codex PR-62 r1: the writer dying while NO flush future is pending
+    must not strand the NEXT waiter — a later terminal frame registers a
+    fresh future nobody will ever resolve. _send_frame's writer_task.done()
+    guard has to fail it immediately instead."""
+
+    def test_command_after_writer_death_fails_fast_not_forever(
+        self, client, monkeypatch
+    ):
+        import time
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        from clearwing.core.events import EventBus
+
+        class _WriterKilled(BaseException):
+            # _safe_send_text swallows `Exception` only — a BaseException
+            # escapes it and kills the writer coroutine for real.
+            pass
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
+
+        real_send_text = FastAPIWebSocket.send_text
+        kill = {"now": False}
+
+        async def killed_send_text(self_ws, data):
+            if kill["now"]:
+                raise _WriterKilled("writer coroutine died")
+            return await real_send_text(self_ws, data)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", killed_send_text)
+
+        torn_down = threading.Event()
+        real_unsubscribe = EventBus.unsubscribe
+
+        def recording_unsubscribe(bus_self, event_type, handler):
+            real_unsubscribe(bus_self, event_type, handler)
+            torn_down.set()
+
+        monkeypatch.setattr(EventBus, "unsubscribe", recording_unsubscribe)
+
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "10.0.0.9"})
+            assert ws.receive_json()["type"] == "started"
+
+            # Kill the writer while NOBODY is awaiting a flush: emit a bus
+            # event whose delivery kills the writer coroutine (no terminal
+            # frame in flight → no pending future at death time).
+            kill["now"] = True
+            _emit_tool_start("after_death_probe", {})
+            time.sleep(0.5)  # let the loop process the poisoned send
+
+            # A later command's terminal frame must fail FAST (the done()
+            # guard) — without it the handler parks on a future that died
+            # with the writer and teardown never runs.
+            ws.send_json({"type": "stop"})
+            assert torn_down.wait(timeout=10), (
+                "a command arriving after the writer died must tear the "
+                "connection down via the writer_task.done() guard — not "
+                "wait forever on a future nothing will resolve"
+            )
+
+
+class TestSessionSnapshotAtomicity:
+    """Codex PR-62 r1: out-of-turn frames read cost and tokens through ONE
+    tracker snapshot — two separately locked reads could straddle a
+    concurrent booking and report internally inconsistent totals."""
+
+    def test_snapshot_returns_cost_and_tokens_together(self):
+        from clearwing.observability.telemetry import CostTracker
+
+        tracker = CostTracker()
+        sid = "snap-atomic-1"
+        tracker.record_llm_call(11, 7, "claude-sonnet-4-6", session_id=sid)
+        cost, in_tok, out_tok = tracker.session_snapshot(sid)
+        assert in_tok == 11 and out_tok == 7
+        assert cost == tracker.session_total(sid)
+        assert (in_tok, out_tok) == tracker.session_tokens(sid)
+        tracker.forget_session(sid)
+
+    def test_snapshot_unknown_and_none_ids(self):
+        from clearwing.observability.telemetry import CostTracker
+
+        tracker = CostTracker()
+        assert tracker.session_snapshot("never-recorded") == (0.0, 0, 0)
+        assert tracker.session_snapshot(None) == (0.0, 0, 0)
