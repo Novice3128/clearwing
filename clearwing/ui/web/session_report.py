@@ -114,6 +114,18 @@ def _md_cell(value: Any) -> str:
     # Cells only; after html.escape, same discipline as `://` above.
     text = re.sub(r"(?i)(www)\.", r"\1&#46;", text)
     text = text.replace("@", "&#64;")
+    # PR #71 r3: the three rules above only neutralize their own shapes —
+    # a bare registrable domain (`evil.com`) has no scheme, `www` or `@` to
+    # break, so linkify still fuzzy-matched it (verified against GFM
+    # markdown-it + linkify: cell `evil.com` became <a href>, while
+    # `evil&#46;com` renders plain text). Escape EVERY intra-word dot — a
+    # dot with word chars on both sides — which breaks any contiguous
+    # label linkify needs, while `&#46;` decodes back to `.` everywhere.
+    # Sentence-ending dots (space follows) and dot-free tokens are
+    # untouched; dotted tokens that never linkified (`10.0.0.1`,
+    # `gpt-4.1-mini`) render byte-identically after unescape. Cells only;
+    # after html.escape, same discipline as the rules above.
+    text = re.sub(r"(\w)\.(\w)", r"\1&#46;\2", text)
     return text.strip()
 
 

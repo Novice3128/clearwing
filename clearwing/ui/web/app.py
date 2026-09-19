@@ -140,12 +140,20 @@ def _probe_dir_writable(directory: Path) -> tuple[bool, str]:
         probe.write_text("ok", encoding="utf-8")
     except OSError as exc:
         return False, f"{directory} is not writable: {exc}"
-    # Cleanup is best-effort: a stale probe file is cosmetic, and failing a
-    # healthy directory over its removal would be worse.
+    # PR #71 r3: cleanup failure is a health failure, not a cosmetic one.
+    # On a filesystem that allows create but denies delete (NFSv4
+    # ADD_FILE without DELETE_CHILD), a best-effort unlink left one
+    # .health_probe.* residue file per poll while health kept answering
+    # 200 — unbounded accumulation until the volume exhausts. A directory
+    # the service cannot keep clean is not a healthy write target:
+    # degrade. Deliberately stateless (no cross-request residue memory) —
+    # the 503 surfaces the condition immediately so the operator fixes
+    # the ACL, and both probe sites (home root and sessions BASE_DIR)
+    # inherit the behavior through this helper.
     try:
         probe.unlink(missing_ok=True)
     except OSError as exc:
-        logger.warning("Health probe residue left at %s: %s", probe, exc)
+        return False, f"{directory} is not writable: probe cleanup failed: {exc}"
     return True, ""
 
 

@@ -215,6 +215,61 @@ class TestHealthSessionsProbe:
         assert len(probe_payloads) >= 2
         assert all(len(payload) > 0 for payload in probe_payloads)
 
+    def test_probe_cleanup_failure_degrades_health(self, client, monkeypatch, tmp_path):
+        """Codex PR-71 r3 (P2): on a filesystem that allows create but
+        denies delete (NFSv4 ADD_FILE without DELETE_CHILD), cleanup was
+        best-effort — every poll left a .health_probe.* residue file
+        while health kept answering 200, accumulating until the volume
+        exhausts. A cleanup failure must degrade health instead. Both
+        probe sites flow through _probe_dir_writable: this variant breaks
+        unlink at the HOME probe (first to fire)."""
+        from pathlib import Path
+
+        home = self._writable_home(monkeypatch, tmp_path)
+        real_unlink = Path.unlink
+
+        def _deny_probe_unlink(self, *args, **kwargs):
+            if self.name.startswith(".health_probe"):
+                raise PermissionError(1, "Operation not permitted", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _deny_probe_unlink)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        # Unauthenticated endpoint: generic wire detail; path + errno stay
+        # in the server log.
+        assert data["detail"] == "state directory unavailable"
+        assert str(home) not in data["detail"]
+
+    def test_probe_cleanup_failure_sessions_dir_degrades_health(
+        self, client, monkeypatch, tmp_path
+    ):
+        """Same regression, sessions-BASE_DIR variant: the home probe
+        cleans up fine but the sessions-dir probe's unlink fails (site
+        mounts can differ) — health must still degrade, with the sessions
+        detail."""
+        from pathlib import Path
+
+        home = self._writable_home(monkeypatch, tmp_path)
+        sessions = home / "sessions"
+        sessions.mkdir()
+        real_unlink = Path.unlink
+
+        def _deny_sessions_probe_unlink(self, *args, **kwargs):
+            if self.parent == sessions and self.name.startswith(".health_probe"):
+                raise PermissionError(1, "Operation not permitted", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _deny_sessions_probe_unlink)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["detail"] == "session store unavailable"
+        assert str(sessions) not in data["detail"]
+
 
 class TestHealthProbeConcurrency:
     """Three-lens review (F3): concurrent /api/health polls used to race on
@@ -1098,9 +1153,10 @@ class TestSessionReportHardening:
         path = transcript.write()
 
         content = path.read_text(encoding="utf-8")
-        # Cell: the raw bare-URL pattern must not survive.
+        # Cell: the raw bare-URL pattern must not survive (r3 adds
+        # intra-word dot escapes on top of the scheme-colon escape).
         assert "http://evil.example" not in content
-        assert "http&#58;//evil.example" in content
+        assert "http&#58;//evil&#46;example" in content
         # Prose: links stay clickable (readability tradeoff, per issue).
         assert "https://docs.example.com/guide" in content
 
@@ -1135,16 +1191,58 @@ class TestSessionReportHardening:
         # Cells: the raw fuzzy forms must not survive anywhere a cell
         # rendered them (Target, Model, tool args).
         assert "www.evil.example" not in content
-        assert "www&#46;evil.example" in content
+        assert "www&#46;evil&#46;example" in content
         assert "WWW.EVIL.example" not in content
-        assert "WWW&#46;EVIL.example" in content
+        assert "WWW&#46;EVIL&#46;example" in content
         assert "user@evil.example" not in content
-        assert "user&#64;evil.example" in content
+        assert "user&#64;evil&#46;example" in content
         # Entities decode back for display: rendered text is unchanged.
         cell = session_report._md_cell("www.evil.example user@evil.example")
         assert html_module.unescape(cell) == "www.evil.example user@evil.example"
         # Prose: fuzzy forms and emails stay raw and clickable.
         assert "user@host.example" in content
+        assert "www.docs.example" in content
+        assert "https://docs.example.com/guide" in content
+
+    def test_bare_registrable_domain_in_cell_not_fuzzy_linked(
+        self, monkeypatch, tmp_path
+    ):
+        """Codex PR-71 r3 (P2): the r1/r2 escapes only break their own
+        shapes — a bare registrable domain (`evil.com`) carries no scheme,
+        `www` or `@`, so GFM markdown-it + linkify still fuzzy-linked it
+        in cells (verified empirically: `evil.com` renders <a href>).
+        Every intra-word dot is now entity-escaped — linkify-it is not
+        entity-aware, so the split labels never match, while `&#46;`
+        decodes back to `.` and rendered text is identical (including
+        dotted tokens that never linkified); prose keeps raw forms."""
+        import html as html_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00013", target="evil.com", model="sub.evil.example"
+        )
+        transcript.add_tool("lookup", args="host 10.0.0.1 model gpt-4.1-mini")
+        transcript.add_user(
+            "docs at www.docs.example and https://docs.example.com/guide"
+        )
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Cells: no contiguous bare-domain token survives to linkify.
+        assert "evil.com" not in content
+        assert "evil&#46;com" in content
+        assert "sub.evil.example" not in content
+        assert "sub&#46;evil&#46;example" in content
+        # Entities decode back for display: rendered text is identical,
+        # and non-link dotted tokens render byte-unchanged.
+        for raw in ("evil.com", "sub.evil.example", "10.0.0.1", "gpt-4.1-mini"):
+            cell = session_report._md_cell(raw)
+            assert html_module.unescape(cell) == raw
+        # Prose: bare domains and URLs stay raw and clickable.
         assert "www.docs.example" in content
         assert "https://docs.example.com/guide" in content
 
