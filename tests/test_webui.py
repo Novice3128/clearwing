@@ -116,10 +116,80 @@ class TestHealthSessionsProbe:
         assert str(home) not in data["detail"]
 
     def test_sessions_path_writable_health_ok(self, client, monkeypatch, tmp_path):
-        self._writable_home(monkeypatch, tmp_path)
-        resp = client.get("/api/health")
-        assert resp.status_code == 200
+        home = self._writable_home(monkeypatch, tmp_path)
+        # Poll repeatedly: every probe (home root AND sessions dir) must
+        # clean up after itself — no .health_probe.* residue either way.
+        for _ in range(3):
+            resp = client.get("/api/health")
+            assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+        sessions = home / "sessions"
+        assert not [
+            p for p in sessions.iterdir() if p.name.startswith(".health_probe")
+        ]
+        assert not [
+            p for p in home.iterdir() if p.name.startswith(".health_probe")
+        ]
+
+    def test_sessions_dir_read_only_degrades_health(self, client, monkeypatch, tmp_path):
+        # #77: mkdir(exist_ok=True) SUCCEEDS on an already-existing
+        # read-only sessions dir (e.g. a separately mounted read-only
+        # volume), so the construction probe alone answers "ok" while the
+        # next SessionStore.save() raises. Health must write-test the dir.
+        home = self._writable_home(monkeypatch, tmp_path)
+        sessions = home / "sessions"
+        sessions.mkdir()
+        sessions.chmod(0o500)
+        try:
+            # Permission bits are advisory for root: verify the
+            # restriction actually bites before asserting on it.
+            canary = sessions / ".canary"
+            try:
+                canary.write_text("", encoding="utf-8")
+            except OSError:
+                restricted = True
+            else:
+                restricted = False
+                canary.unlink(missing_ok=True)
+            if not restricted:
+                pytest.skip("chmod cannot restrict this user (running as root)")
+            resp = client.get("/api/health")
+            assert resp.status_code == 503
+            data = resp.json()
+            assert data["status"] == "degraded"
+            assert data["service"] == "clearwing"
+            # Unauthenticated endpoint: generic wire detail; the sessions
+            # path and errno stay in the server log.
+            assert data["detail"] == "session store unavailable"
+            assert str(home) not in data["detail"]
+            assert str(sessions) not in data["detail"]
+        finally:
+            sessions.chmod(0o700)  # let tmp_path cleanup remove it
+
+    def test_sessions_dir_unwritable_degrades_health_for_root(
+        self, client, monkeypatch, tmp_path
+    ):
+        # Same regression as above, but via an injected OSError so the
+        # case is exercised even where chmod cannot restrict (root CI).
+        from pathlib import Path
+
+        home = self._writable_home(monkeypatch, tmp_path)
+        sessions = home / "sessions"
+        sessions.mkdir()
+        real_write_text = Path.write_text
+
+        def _deny_sessions_writes(self, data, *args, **kwargs):
+            if self.parent == sessions:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_write_text(self, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _deny_sessions_writes)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["detail"] == "session store unavailable"
+        assert str(sessions) not in data["detail"]
 
 
 class TestHealthProbeConcurrency:

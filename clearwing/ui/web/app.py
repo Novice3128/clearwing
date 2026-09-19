@@ -116,6 +116,36 @@ def _cors_origins() -> list[str]:
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 
+def _probe_dir_writable(directory: Path) -> tuple[bool, str]:
+    """Create+write+delete a uniquely-named probe file inside *directory*.
+
+    A directory that merely exists proves nothing: ``mkdir(exist_ok=True)``
+    succeeds on an already-existing read-only directory (e.g. a separately
+    mounted read-only volume), so only an actual create+write catches it
+    before the first real write raises.
+
+    The probe file name is unique per call: concurrent health polls used
+    to race on one fixed `.health_probe` path (one caller's unlink hit
+    another's write → FileNotFoundError → spurious 503s).
+
+    Returns ``(ok, reason)``; the reason carries the directory path and
+    errno for the server log — callers must keep it off the wire
+    (/api/health is unauthenticated).
+    """
+    probe = directory / f".health_probe.{uuid.uuid4().hex}"
+    try:
+        probe.write_text("", encoding="utf-8")
+    except OSError as exc:
+        return False, f"{directory} is not writable: {exc}"
+    # Cleanup is best-effort: a stale empty probe file is cosmetic, and
+    # failing a healthy directory over its removal would be worse.
+    try:
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Health probe residue left at %s: %s", probe, exc)
+    return True, ""
+
+
 def _state_dir_status() -> tuple[bool, str]:
     """Probe the clearwing state directory for writability (issue #7).
 
@@ -123,21 +153,17 @@ def _state_dir_status() -> tuple[bool, str]:
     a read-only volume) breaks SessionStore and every state-writing
     endpoint; /api/health must surface that instead of reporting "ok"
     while /api/sessions 500s on every call.
-
-    The probe file name is unique per call: concurrent health polls used
-    to race on one fixed `.health_probe` path (one caller's unlink hit
-    another's write → FileNotFoundError → spurious 503s).
     """
     from clearwing.core.config import clearwing_home
 
     home = clearwing_home()
     try:
         home.mkdir(parents=True, exist_ok=True)
-        probe = home / f".health_probe.{uuid.uuid4().hex}"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink(missing_ok=True)
     except OSError as exc:
         return False, f"state dir {home} is not writable: {exc}"
+    ok, reason = _probe_dir_writable(home)
+    if not ok:
+        return False, f"state dir {reason}"
     return True, ""
 
 
@@ -235,6 +261,19 @@ def create_app():
                 ok = False
                 reason = store.unavailable_reason or "sessions dir unavailable"
                 detail = "session store unavailable"
+            else:
+                # Issue #77 (Codex PR-71 r1): the sessions dir can EXIST
+                # and still reject writes — a separately mounted read-only
+                # volume passes mkdir(exist_ok=True), so construction alone
+                # answers "ok" while the next SessionStore.save() raises.
+                # Write-probe the exact directory the store persists into
+                # (store.BASE_DIR — the same path save() writes to), using
+                # the unique-probe convention from _state_dir_status.
+                probe_ok, probe_reason = _probe_dir_writable(store.BASE_DIR)
+                if not probe_ok:
+                    ok = False
+                    reason = probe_reason
+                    detail = "session store unavailable"
         if not ok:
             logger.warning("Health degraded: %s", reason)
             return JSONResponse(
