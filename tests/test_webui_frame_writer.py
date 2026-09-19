@@ -39,7 +39,15 @@ FIFO queue and one writer coroutine:
   accumulation on session-bound connections too (Codex PR-62 r4): its
   spend was never booked in the tracker, so the snapshot rewrite would
   silently drop it from the displayed totals — best-effort display, the
-  tracker stays authoritative.
+  tracker stays authoritative;
+- HANDLER-side terminal waits are bounded (issue #66): a half-dead socket
+  (sends fail, receives healthy) parks a no-future frame at the queue
+  head forever, and the receive loop's own stop/rejection handshakes
+  queue behind it with no reaper to rescue them. On expiry the handshake
+  future is cancelled (the writer's stale guard skips the still-queued
+  entry — False stays a hard never-delivered guarantee) and the handler
+  breaks into its normal teardown. Turn-task sends stay unbounded: the
+  stop/disconnect path cancels the turn task, which rescues them.
 """
 
 from __future__ import annotations
@@ -1293,6 +1301,234 @@ class TestStalledBusFrameKeepsLaterWaitersPending:
         assert text[:200] in contents  # the stalled echo went out
         assert text in contents  # the full inline text followed in FIFO order
         assert frames[-1]["data"]["status"] == "ok"
+
+
+class TestHalfDeadSocketHandlerPark:
+    """Issue #66: a half-dead socket — every send fails deterministically,
+    the receive side stays healthy — parks a no-future frame (bus event /
+    heartbeat) at the head of the outbound queue; the writer retries it
+    forever and never reaches anything behind it. The receive loop's own
+    terminal handshakes (`stopped`, busy rejections, ...) queue behind
+    that frame and nothing rescues them: stop/disconnect cancellation
+    cannot reach the loop that IS waiting, and no writer reaper exists on
+    that path — teardown never ran. Handler-side waits are now bounded:
+    on expiry the handshake future is cancelled (the writer's
+    fut.cancelled() stale guard skips the still-queued entry, so False
+    stays a hard never-delivered guarantee) and the handler breaks into
+    the existing teardown."""
+
+    def test_stop_wait_is_bounded_and_teardown_runs(self, client, monkeypatch):
+        import asyncio
+        import threading
+        import time
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        from clearwing.core.events import EventBus
+        from clearwing.observability.telemetry import CostTracker
+        from clearwing.ui.web import app as app_module
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
+        monkeypatch.setattr(
+            "clearwing.ui.web.app._HANDLER_SEND_TIMEOUT_SECONDS", 0.05
+        )
+
+        real_send_text = FastAPIWebSocket.send_text
+        transport_dead = {"now": False}
+        # Wire-level truth: what actually got sent (post-recovery frames
+        # are recorded here too, so a stale `stopped` cannot hide).
+        delivered = []
+        # The stalled head frame must PROVABLY park the writer: wait for
+        # its second failed attempt before triggering the stop flow.
+        second_bus_failure = threading.Event()
+        failures = {"n": 0}
+        # The writer task is the only sender — capture it on its first
+        # send so the test can observe how it ends.
+        writer_state = {"task": None, "cancelled": None}
+        writer_done = threading.Event()
+
+        async def dying_send_text(self_ws, data):
+            if writer_state["task"] is None:
+                task = asyncio.current_task()
+                writer_state["task"] = task
+
+                def _on_done(t):
+                    writer_state["cancelled"] = t.cancelled()
+                    writer_done.set()
+
+                task.add_done_callback(_on_done)
+            if transport_dead["now"]:
+                failures["n"] += 1
+                if failures["n"] >= 2:
+                    second_bus_failure.set()
+                raise RuntimeError("client vanished mid-send")
+            delivered.append(data)
+            return await real_send_text(self_ws, data)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", dying_send_text)
+
+        torn_down = threading.Event()
+        real_unsubscribe = EventBus.unsubscribe
+
+        def recording_unsubscribe(bus_self, event_type, handler):
+            real_unsubscribe(bus_self, event_type, handler)
+            torn_down.set()
+
+        monkeypatch.setattr(EventBus, "unsubscribe", recording_unsubscribe)
+
+        transcript_written = threading.Event()
+        real_write = app_module.SessionTranscript.write
+
+        def recording_write(transcript_self):
+            result = real_write(transcript_self)
+            transcript_written.set()
+            return result
+
+        monkeypatch.setattr(app_module.SessionTranscript, "write", recording_write)
+
+        forgotten = []
+        real_forget = CostTracker.forget_session
+
+        def recording_forget(tracker_self, session_id):
+            forgotten.append(session_id)
+            return real_forget(tracker_self, session_id)
+
+        monkeypatch.setattr(CostTracker, "forget_session", recording_forget)
+
+        with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+            ws.send_json({"type": "start", "target": "10.0.0.9"})
+            started = ws.receive_json()
+            assert started["type"] == "started"
+
+            # Half-dead transport: every send now raises while receives
+            # keep working. The no-future bus frame parks the writer on
+            # its infinite retry AT THE QUEUE HEAD.
+            transport_dead["now"] = True
+            _emit_tool_start("half_dead_head_probe", {})
+            assert second_bus_failure.wait(timeout=10), (
+                "writer never parked retrying the no-future head frame"
+            )
+
+            # Stop queues `stopped` behind the stalled frame. Pre-fix the
+            # receive loop parked on the flush handshake forever and
+            # teardown never ran; the bounded wait must expire it into
+            # the normal teardown path instead (this send itself works —
+            # only the server's send direction is dead).
+            ws.send_json({"type": "stop"})
+
+            assert torn_down.wait(timeout=10), (
+                "handler must tear down when the stop handshake's bounded "
+                "wait expires behind a parked head frame — not hang on a "
+                "half-dead socket (#66)"
+            )
+            # Teardown ran in order: transcript write precedes the bus
+            # unsubscribe that set torn_down.
+            assert transcript_written.is_set()
+            assert started["session_id"] in forgotten
+            assert writer_done.wait(timeout=10), "writer task never ended"
+            assert writer_state["cancelled"] is True, (
+                "teardown must cancel the writer, not leave it retrying"
+            )
+
+            # Recovery: the abandoned `stopped`/post-stop `complete` must
+            # NEVER reach the wire — the cancelled handshake made their
+            # queue entries stale for the writer's skip guard (and the
+            # writer is gone regardless).
+            transport_dead["now"] = False
+            time.sleep(0.1)
+            assert all('"stopped"' not in d for d in delivered)
+            assert all('"complete"' not in d for d in delivered)
+
+    def test_busy_rejection_wait_is_bounded_and_tears_down(
+        self, client, monkeypatch
+    ):
+        import threading
+
+        from fastapi import WebSocket as FastAPIWebSocket
+
+        from clearwing.core.events import EventBus
+        from clearwing.observability.telemetry import CostTracker
+
+        monkeypatch.setattr("clearwing.ui.web.app._PUMP_SEND_RETRY_SECONDS", 0.02)
+        monkeypatch.setattr(
+            "clearwing.ui.web.app._HANDLER_SEND_TIMEOUT_SECONDS", 0.05
+        )
+
+        real_send_text = FastAPIWebSocket.send_text
+        transport_dead = {"now": False}
+        second_bus_failure = threading.Event()
+        failures = {"n": 0}
+
+        async def dying_send_text(self_ws, data):
+            if transport_dead["now"]:
+                failures["n"] += 1
+                if failures["n"] >= 2:
+                    second_bus_failure.set()
+                raise RuntimeError("client vanished mid-send")
+            return await real_send_text(self_ws, data)
+
+        monkeypatch.setattr(FastAPIWebSocket, "send_text", dying_send_text)
+
+        torn_down = threading.Event()
+        real_unsubscribe = EventBus.unsubscribe
+
+        def recording_unsubscribe(bus_self, event_type, handler):
+            real_unsubscribe(bus_self, event_type, handler)
+            torn_down.set()
+
+        monkeypatch.setattr(EventBus, "unsubscribe", recording_unsubscribe)
+
+        forgotten = []
+        real_forget = CostTracker.forget_session
+
+        def recording_forget(tracker_self, session_id):
+            forgotten.append(session_id)
+            return real_forget(tracker_self, session_id)
+
+        monkeypatch.setattr(CostTracker, "forget_session", recording_forget)
+
+        class _SilentTurnGraph:
+            # No bus echo: the turn's flush sentinel queues behind the
+            # stalled head frame and parks (turn-task waits stay
+            # UNBOUNDED by design — the teardown below cancels the turn
+            # task, which rescues them).
+            def get_state(self, config):
+                del config
+                return SimpleNamespace(values={"messages": []}, next=(), tasks=[])
+
+            async def astream(self, input_msg, config, stream_mode="values"):
+                del input_msg, config, stream_mode
+                yield {"messages": [_AI("busy-rejection park probe")]}
+
+        with patch(
+            "clearwing.ui.web.app.create_agent", lambda **kwargs: _SilentTurnGraph()
+        ):
+            with client.websocket_connect("/ws/agent", headers=AUTH) as ws:
+                ws.send_json({"type": "start", "target": "10.0.0.9"})
+                started = ws.receive_json()
+                assert started["type"] == "started"
+
+                # Park the writer on a no-future head frame, then start a
+                # turn: it parks on its flush sentinel behind the head
+                # frame and stays active (it can never finish).
+                transport_dead["now"] = True
+                _emit_tool_start("busy_rejection_head_probe", {})
+                assert second_bus_failure.wait(timeout=10)
+
+                ws.send_json({"type": "message", "content": "run"})
+                # Second message while the turn is active: the busy
+                # rejection is a HANDLER-side send — pre-fix it parked the
+                # receive loop forever here. The bounded wait must expire
+                # it into teardown (which also cancels+joins the parked
+                # turn task and the writer).
+                ws.send_json({"type": "message", "content": "again"})
+
+                assert torn_down.wait(timeout=10), (
+                    "handler must tear down when the busy-rejection "
+                    "frame's bounded wait expires behind a parked head "
+                    "frame — not hang on a half-dead socket (#66)"
+                )
+                assert started["session_id"] in forgotten
 
 
 class TestLegacyUnmarkedCostFrame:
