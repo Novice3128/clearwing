@@ -48,7 +48,14 @@ The two unauthenticated ones relevant to orchestration:
 - `200` — `{"status": "ok", "service": "clearwing"}`.
 - `503` — `{"status": "degraded", "service": "clearwing",
   "detail": "state directory unavailable"}` when the Clearwing state
-  directory (`CLEARWING_HOME`) is not writable. The wire `detail` is
+  directory (`CLEARWING_HOME`) is not writable, or
+  `"detail": "session store unavailable"` when the sessions persistence
+  path (`CLEARWING_HOME/sessions`) is blocked. Health probes both: the
+  home root with a unique write probe, and the sessions path by
+  constructing the `SessionStore` (construction is the probe — it creates
+  the directory and degrades to `available=False` on failure), so a home
+  that is writable while `sessions/` is blocked no longer reports "ok"
+  while `GET /api/sessions` answers 503. The wire `detail` is
   deliberately generic (the endpoint is unauthenticated); the full
   reason — path and errno — goes to the server log only.
 

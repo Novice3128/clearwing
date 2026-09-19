@@ -222,6 +222,19 @@ def create_app():
         # generic on the wire (this endpoint is unauthenticated — no
         # internal paths/errno); the full reason goes to the server log.
         ok, reason = _state_dir_status()
+        detail = "state directory unavailable"
+        if ok:
+            # Issue #49: home writable does not imply sessions persist —
+            # SessionStore mkdirs home/sessions and degrades independently
+            # (available=False). Probe the ACTUAL sessions persistence path
+            # so health cannot say "ok" while /api/sessions 503s. Reuse the
+            # same construction as /api/sessions: constructing the store IS
+            # the probe.
+            store = _make_session_store()
+            if not store.available:
+                ok = False
+                reason = store.unavailable_reason or "sessions dir unavailable"
+                detail = "session store unavailable"
         if not ok:
             logger.warning("Health degraded: %s", reason)
             return JSONResponse(
@@ -229,7 +242,7 @@ def create_app():
                 content={
                     "status": "degraded",
                     "service": "clearwing",
-                    "detail": "state directory unavailable",
+                    "detail": detail,
                 },
             )
         return {"status": "ok", "service": "clearwing"}

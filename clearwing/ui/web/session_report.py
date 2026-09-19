@@ -85,9 +85,27 @@ def _md_cell(value: Any) -> str:
     inert — the same neutralization level as :func:`_md_neutralize`.
     """
     text = _redact(str(value if value is not None else ""))
-    text = text.replace("|", "\\|").replace("\n", " ")
+    # #46: fold ALL line-break shapes, not just "\\n" — str.splitlines()
+    # also recognizes \\r, \\v, \\f, \\x1c-\\x1e, NEL (\\x85) and
+    # U+2028/U+2029 (WS-sourced strings — targets, tool args — can carry
+    # them raw); any survivor could split the table row or forge a heading
+    # in lenient renderers.
+    text = " ".join(text.splitlines())
+    text = text.replace("|", "\\|")
     text = text.replace("[", "\\[").replace("]", "\\]")
-    return html.escape(text, quote=False).strip()
+    # #46: escape tildes so a `~~~` run inside a cell can never read as a
+    # fence opener (and swallow the rest of the report) in a renderer that
+    # treats the line as block content.
+    text = text.replace("~", "\\~")
+    text = html.escape(text, quote=False)
+    # #46: GFM autolinks bare `scheme://...` URLs inside cells. The entity
+    # breaks the raw-text pattern match while still rendering as ":" —
+    # verified against GFM markdown-it (`http&#58;//x` in a cell renders
+    # plain, `http://x` becomes <a href>). Cells only: prose keeps
+    # clickable links (cells are data-like). After html.escape so the
+    # entity's `&` is not itself escaped.
+    text = text.replace("://", "&#58;//")
+    return text.strip()
 
 
 # Issue #24: transcript text is attacker-controllable prose (operator input,
@@ -199,7 +217,14 @@ class SessionTranscript:
                 args = call.get("args")
                 args_text = _md_cell(args) if args else ""
                 if len(args_text) > 120:
-                    args_text = args_text[:117] + "..."
+                    args_text = args_text[:117]
+                    # #46: a cut landing inside a `\\|`/`\\[` escape leaves a
+                    # dangling backslash at the cell tail — back off past
+                    # every trailing backslash (an escaped-literal `\\` cut
+                    # in half is indistinguishable from a cut escape).
+                    while args_text.endswith("\\"):
+                        args_text = args_text[:-1]
+                    args_text += "..."
                 lines.append(
                     f"| {i} | {_md_cell(call.get('name', 'tool'))} "
                     f"| {args_text} | {_md_cell(call.get('content_length', ''))} |"

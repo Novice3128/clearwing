@@ -159,6 +159,100 @@ class TestSessionStore:
         )
         assert session.model == "kimi-k2"
 
+    def test_sync_session_model_pins_resolved_deferred_row(self):
+        """#50: a deferred (model="") row that resolves — even to exactly
+        DEFAULT_ANTHROPIC_MODEL — must be recorded as an explicit choice so
+        a later --resume pins it instead of letting config override."""
+        from types import SimpleNamespace
+
+        from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
+        from clearwing.ui.commands.interactive import _sync_session_model
+
+        session = self.store.create("10.0.0.1", model="")
+        graph = SimpleNamespace(llm=SimpleNamespace(model_name=DEFAULT_ANTHROPIC_MODEL))
+        _sync_session_model(session, graph)
+        assert session.model == DEFAULT_ANTHROPIC_MODEL
+        assert session.model_explicit is True
+        self.store.save(session)
+        assert self.store.load(session.session_id).model_explicit is True
+
+    def test_sync_session_model_keeps_explicitness_of_rows_with_model(self):
+        """#50: rows that already had a model keep their recorded
+        explicitness — a legacy model==DEFAULT row written without the
+        explicit flag keeps deferring; an explicit row stays explicit."""
+        from types import SimpleNamespace
+
+        from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
+        from clearwing.ui.commands.interactive import _sync_session_model
+
+        # Legacy row: model set, explicit flag absent/False.
+        legacy = self.store.create("10.0.0.1", model=DEFAULT_ANTHROPIC_MODEL)
+        _sync_session_model(
+            legacy, SimpleNamespace(llm=SimpleNamespace(model_name="glm-5.3"))
+        )
+        assert legacy.model == "glm-5.3"
+        assert legacy.model_explicit is False  # explicitness untouched
+
+        # Explicit operator choice: stays explicit across a re-resolution.
+        explicit = self.store.create("10.0.0.1", model="kimi-k2", model_explicit=True)
+        _sync_session_model(
+            explicit, SimpleNamespace(llm=SimpleNamespace(model_name="glm-5.3"))
+        )
+        assert explicit.model == "glm-5.3"
+        assert explicit.model_explicit is True
+
+    def test_resume_pins_model_resolved_to_default(self, monkeypatch, tmp_path):
+        """#50 end-to-end: a deferred session whose first run resolves to
+        exactly DEFAULT_ANTHROPIC_MODEL must resume PINNED (config cannot
+        override); before the fix only non-default resolutions pinned."""
+        from types import SimpleNamespace
+
+        import clearwing.core.config as config_mod
+        import clearwing.ui.commands.interactive as interactive
+        from clearwing.providers.env import DEFAULT_ANTHROPIC_MODEL
+
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: tmp_path)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")  # pass preflight
+
+        cli = SimpleNamespace(console=SimpleNamespace(print=lambda *a, **k: None))
+
+        # First run: fresh deferred session; the TUI write-back resolves the
+        # model to exactly the hard-coded default.
+        first = {}
+
+        def fake_run_tui(_cli, args, session):
+            first["args"] = args
+            first["session"] = session
+            interactive._sync_session_model(
+                session,
+                SimpleNamespace(llm=SimpleNamespace(model_name=DEFAULT_ANTHROPIC_MODEL)),
+            )
+            interactive.SessionStore().save(session)
+
+        monkeypatch.setattr(interactive, "_run_tui", fake_run_tui)
+        interactive.handle(
+            cli, SimpleNamespace(model=None, target=None, resume=None, no_tui=False)
+        )
+        assert first["args"].model is None  # deferred on the first run
+        assert first["session"].model == DEFAULT_ANTHROPIC_MODEL
+        assert first["session"].model_explicit is True  # the #50 fix
+
+        # Second run: --resume of that row pins the stored default.
+        second = {}
+
+        def fake_run_tui_resumed(_cli, args, session):
+            second["args"] = args
+
+        monkeypatch.setattr(interactive, "_run_tui", fake_run_tui_resumed)
+        interactive.handle(
+            cli,
+            SimpleNamespace(
+                model=None, target=None, resume=first["session"].session_id, no_tui=False
+            ),
+        )
+        assert second["args"].model == DEFAULT_ANTHROPIC_MODEL
+        assert second["args"].model_explicit is True  # pinned, not deferred
+
 
 class TestTuiSessionWriteBack:
     """Three-lens review (F8): the TUI exit write-back (resolved model +

@@ -38,7 +38,13 @@ def unauth_client(unauth_app):
 
 
 class TestHealthEndpoint:
-    def test_health(self, client):
+    def test_health(self, client, monkeypatch, tmp_path):
+        # #49: health now also probes the sessions persistence path, so the
+        # happy path is tested against an isolated home (not the operator's
+        # real ~/.clearwing).
+        import clearwing.core.config as config_mod
+
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: tmp_path / "home")
         resp = client.get("/api/health")
         assert resp.status_code == 200
         data = resp.json()
@@ -81,6 +87,39 @@ class TestStateDirDegradation:
         resp = client.get("/api/sessions/abc123")
         assert resp.status_code == 503
         assert resp.json()["detail"] == "session store unavailable"
+
+
+class TestHealthSessionsProbe:
+    """#49: home writable but CLEARWING_HOME/sessions blocked must degrade
+    health — SessionStore degrades independently of the home write probe,
+    so health used to say "ok" while /api/sessions answered 503."""
+
+    def _writable_home(self, monkeypatch, tmp_path):
+        import clearwing.core.config as config_mod
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: home)
+        return home
+
+    def test_sessions_path_blocked_degrades_health(self, client, monkeypatch, tmp_path):
+        home = self._writable_home(monkeypatch, tmp_path)
+        (home / "sessions").write_text("")  # a file where a directory is needed
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["service"] == "clearwing"
+        # Unauthenticated endpoint: generic wire detail; the sessions path
+        # and errno stay in the server log.
+        assert data["detail"] == "session store unavailable"
+        assert str(home) not in data["detail"]
+
+    def test_sessions_path_writable_health_ok(self, client, monkeypatch, tmp_path):
+        self._writable_home(monkeypatch, tmp_path)
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
 
 
 class TestHealthProbeConcurrency:
@@ -899,6 +938,103 @@ class TestSessionReportHardening:
         assert not re_module.search(r"^\|---\|---\|", content, re_module.MULTILINE)
         # Everything after the pseudo-fence is still rendered as prose.
         assert "real answer after the fence attempt" in content
+
+    def test_exotic_line_breaks_in_cells_cannot_split_rows(self, monkeypatch, tmp_path):
+        """#46 item 1: \\r / \\v / \\x1c / \\x85 / U+2028 in a cell survive a
+        lone "\\n" replace; fold every splitlines()-recognized break so no
+        cell can break out of its row or forge a heading."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00008",
+            target="t1\r# Forged Heading",
+            model="m\u2028## Also Forged",
+        )
+        transcript.add_tool("run", args="a\vb\x1cc\x1dd\x1ee\x85f")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # No line may start with a heading forged inside a cell.
+        assert not re_module.search(r"^# Forged Heading", content, re_module.MULTILINE)
+        assert not re_module.search(r"^## Also Forged", content, re_module.MULTILINE)
+        # The breaks were folded into spaces, not preserved.
+        assert "t1 # Forged Heading" in content
+        assert "m ## Also Forged" in content
+
+    def test_tilde_run_in_cell_cannot_open_fence(self, monkeypatch, tmp_path):
+        """#46 item 1: a `~~~` inside a table cell must stay escaped so no
+        renderer can read it as a fence opener."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00009", target="~~~", model="m")
+        transcript.add_agent("answer after the tilde cell")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert not re_module.search(r"^~", content, re_module.MULTILINE)
+        assert "\\~\\~\\~" in content  # escaped, renders back to tildes
+        assert "answer after the tilde cell" in content
+
+    def test_bare_url_in_cell_not_autolinked_prose_untouched(
+        self, monkeypatch, tmp_path
+    ):
+        """#46 item 2: GFM autolinks bare `scheme://` URLs inside cells —
+        escape the colon as `&#58;` (renders back to ":" but never
+        linkifies, verified against GFM markdown-it); prose keeps raw
+        clickable links."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00010", target="http://evil.example", model="m"
+        )
+        transcript.add_user("see https://docs.example.com/guide for details")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Cell: the raw bare-URL pattern must not survive.
+        assert "http://evil.example" not in content
+        assert "http&#58;//evil.example" in content
+        # Prose: links stay clickable (readability tradeoff, per issue).
+        assert "https://docs.example.com/guide" in content
+
+    def test_truncated_args_cell_has_no_dangling_backslash(
+        self, monkeypatch, tmp_path
+    ):
+        """#46: `[:117]` could cut a `\\|` escape leaving a dangling
+        backslash at the cell tail — back off past trailing backslashes."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00011", model="m")
+        # _md_cell escapes the pipe into `\\|`; 116 z's + `\\|` + filler makes
+        # the escaped form 128 chars, so [:117] lands exactly on the backslash
+        # (z's, not a's: a 32+ run of [A-Fa-f0-9] would be redacted as a hash).
+        transcript.add_tool("download", args="z" * 116 + "|" + "b" * 10)
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert len(session_report._md_cell("z" * 116 + "|" + "b" * 10)) == 128
+        # No backslash may sit immediately before the truncation ellipsis
+        # (it would escape the following char inside the row).
+        assert not re_module.search(r"\\\.\.\.", content)
+        assert "z" * 116 + "..." in content
 
     def test_ws_message_with_null_content_still_writes_report(
         self, client, monkeypatch, results_dir

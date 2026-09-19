@@ -167,11 +167,20 @@ def _preflight_check(cli, args) -> bool:
 def _sync_session_model(session, graph) -> None:
     """#28: a deferred model leaves the session row as model="" at creation
     time; write the graph's resolved model back so /api/sessions and
-    --resume see what actually ran. Mutates only — callers persist the row."""
+    --resume see what actually ran. Mutates only — callers persist the row.
+
+    #50: a row whose stored model was previously EMPTY is the deferred
+    case; once it resolves, also set model_explicit — the session has now
+    resolved, and future resumes pin the stored name regardless of whether
+    it happens to equal the hard-coded default. Rows that already carried
+    a model keep their recorded explicitness (a legacy model==DEFAULT row
+    keeps deferring — don't rewrite history)."""
     if session is None:
         return
     resolved = getattr(getattr(graph, "llm", None), "model_name", None)
     if resolved and session.model != resolved:
+        if not session.model:
+            session.model_explicit = True
         session.model = resolved
 
 
