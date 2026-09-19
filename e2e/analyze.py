@@ -27,12 +27,31 @@ def _log(msg: str) -> None:
 
 # ------------------------------------------------------------ frames ------
 
+def statuses_compact(statuses: list) -> str:
+    """Compact counter form of the FULL status sequence, e.g. ``awaiting_approval×6→ok``.
+    Replaces the lossy last-N slices that made report/adjudication/frames
+    disagree on the same run (R1-B, 2026-09-19)."""
+    if not statuses:
+        return "[]"
+    parts: list[str] = []
+    cur, n = statuses[0], 0
+    for s in statuses:
+        if s == cur:
+            n += 1
+        else:
+            parts.append(f"{cur}×{n}" if n > 1 else cur)
+            cur, n = s, 1
+    parts.append(f"{cur}×{n}" if n > 1 else cur)
+    return "→".join(parts)
+
+
 def frames_metrics(frames_path: Path) -> dict:
     types: dict[str, int] = {}
     statuses: list[str] = []
     agent_msgs: list[str] = []
     late = 0
     last_terminal_idx = None
+    max_tool = None            # (content_length, tool_name) of the largest tool result
     idx = 0
     for line in frames_path.read_text().splitlines():
         if line.startswith("#"):
@@ -44,6 +63,14 @@ def frames_metrics(frames_path: Path) -> dict:
         idx += 1
         t = m.get("type", "")
         types[t] = types.get(t, 0) + 1
+        if t == "tool_result":
+            # tool_result frames carry the product-side content_length — the
+            # 2.79MB scan_vulnerabilities result of 2026-09-19 was invisible
+            # to every gate until this counter (R4 lens)
+            d = m.get("data") or {}
+            cl = d.get("content_length")
+            if isinstance(cl, (int, float)) and (max_tool is None or cl > max_tool[0]):
+                max_tool = (int(cl), str(d.get("tool") or "?"))
         if t == "complete":
             st = (m.get("data") or {}).get("status") or "ok"
             statuses.append(st)
@@ -56,7 +83,8 @@ def frames_metrics(frames_path: Path) -> dict:
             agent_msgs.append(c if isinstance(c, str) else "")
     dup = sum(1 for a, b in zip(agent_msgs, agent_msgs[1:]) if a and a == b)
     return {"frame_types": types, "statuses": statuses, "dup_pairs": dup,
-            "late_frames": late, "frames": idx}
+            "late_frames": late, "frames": idx,
+            "max_tool_result": max_tool}
 
 
 # ------------------------------------------------------------- audit ------
@@ -92,7 +120,7 @@ def audit_metrics(sid: str, home: Path) -> dict | None:
             "calls": per_call}
 
 
-def cache_prefix_median(per_call: list[tuple]) -> float | None:
+def cache_prefix_median(per_call: list[tuple]) -> dict:
     """Median cache ratio over STABLE-PREFIX calls, computed WITHIN each
     agent context. Contexts are tracked separately (Codex #67 r1 P2): an
     interleaved 6k uncached operator call must not count as a main-prefix
@@ -122,17 +150,17 @@ def cache_prefix_median(per_call: list[tuple]) -> float | None:
         if prev is not None and ti <= prev * 1.2:
             ratios.append(100 * tc / max(ti, 1))
         prev_in[agent] = ti
-    if len(ratios) < 2:
-        return None
     import statistics
-    return statistics.median(ratios)
+    return {"n": len(ratios),
+            "median": statistics.median(ratios) if ratios else None,
+            "min": min(ratios) if ratios else None}
 
 
 # ------------------------------------------------------------- gates ------
 
 def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
              hud: dict | None, expect: dict | None = None,
-             flag_max: int | None = None) -> list[dict]:
+             flag_max: int | None = None, run_dir: Path | None = None) -> list[dict]:
     """Gate evaluation. severity policy (SPEC §4, aligned after review):
     reconcile / audit-completeness / cache gates are HARD (they were 'ratio'
     before — breaches could not flip the verdict, which contradicted SPEC).
@@ -151,7 +179,7 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
 
     inv = summary.get("invariants", {})
     add("terminal-closure", inv.get("terminal_closure", False),
-        f"statuses={fm['statuses'][-3:] if fm['statuses'] else []}")
+        f"statuses={statuses_compact(fm['statuses'])}")
     add("approval-closure", inv.get("approval_closure", True),
         f"approvals={summary.get('approvals')}")
     add("complete-while-approval-open", inv.get("no_complete_while_approval_open", True),
@@ -164,6 +192,15 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
         f"dup_pairs={fm['dup_pairs']}")
     add("late-frames", fm["late_frames"] <= SUITE["thresholds"]["hard"]["late_frames_max"],
         f"late_frames={fm['late_frames']}")
+    tr = fm.get("max_tool_result")
+    warn_b = int(SUITE["thresholds"]["trend"].get("tool_result_bytes_warn", 500_000))
+    if tr and tr[0] > warn_b:
+        # informational context-flood watch — size is data-dependent (NVD
+        # result sets vary ~57× run-over-run on identical code), so this
+        # surfaces the shape without hard-failing on it (2026-09-19 lesson)
+        add("tool-result-size", True,
+            f"max single tool result {tr[0]:,}B ({tr[1]}) exceeds {warn_b // 1000}KB — "
+            "context-flood watch (informational)", sev="trend")
 
     cache_pct = 100 * summary.get("tokens_cached", 0) / max(summary.get("tokens_in", 1), 1)
     if tier_name == "full" and summary.get("tokens_in", 0) > 100000:
@@ -172,18 +209,22 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
         # build measured 54.2% and 98.6% aggregate)
         add("cache-nonzero", cache_pct > 1, f"cache={cache_pct:.1f}% (aggregate, shape-dependent)")
     if audit and audit.get("calls"):
-        med = cache_prefix_median(audit["calls"])
-        if med is None:
+        cs = cache_prefix_median(audit["calls"])
+        thr = SUITE["thresholds"]["hard"].get("cache_prefix_median_min", 90)
+        floor = SUITE["thresholds"]["hard"].get("cache_prefix_sample_floor", 80)  # default MUST match suite.yaml (lens-1: a drifted 85 default silently killed the healthy 82 tail)
+        if cs["n"] < 3:
+            # n<3 is not adjudicable as a hard verdict: the 2026-09-19 full
+            # run failed on n=2 by 0.6pp — a young-context × per-turn-increment
+            # artifact, causally independent of the flood axis (R2 lens)
             add("cache-prefix-samples", True,
-                f"stable-prefix samples <2 across {audit['llm_calls']} calls — "
-                "median unavailable (informational; short sessions)",
+                f"n={cs['n']}<3 stable-prefix samples across {audit['llm_calls']} calls — "
+                "not adjudicable as hard (informational; hard gate needs n≥3)",
                 sev="trend")
         else:
-            add("cache-prefix-median",
-                med >= SUITE["thresholds"]["hard"].get("cache_prefix_median_min", 90),
-                f"prefix-median={med:.1f}% want>="
-                f"{SUITE['thresholds']['hard'].get('cache_prefix_median_min', 90)}% "
-                f"(aggregate {cache_pct:.1f}% is informational)")
+            add("cache-prefix-median", cs["median"] >= thr and cs["min"] >= floor,
+                f"prefix-median={cs['median']:.1f}% min-sample={cs['min']:.1f}% "
+                f"want>={thr}% & floor>={floor}% (n={cs['n']}; "
+                f"aggregate {cache_pct:.1f}% is informational)")
         # degenerate-output detector (t3-warm-chain-2: 23.7k-in, 0% cache,
         # 3-token reply — silently passed the old >100k-bound gates). Caliber
         # = CALL signature, not session totals: warm-chain-1/-3 legitimately
@@ -261,6 +302,28 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
                     got = summary.get("complete_statuses") or []
                     add("expect-graceful", bool(got) and got[-1] in ("ok", "stopped"),
                         f"last={got[-1] if got else None} want=ok|stopped")
+            elif k == "artifacts":
+                # Task-compliance gate (R2-F4): both deep scenarios' prompts
+                # explicitly demand save_report output, yet both skipped it on
+                # 2026-09-19 and still terminated ok. Glob patterns are
+                # relative to the run dir; target IPs stay out of suite.yaml.
+                missing = []
+                for pat in v or []:
+                    if run_dir is None or not [q for q in run_dir.glob(pat)
+                                               if q.is_file() and q.stat().st_size > 0]:
+                        missing.append(pat)
+                if not v:
+                    missing.append("<empty artifacts list>")
+                add("expect-artifacts", not missing,
+                    f"missing={missing}" if missing
+                    else f"{len(v or [])} artifact globs present+non-empty")
+            else:
+                # DEAD-KEY guard: a typo'd expect key (e.g. `artifact:`) must
+                # FAIL loudly, not silently disable the gate it names (the
+                # 2026-09-19 export note and the historical DEAD-KEY review
+                # finding are the same disease)
+                add(f"expect-unknown-key[{k}]", False,
+                    f"suite expect key {k!r} has no consumer — typo or stale key")
     return g
 
 
@@ -278,13 +341,28 @@ def previous_run(run_dir: Path, tier_name: str) -> dict | None:
     if not cands:
         return None
     m = cands[-1] / "ledger.json"
-    return json.loads(m.read_text()) if m.exists() else None
+    if not m.exists():
+        return None
+    led = json.loads(m.read_text())
+    led["_baseline_dir"] = str(cands[-1])   # marker consumed by trend_gate
+    return led
 
 
 def trend_gate(cur: dict, prev: dict | None) -> list[dict]:
     if not prev:
         return [{"gate": "baseline", "pass": True, "severity": "trend",
                  "detail": "first run — baseline established"}]
+    # baseline build annotation (R2 attack-6): trend numbers are only honest
+    # with the comparison builds visible — HEAD/suite drift is for the
+    # adjudicator to interpret, not for the gate to hide
+    base_note = ""
+    bdir = prev.get("_baseline_dir")
+    if bdir:
+        rp = Path(bdir) / "report.md"
+        if rp.exists():
+            hm = re.search(r"git HEAD `([0-9a-f]+)`.*?suite `([0-9a-f]+)`", rp.read_text())
+            if hm:
+                base_note = f" [baseline {hm.group(1)[:8]}/{hm.group(2)[:8]}]"
     out = []
     band = SUITE["thresholds"]["trend"]["duration_band_pct"]
     for key in ("seconds", "cost_usd_product"):
@@ -294,7 +372,7 @@ def trend_gate(cur: dict, prev: dict | None) -> list[dict]:
         if p and c:
             ok = abs(c - p) / max(p, 1e-9) * 100 <= b
             out.append({"gate": f"trend-{key}", "pass": bool(ok), "severity": "trend",
-                        "detail": f"prev={p} cur={c} (band ±{b}%)"})
+                        "detail": f"prev={p} cur={c} (band ±{b}%){base_note}"})
     return out
 
 
@@ -326,7 +404,7 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         audit = audit_metrics(sid, s.get("home") or home_default) if sid else None
         if s.get("invariants") is not None:      # real WS run — full gate set
             gates = evaluate(s, fm, tier_name, audit, None,
-                             expect=sc.get("expect"), flag_max=flag_max)
+                             expect=sc.get("expect"), flag_max=flag_max, run_dir=run_dir)
         elif s.get("status") in ("skipped", "crashed"):
             gates = evaluate(s, fm, tier_name, None, None)
         else:                                     # probe/hud/cli/pytest — pass/fail only
@@ -340,9 +418,11 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         ledger["tokens_out"] += s.get("tokens_out") or 0
         rows.append({
             "name": name, "sid": sid, "seconds": s.get("seconds"),
-            "statuses": fm.get("statuses", [])[-3:] or s.get("complete_statuses", [])[-3:],
+            "statuses": statuses_compact(fm.get("statuses") or s.get("complete_statuses") or []),
             "errors": s.get("error_count", 0), "cost": s.get("cost_usd_product"),
-            "cache_pct": round(100 * s.get("tokens_cached", 0) / max(s.get("tokens_in", 1), 1), 1)
+            "cache_pct": round(v, 2) if (v := round(100 * s.get("tokens_cached", 0)
+                                                  / max(s.get("tokens_in", 1), 1), 2)) >= 99.9
+            else round(v, 1)
             if s.get("tokens_in") else None,
             "dup": fm.get("dup_pairs"), "late": fm.get("late_frames"),
             "memory": s.get("memory"), "flag_faces": s.get("flag_faces"),
@@ -399,9 +479,11 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         lines_hint = ""
     partial = "-partial" in run_dir.name
     try:
-        suite_sha = json.loads((run_dir / "state/pre-state.json").read_text()).get("suite_sha256", "?")
+        _ps = json.loads((run_dir / "state/pre-state.json").read_text())
+        suite_sha = _ps.get("suite_sha256", "?")
+        trigger = _ps.get("trigger")
     except (OSError, ValueError):
-        suite_sha = "?"
+        suite_sha, trigger = "?", None
     verdict_line = {
         "quick": "quick PASS authorizes merge only (n=1, protocol-plane); "
                  "release needs Full PASS ×2 + deep-cold ≥1 (SPEC §4).",
@@ -418,6 +500,9 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         f"# cw-e2e {tier_name}{' (partial)' if partial else ''} — {run_dir.name} — {overall}",
         "",
         f"- git HEAD `{ver.get('git', {}).get('head', '?')[:12]}` · web-api.md `{ver.get('git', {}).get('webapi_commit', '?')}` · suite `{suite_sha}`",
+        # SPEC §3 dual-carrier: the run REPORT itself must state its trigger
+        # source (round-log alone was the old single carrier — R4 lens)
+        f"- trigger: {trigger if trigger else '⚠️ 未記錄（run --trigger；SPEC §3 誠實條款）'}",
         f"- ledger: product ${ledger['cost_usd_product']:.4f} · no-cache upper bound "
         f"${(ledger['tokens_in'] * PRICING['input'] + ledger['tokens_out'] * PRICING['output']) / 1e6:.2f}"
         f" · tokens in/out {ledger['tokens_in']:,}/{ledger['tokens_out']:,} · wall {ledger['seconds']}s",
