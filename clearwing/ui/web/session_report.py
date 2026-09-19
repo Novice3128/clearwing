@@ -105,6 +105,15 @@ def _md_cell(value: Any) -> str:
     # clickable links (cells are data-like). After html.escape so the
     # entity's `&` is not itself escaped.
     text = text.replace("://", "&#58;//")
+    # PR #71 r2: linkify's fuzzy forms have no scheme to break — `www.*`
+    # bare domains (linkify matches case-insensitively and even mid-word:
+    # `awww.evil.com` linkifies whole) and emails (`user@host` →
+    # mailto:). Escape one char of each shape the same way; both decode
+    # back for display (verified: `www&#46;evil.com` / `user&#64;evil.com`
+    # render as plain text `www.evil.com` / `user@evil.com`, no <a>).
+    # Cells only; after html.escape, same discipline as `://` above.
+    text = re.sub(r"(?i)(www)\.", r"\1&#46;", text)
+    text = text.replace("@", "&#64;")
     return text.strip()
 
 

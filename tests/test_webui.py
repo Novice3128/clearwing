@@ -191,6 +191,30 @@ class TestHealthSessionsProbe:
         assert data["detail"] == "session store unavailable"
         assert str(sessions) not in data["detail"]
 
+    def test_probe_writes_nonempty_data(self, client, monkeypatch, tmp_path):
+        """Codex PR-71 r2 (P1): `write_text("")` is a zero-length create —
+        it only allocates an inode, so it succeeds on a volume with
+        exhausted data blocks (free inodes) and health answered 200 while
+        the next real write failed with ENOSPC. Every probe write (home
+        root AND sessions dir) must carry at least one byte."""
+        from pathlib import Path
+
+        self._writable_home(monkeypatch, tmp_path)
+        real_write_text = Path.write_text
+        probe_payloads = []
+
+        def _spy_write_text(self, data, *args, **kwargs):
+            if self.name.startswith(".health_probe"):
+                probe_payloads.append(data)
+            return real_write_text(self, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _spy_write_text)
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        # Both probe sites fired (home root + sessions dir), each with data.
+        assert len(probe_payloads) >= 2
+        assert all(len(payload) > 0 for payload in probe_payloads)
+
 
 class TestHealthProbeConcurrency:
     """Three-lens review (F3): concurrent /api/health polls used to race on
@@ -1078,6 +1102,50 @@ class TestSessionReportHardening:
         assert "http://evil.example" not in content
         assert "http&#58;//evil.example" in content
         # Prose: links stay clickable (readability tradeoff, per issue).
+        assert "https://docs.example.com/guide" in content
+
+    def test_fuzzy_bare_url_and_email_in_cell_not_autolinked(
+        self, monkeypatch, tmp_path
+    ):
+        """Codex PR-71 r2 (P2): linkify autolinks more than `scheme://` —
+        fuzzy `www.` bare domains (case-insensitively and even mid-word)
+        and emails (`user@host` → mailto:). Cells escape one char of each
+        shape as an entity — it never matches linkify but decodes back
+        for display (verified against GFM markdown-it + linkify: cell
+        `www&#46;evil…`/`user&#64;evil…` render plain text, no <a>);
+        prose keeps raw clickable forms."""
+        import html as html_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00012", target="www.evil.example", model="WWW.EVIL.example"
+        )
+        transcript.add_tool("download", args="contact user@evil.example")
+        transcript.add_user(
+            "mail user@host.example or see www.docs.example "
+            "and https://docs.example.com/guide"
+        )
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Cells: the raw fuzzy forms must not survive anywhere a cell
+        # rendered them (Target, Model, tool args).
+        assert "www.evil.example" not in content
+        assert "www&#46;evil.example" in content
+        assert "WWW.EVIL.example" not in content
+        assert "WWW&#46;EVIL.example" in content
+        assert "user@evil.example" not in content
+        assert "user&#64;evil.example" in content
+        # Entities decode back for display: rendered text is unchanged.
+        cell = session_report._md_cell("www.evil.example user@evil.example")
+        assert html_module.unescape(cell) == "www.evil.example user@evil.example"
+        # Prose: fuzzy forms and emails stay raw and clickable.
+        assert "user@host.example" in content
+        assert "www.docs.example" in content
         assert "https://docs.example.com/guide" in content
 
     def test_truncated_args_cell_has_no_dangling_backslash(

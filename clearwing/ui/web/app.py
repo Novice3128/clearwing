@@ -131,14 +131,17 @@ def _probe_dir_writable(directory: Path) -> tuple[bool, str]:
     Returns ``(ok, reason)``; the reason carries the directory path and
     errno for the server log — callers must keep it off the wire
     (/api/health is unauthenticated).
+    The probe payload is non-empty: a zero-length create only allocates
+    an inode, so it succeeds on a volume with exhausted data blocks and
+    health would answer 200 while the next real write fails with ENOSPC.
     """
     probe = directory / f".health_probe.{uuid.uuid4().hex}"
     try:
-        probe.write_text("", encoding="utf-8")
+        probe.write_text("ok", encoding="utf-8")
     except OSError as exc:
         return False, f"{directory} is not writable: {exc}"
-    # Cleanup is best-effort: a stale empty probe file is cosmetic, and
-    # failing a healthy directory over its removal would be worse.
+    # Cleanup is best-effort: a stale probe file is cosmetic, and failing a
+    # healthy directory over its removal would be worse.
     try:
         probe.unlink(missing_ok=True)
     except OSError as exc:
