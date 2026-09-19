@@ -24,7 +24,7 @@
 5. **8898 自起實例規格**：必經 `.venv/bin/clearwing webui` CLI（保證 api_key redact filter）；`--host 127.0.0.1`（`/api/sessions*`、`/api/metrics` **無鑰**）；env 隨機 key 自產自傳；cwd＝run 目錄（防污染 repo `results/`）；`CLEARWING_MCP_SERVERS_DIR` 指空目錄；pidfile 管理，**只 kill pidfile 的 pid，禁 `pkill -f clearwing`**（會同殺 8899/8080）；`setsid nohup … </dev/null`。
 6. **config 手術（real-config，Deep-fallback）**：atomic write＋fsync＋SIGINT/TERM/EXIT trap 自動還原；重啟前查 `/api/sessions` 無 running；啟動時掃 `~/.clearwing/config.yaml.bak-*` 殘留（含金鑰）→ 有即拒跑；備份 0600＋時間戳＋測畢即刪；還原後 health＋diff＋pid 三驗。**CLEARWING_HOME 不隔離 provider config**（`~/.clearwing/config.yaml` 永遠疊加覆蓋同名鍵，config.py:146-161）——隔離實例測不到獨立拓撲，fallback 測試必須 real-config 手術＋8898 重啟承載。
 7. **輸出隔離**：每 run 唯一 `results/<ts>-<tier>/`；寫檔前斷言目標不存在（歷史跨輪覆蓋教訓）；產出目錄名 `results/` 命中既有 gitignore（機制級防誤提交）。
-8. **清理 SOP（每 run 收尾，斷言化）**：起跑側備份 memory.db/KG 至 `state/aside-pre/`、收尾 `aside-post/`＋diff 記錄（v2 SOP② 機制化；2026-09-18 實測一輪即變動 221k→282k/1.69M→2.10M）；僅移除本輪記錄的 `clearwing-kali-<sid>` 容器（**禁 name-filter 全清**——docker 為全域共用）；`/tmp/report_*`/`kerbrute*` 淨；8787/8898 釋放；tmux 無（已自動斷言）；產物金鑰掃＝0（**值本位**：webui key＋LLM key 實值 byte-probe＋`api_key[=:?&]` 正則雙保險；截圖 strings＝0；`.key` 檔納掃；8898 自起實例 key 於 stop 時刪除）；8899 health 200 且 pid 未變。**成員 8899 的 webui log 掃描屬 R3 人工步驟**——live log redirect 目前寫入已刪除 inode 且 WS-accepted 行不經 redact filter（見 gh/unauth-endpoints-report.md 附錄），修復前自動掃不可行。
+8. **清理 SOP（每 run 收尾，斷言化）**：起跑側備份 memory.db/KG 至 `state/aside-pre/`、收尾 `aside-post/`＋diff 記錄（v2 SOP② 機制化；2026-09-18 實測一輪即變動 221k→282k/1.69M→2.10M）；僅移除本輪記錄的 `clearwing-kali-<sid>` 容器（**禁 name-filter 全清**——docker 為全域共用）；`/tmp/report_*`/`kerbrute*` 淨＋`clearwing_custom_tools_*` scratch 目錄感知（run 視窗內空目錄收尾自刪、非空殘留＝FAIL——r2 教訓：9 個空目錄曾在 PASS 的 cleanup 下存活；/tmp 為共用，非空殘留先辨識是否併發成員 session 再裁定）；8787/8898 釋放；tmux 無（已自動斷言）；產物金鑰掃＝0（**值本位**：webui key＋LLM key 實值 byte-probe＋`api_key[=:?&]` 正則雙保險；截圖 strings＝0；`.key` 檔納掃；8898 自起實例 key 於 stop 時刪除）；8899 health 200 且 pid 未變。**成員 8899 的 webui log 掃描屬 R3 人工步驟**——live log redirect 目前寫入已刪除 inode 且 WS-accepted 行不經 redact filter（見 gh/unauth-endpoints-report.md 附錄），修復前自動掃不可行。
 
 ## 3. 層級與觸發（事件驅動，非每 PR 盲跑）
 
@@ -41,11 +41,11 @@
 
 ## 4. 判定門檻（三類；suite.yaml `thresholds`）
 
-- **硬門（任一觸發＝FAIL）**：相鄰重複 agent_message 對>0；終態 complete 後遲到幀>0（**終幀後排水窗 `late_drain_s`=5s 內觀測**）；審批閉包破；**終態 complete 落在未執行審批之上（D1/#29 偵測器）**；**快取前綴中位數 ≥90% 且任一穩定樣本 ≥80%**（per-call 穩定前綴口徑：成長型 call〔>20%〕與 <5k 輔助上下文排除；聚合值僅報告欄；**n≥3 才 hard**——不足降為趨勢資訊門不作硬判〔2026-09-19 t1 以 n=2 差 0.6pp 定 FAIL 的教訓：年輕 context×單輪增量的結構性交互〕；地板 80＝健康實測全距低至 82 之下留 2pp 餘裕、專抓塌陷）＋**degenerate-output**（>10k-in 且 0-cache 的 call 回 <10 token——call 簽名口徑；「簡短但全快取」的暖召回不觸發）；**對帳差>0.5% 或 audit 缺記 llm_call**；**有 metered cost_update 而 audit 檔缺席（audit-present）**；場景 `expect:` 全部鍵（approvals 下限/cancelled_turn/watchdog 觸發/complete_status/errors/**chaos_hits 注入數下限**/**graceful**/**artifacts**〔glob 相對 run_dir、非空才算——t1/t2 於 2026-09-19 雙雙跳過 prompt 明示的 save_report 仍 terminal ok 的教訓〕）；flag faces >15（同代碼實測波動 8-14，基線 9 僅史料）；**清理斷言失敗**（容器殘留/埠佔用/8899 pid 變/金鑰掃命中＝cleanup-\* 硬門）。`skipped` 場景不計 FAIL（severity=skip）。
+- **硬門（任一觸發＝FAIL）**：相鄰重複 agent_message 對>0；終態 complete 後遲到幀>0（**終幀後排水窗 `late_drain_s`=5s 內觀測**）；審批閉包破；**終態 complete 落在未執行審批之上（D1/#29 偵測器）**；**快取前綴中位數 ≥90% 且任一穩定樣本 ≥80%**（per-call 穩定前綴口徑：成長型 call〔>20%〕與 <5k 輔助上下文排除；聚合值僅報告欄；**n≥3 才 hard**——不足時中位數**與地板同降**為趨勢資訊門，皆不作硬判〔2026-09-19 t1 以 n=2 差 0.6pp 定 FAIL 的教訓：年輕 context×單輪增量的結構性交互〕；地板 80＝健康實測全距低至 82 之下留 2pp 餘裕、專抓塌陷）＋**degenerate-output**（>10k-in 且 0-cache 的 call 回 <10 token——call 簽名口徑；「簡短但全快取」的暖召回不觸發）；**對帳差>0.5% 或 audit 缺記 llm_call**；**有 metered cost_update 而 audit 檔缺席（audit-present）**；場景 `expect:` 全部鍵（approvals 下限/cancelled_turn/watchdog 觸發/complete_status/errors/**chaos_hits 注入數下限**/**graceful**/**artifacts**〔glob 相對 run_dir、非空才算——t1/t2 於 2026-09-19 雙雙跳過 prompt 明示的 save_report 仍 terminal ok 的教訓〕）；flag faces >15（同代碼實測波動 8-14，基線 9 僅史料）；**清理斷言失敗**（容器殘留/埠佔用/8899 pid 變/金鑰掃命中＝cleanup-\* 硬門）。`skipped` 場景不計 FAIL（severity=skip）。
 - **比例門**：audit×PRICING 對帳 ≤0.5%；HUD≡報告（頁面渲染，精確到分）。（cache 比例門已由 per-call 前綴中位數硬門取代，見上；聚合值僅報告欄。）
 - **趨勢門**：時長/成本 vs 前次 Full ±30% 帶（首輪建立基線；detail 附基線 HEAD/suite 短碼——趨勢數字必須帶著比較 build 出場）；**失敗＝判定 REGRESSION（非 PASS）**。
 - **資訊門（trend，不影響判定）**：`tool-result-size`——單一工具結果 >500KB 即現身（2026-09-19 NVD 洪粉 2.79MB 對所有門不可見的教訓；大小是資料相依，只揭形狀不 hard-fail）。
-- **判定詞彙**：PASS/FAIL/REGRESSION/SKIPPED＋每判定必附限定欄（n=、warm/cold、scope、口徑）。Quick PASS 僅授權「可併」＋免責聲明（n=1、協議面）；**發版＝Full 連續 2 次通過＋Deep-cold ≥1 樣本**。
+- **判定詞彙**：PASS/FAIL/REGRESSION/SKIPPED＋**MIXED＝輪級聚合**（多 run 判定互異時 export 的表達；非任一 run 的翻案、不授權合併/發版，各 run 判定以 run index 為準）＋每判定必附限定欄（n=、warm/cold、scope、口徑）。Quick PASS 僅授權「可併」＋免責聲明（n=1、協議面）；**發版＝Full 連續 2 次通過＋Deep-cold ≥1 樣本**。
 - **驅動器協議紀律（approval）**：`approval_needed` 在 turn 內發射、turn 收尾才發 `complete(awaiting_approval)`，turn 活動期間伺服器**拒絕** `approve`（busy error 幀）——driver 一律**佇列決策、待 awaiting_approval 窗口開啟才沖刷**（殘餘微競速以 busy-reject 重試一次自癒）；終幀後不立即斷線（排水窗）。
 
 ## 5. 不變量優先（協議脆性對策）
@@ -111,7 +111,7 @@
 | `web-api.md` 加版本頭（gh/ 草稿） | verify 增加版本比對、報告記版本 | `runner.py git_info` |
 | 新端點/埠 | `suite.yaml webui` | 無代碼 |
 
-**離線回歸**：改動套件任何檔案後先跑 `.venv/bin/python e2e/runner.py selftest`（=34 項離線測試，零 LLM 成本）再考慮 live 層。
+**離線回歸**：改動套件任何檔案後先跑 `.venv/bin/python e2e/runner.py selftest`（項數以 `cw-e2e selftest` 輸出為準（勿在文件寫死——歷史上已 stale 兩次）
 
 **契約紀律**：套件斷言壞掉時優先懷疑產品改了（歷史六輪皆如此）；修套件前先跑
 `git log -- docs/web-api.md` 對照。連續兩次維護只是追協議、零新發現 → 觸發 §6 棄用條款檢討。

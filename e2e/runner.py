@@ -840,7 +840,7 @@ def scenario_hud(sc: dict, run_dir: Path, ws_url: str, keyfile: Path) -> dict:
               "cost_usd_product": hc, "seconds": 0}
     # numeric tokens from the session's own audit so run-level token totals
     # stop silently excluding this session (R1-A: quick ledger omitted
-    # warm-hud's 23,584 tokens while its cost WAS counted)
+    # warm-hud's 23,584-in tokens — footer total 23,587 — while its cost WAS counted)
     if sid:
         import analyze as _az
         am = _az.audit_metrics(sid, Path.home() / ".clearwing")
@@ -870,8 +870,9 @@ def _tmp_scratch_left(run_dir: Path) -> list[str]:
                     d.rmdir()
                 else:
                     scratch_left.append(d.name)
-        except OSError:
-            pass
+        except OSError as e:
+            # fail-closed: an unscannable scratch dir is NOT a clean /tmp
+            scratch_left.append(f"{d.name} ({type(e).__name__})")
     return scratch_left
 
 
@@ -897,7 +898,9 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
     scratch_left = _tmp_scratch_left(run_dir)
     out.append(("tmp-residue", not (list(TMP_ROOT.glob('report_*')) or list(TMP_ROOT.glob('kerbrute*'))
                                     or scratch_left),
-                f"scratch-dirs-left={scratch_left}"))
+                f"scratch-dirs-left={scratch_left}"
+                + (" (non-empty dirs in-window MIGHT be a concurrent member session — "
+                   "/tmp is shared; adjudicate before assuming)" if scratch_left else "")))
     out.append(("tmux-none", subprocess.run(["tmux", "ls"], capture_output=True).returncode != 0, ""))
     for png in run_dir.rglob("*.png"):
         r = subprocess.run(["strings", str(png)], capture_output=True, text=True)
@@ -1164,8 +1167,9 @@ def _run_dir_facts(d: Path) -> dict:
         led = json.loads((d / "ledger.json").read_text())
         c = led.get("cost_usd_product")
         # round(4) kills float residue like 2.3198000000000008 leaking into
-        # adjudication/export text (R1-C, 2026-09-19)
-        facts["cost"], facts["seconds"] = (round(c, 4) if c is not None else None), led.get("seconds")
+        # adjudication/export text (R1-C, 2026-09-19); non-numeric junk -> None
+        facts["cost"] = round(c, 4) if isinstance(c, (int, float)) else None
+        facts["seconds"] = led.get("seconds")
     except (OSError, ValueError):
         pass
     try:
@@ -1221,7 +1225,12 @@ def cmd_adjudicate(args) -> None:
             die("review-record section is empty/too short — the four-lens review "
                 "(REVIEW.md) must be pasted before finalize (SPEC §9 hard rule)")
         lm = re.search(r"## limits[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
-        lbody = re.sub(r"<!--.*?-->", "", lm.group(1) if lm else "", flags=re.S)
+        lbody = lm.group(1) if lm else ""
+        # the auto-injected trigger line is machine text, not a human 限定欄 —
+        # it must not satisfy the guard by itself (lens-1 bypass finding)
+        lbody = "\n".join(ln for ln in lbody.splitlines()
+                           if not ln.lstrip("- ").startswith("觸發源（pre-state 自動引用）"))
+        lbody = re.sub(r"<!--.*?-->", "", lbody, flags=re.S)
         lbody = re.sub(r"[\s#|>*-]", "", lbody)
         if len(lbody) < 30:
             die("limits section is empty/too short — every verdict carries its 限定欄 "
@@ -1372,7 +1381,10 @@ def cmd_export(args) -> None:
     for f in all_facts:
         out.append(f"  - `{f['path']}` — {f['verdict']} · ${f['cost']} · "
                    + (f"failed: {', '.join(f['failed_gates'])}" if f["failed_gates"] else "clean"))
-    if final_verdict == "MIXED":
+    if final_verdict == "MIXED" and len(machine) > 1:
+        # only for TRUE aggregation over heterogeneous run verdicts — a
+        # single-machine MIXED flip says "see overrides" above and must not
+        # also claim "非任一 run 的翻案" (lens-1 contradiction finding)
         out.append("- ⚠️ MIXED＝輪級聚合（多 run 判定互異），非任一 run 的翻案——"
                    "不授權合併/發版動作；各 run 判定以上列為準")
     if any(f["r3_pending"] for f in all_facts):
@@ -1431,7 +1443,7 @@ def cmd_run(args) -> None:
     with SuiteLock():
         run_dir = new_run_dir(tier_name + ("-partial" if args.only else ""))
         log(f"run dir: {run_dir}")
-        ver = verify(run_dir, strict=not args.force, trigger=getattr(args, "trigger", None))
+        ver = verify(run_dir, strict=not args.force, trigger=getattr(args, "trigger", None) or "")
         if args.force:
             forced = [c for c in ver.get("checks", []) if not c[1]]
             (run_dir / "state" / "forced-gates.json").write_text(json.dumps(

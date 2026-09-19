@@ -120,7 +120,7 @@ def audit_metrics(sid: str, home: Path) -> dict | None:
             "calls": per_call}
 
 
-def cache_prefix_median(per_call: list[tuple]) -> float | None:
+def cache_prefix_median(per_call: list[tuple]) -> dict:
     """Median cache ratio over STABLE-PREFIX calls, computed WITHIN each
     agent context. Contexts are tracked separately (Codex #67 r1 P2): an
     interleaved 6k uncached operator call must not count as a main-prefix
@@ -179,7 +179,7 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
 
     inv = summary.get("invariants", {})
     add("terminal-closure", inv.get("terminal_closure", False),
-        f"statuses={fm['statuses'][-3:] if fm['statuses'] else []}")
+        f"statuses={statuses_compact(fm['statuses'])}")
     add("approval-closure", inv.get("approval_closure", True),
         f"approvals={summary.get('approvals')}")
     add("complete-while-approval-open", inv.get("no_complete_while_approval_open", True),
@@ -211,7 +211,7 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
     if audit and audit.get("calls"):
         cs = cache_prefix_median(audit["calls"])
         thr = SUITE["thresholds"]["hard"].get("cache_prefix_median_min", 90)
-        floor = SUITE["thresholds"]["hard"].get("cache_prefix_sample_floor", 85)
+        floor = SUITE["thresholds"]["hard"].get("cache_prefix_sample_floor", 80)  # default MUST match suite.yaml (lens-1: a drifted 85 default silently killed the healthy 82 tail)
         if cs["n"] < 3:
             # n<3 is not adjudicable as a hard verdict: the 2026-09-19 full
             # run failed on n=2 by 0.6pp — a young-context × per-turn-increment
@@ -312,9 +312,18 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
                     if run_dir is None or not [q for q in run_dir.glob(pat)
                                                if q.is_file() and q.stat().st_size > 0]:
                         missing.append(pat)
+                if not v:
+                    missing.append("<empty artifacts list>")
                 add("expect-artifacts", not missing,
                     f"missing={missing}" if missing
                     else f"{len(v or [])} artifact globs present+non-empty")
+            else:
+                # DEAD-KEY guard: a typo'd expect key (e.g. `artifact:`) must
+                # FAIL loudly, not silently disable the gate it names (the
+                # 2026-09-19 export note and the historical DEAD-KEY review
+                # finding are the same disease)
+                add(f"expect-unknown-key[{k}]", False,
+                    f"suite expect key {k!r} has no consumer — typo or stale key")
     return g
 
 
