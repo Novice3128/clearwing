@@ -28,11 +28,13 @@ thresholds:
     dup_pairs_max: 0
     late_frames_max: 0
     cache_prefix_median_min: 90   # per-call stable-prefix median (regression caliber)
+    cache_prefix_sample_floor: 80 # any single stable sample below = FAIL; observed healthy spread reaches 82 (2026-09-18 four-lens) — 80 catches collapse, not the healthy tail
   ratio:
     reconcile_max_pct: 0.5        # audit x PRICING vs meter
   trend:
     duration_band_pct: 30
     cost_band_pct: 30
+    tool_result_bytes_warn: 500000  # informational context-flood watch (2026-09-19 NVD flood)
   late_drain_s: 5                 # post-terminal drain window (late-frames gate)
   default_cost_cap: 5.0           # fallback when neither scenario nor tier sets one
 
@@ -49,6 +51,10 @@ pytest:
     - tests/test_llm_timeout_resilience.py
     - tests/test_webui.py
     - tests/test_kali_docker.py
+    # 2026-09-19: quick was blind to BOTH product defects the full round
+    # caught (scanner flood + flag-detector FP) — scanner/runtime areas join
+    - tests/test_scanners.py
+    - tests/test_agent_internals.py
 
 tiers:
   quick:
@@ -76,12 +82,14 @@ tiers:
     scenarios:
       - {name: t1-fulldepth, type: ws, prompt: fulldepth-81.txt, target: "192.168.73.81", max_seconds: 4800,
          cost_cap: 15.0, trust_status: true, memory: warm, idle_limit: 900,
-         expect: {complete_status: ok, errors: 0}}
+         expect: {complete_status: ok, errors: 0,
+                  artifacts: ["scenarios/t1-report-*.json", "scenarios/t1-report-*.md"]}}   # prompt demands save_report (R2-F4)
       - {name: fc-delay, type: ws, prompt: quick-fc.txt, target: "192.168.73.82", max_seconds: 300,
          cost_cap: 1.0, approve_delay: 3, trust_status: true,
          expect: {approvals: ">=1"}}     # timing variant: complete-before-approval detector
       - {name: t2-partition, type: ws, prompt: partition-82.txt, target: "192.168.73.82", max_seconds: 900,
-         cost_cap: 5.0, trust_status: true}
+         cost_cap: 5.0, trust_status: true,
+         expect: {artifacts: ["scenarios/partition-report-*.md", "scenarios/partition-report-*.json"]}}
       - {name: t3-warm-chain, type: ws, prompt: warm.txt, target: "192.168.73.82", max_seconds: 240,
          cost_cap: 0.5, repeat: 3}
       # Chaos matrix: every scenario must (a) actually route through the proxy
@@ -114,7 +122,9 @@ tiers:
       # state, so "cold"-fulldepth measured an already-warmed environment
       # (Codex r1). Instance sanity is covered by the spawn health gate.
       - {name: cold-fulldepth, type: ws, prompt: fulldepth-81.txt, target: "192.168.73.81", max_seconds: 5400,
-         cost_cap: 15.0, trust_status: true, memory: cold}
+         cost_cap: 15.0, trust_status: true, memory: cold,
+         expect: {complete_status: ok, errors: 0,
+                  artifacts: ["scenarios/t1-report-*.json", "scenarios/t1-report-*.md"]}}
       - {name: smoke, type: ws, prompt: warm.txt, target: "192.168.73.82", max_seconds: 240,
          cost_cap: 0.5, memory: warm}   # post-measurement sanity: instance healthy after the big run
 

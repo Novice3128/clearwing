@@ -1,7 +1,7 @@
 # cw-e2e SPEC — Clearwing 標準 E2E＋真實驗測套件
 
 > 驗證方資產（放置於成員 repo 工作樹內、未追蹤）。成員請勿改動、勿 `git add` 本目錄。
-> 版本：v1.2（2026-09-18 晚——改進計畫 P1-P5 落地：adjudicate/export 判定複審層〔§9 硬規則〕、cache per-call 前綴中位數＋degenerate-output＋flag 區間＋partial trend 抑制〔§4/§7〕、memory/KG 側備份＋跑後目標對照＋budget-ledger＋CW_LLM_PROFILE 預檢〔§2.8/§3〕、R3 抽核制度化〔r3-manual/r3-done〕、觸發源誠實條款；v1.1＝Codex r1 十五項修復＋三鏡自審；v1＝六輪實測＋四代理審查標準化）。
+> 版本：v1.3（2026-09-19 r2 hardening——全流程復跑輪四鏡複審閉環：median 門 n≥3 才 hard＋單樣本地板 80〔§4〕、expect artifacts 任務遵循硬門〔§4〕、tool-result-size 資訊門〔§4〕、趨勢門附基線 build 標註〔§4〕、--trigger 雙載體機制〔§3〕、export MIXED＝輪級聚合措辭＋finalize 空 limits 守衛＋statuses 計數口徑〔§7/§9〕、tmp 清理門目錄感知、pytest 子集納入 scanning/runtime；v1.2＝2026-09-18 晚改進計畫 P1-P5：adjudicate/export 判定複審層〔§9 硬規則〕、cache per-call 前綴中位數＋degenerate-output＋flag 區間＋partial trend 抑制〔§4/§7〕、memory/KG 側備份＋跑後目標對照＋budget-ledger＋CW_LLM_PROFILE 預檢〔§2.8/§3〕、R3 抽核制度化〔r3-manual/r3-done〕、觸發源誠實條款；v1.1＝Codex r1 十五項修復＋三鏡自審；v1＝六輪實測＋四代理審查標準化）。
 
 ## 1. 目的與驗收軸
 
@@ -37,13 +37,14 @@
 | Deep-fallback | **明確核准**（--approve-fallback） | ≈$0.1 | real-config 手術（**YAML 結構化注入 fallbacks 進 provider＋寫後自驗**；`/api/sessions` JSON 解析 running 才放行）＋8898 承載：全拒/回切/slow-fail 三場景（**slow-fail 的 complete=ok 門＝issue #57 驗收測試**） |
 | Capability | 季度/發版 | 視凍結矩陣 | **凍結規劃，未實作**（comparison-test v3 Juice Shop ground-truth 能力基準＋S3 --inject-creds——需時另行建置） |
 
-觸發源誠實條款（2026-09-18 rev2）：**使用者指示**為合法觸發源（如本日 Full 輪），但必須在 run 報告與 round-log 如實記錄為「使用者指示」，不得事後敘述為發版/里程碑觸發。
+觸發源誠實條款（2026-09-18 rev2；2026-09-19 r2 機制化）：**使用者指示**為合法觸發源（如本日 Full 輪），但必須在 run 報告與 round-log 如實記錄為「使用者指示」，不得事後敘述為發版/里程碑觸發。**雙載體機制（r2）**：`run --trigger "<來源>"` → pre-state.json＋report 表頭 `- trigger:` 欄（缺填顯示 ⚠️＋verify 軟提示）；adjudicate DRAFT 自動引用最新 run 的觸發源進 limits 模板。
 
 ## 4. 判定門檻（三類；suite.yaml `thresholds`）
 
-- **硬門（任一觸發＝FAIL）**：相鄰重複 agent_message 對>0；終態 complete 後遲到幀>0（**終幀後排水窗 `late_drain_s`=5s 內觀測**）；審批閉包破；**終態 complete 落在未執行審批之上（D1/#29 偵測器）**；**快取前綴中位數 ≥90%**（per-call 穩定前綴口徑：成長型 call〔>20%〕與 <5k 輔助上下文排除；聚合值僅報告欄）＋**degenerate-output**（>10k-in 且 0-cache 的 call 回 <10 token——call 簽名口徑；「簡短但全快取」的暖召回不觸發）；**對帳差>0.5% 或 audit 缺記 llm_call**；**有 metered cost_update 而 audit 檔缺席（audit-present）**；場景 `expect:` 全部鍵（approvals 下限/cancelled_turn/watchdog 觸發/complete_status/errors/**chaos_hits 注入數下限**/**graceful**）；flag faces >15（同代碼實測波動 8-14，基線 9 僅史料）；**清理斷言失敗**（容器殘留/埠佔用/8899 pid 變/金鑰掃命中＝cleanup-\* 硬門）。`skipped` 場景不計 FAIL（severity=skip）。
+- **硬門（任一觸發＝FAIL）**：相鄰重複 agent_message 對>0；終態 complete 後遲到幀>0（**終幀後排水窗 `late_drain_s`=5s 內觀測**）；審批閉包破；**終態 complete 落在未執行審批之上（D1/#29 偵測器）**；**快取前綴中位數 ≥90% 且任一穩定樣本 ≥80%**（per-call 穩定前綴口徑：成長型 call〔>20%〕與 <5k 輔助上下文排除；聚合值僅報告欄；**n≥3 才 hard**——不足降為趨勢資訊門不作硬判〔2026-09-19 t1 以 n=2 差 0.6pp 定 FAIL 的教訓：年輕 context×單輪增量的結構性交互〕；地板 80＝健康實測全距低至 82 之下留 2pp 餘裕、專抓塌陷）＋**degenerate-output**（>10k-in 且 0-cache 的 call 回 <10 token——call 簽名口徑；「簡短但全快取」的暖召回不觸發）；**對帳差>0.5% 或 audit 缺記 llm_call**；**有 metered cost_update 而 audit 檔缺席（audit-present）**；場景 `expect:` 全部鍵（approvals 下限/cancelled_turn/watchdog 觸發/complete_status/errors/**chaos_hits 注入數下限**/**graceful**/**artifacts**〔glob 相對 run_dir、非空才算——t1/t2 於 2026-09-19 雙雙跳過 prompt 明示的 save_report 仍 terminal ok 的教訓〕）；flag faces >15（同代碼實測波動 8-14，基線 9 僅史料）；**清理斷言失敗**（容器殘留/埠佔用/8899 pid 變/金鑰掃命中＝cleanup-\* 硬門）。`skipped` 場景不計 FAIL（severity=skip）。
 - **比例門**：audit×PRICING 對帳 ≤0.5%；HUD≡報告（頁面渲染，精確到分）。（cache 比例門已由 per-call 前綴中位數硬門取代，見上；聚合值僅報告欄。）
-- **趨勢門**：時長/成本 vs 前次 Full ±30% 帶（首輪建立基線）；**失敗＝判定 REGRESSION（非 PASS）**。
+- **趨勢門**：時長/成本 vs 前次 Full ±30% 帶（首輪建立基線；detail 附基線 HEAD/suite 短碼——趨勢數字必須帶著比較 build 出場）；**失敗＝判定 REGRESSION（非 PASS）**。
+- **資訊門（trend，不影響判定）**：`tool-result-size`——單一工具結果 >500KB 即現身（2026-09-19 NVD 洪粉 2.79MB 對所有門不可見的教訓；大小是資料相依，只揭形狀不 hard-fail）。
 - **判定詞彙**：PASS/FAIL/REGRESSION/SKIPPED＋每判定必附限定欄（n=、warm/cold、scope、口徑）。Quick PASS 僅授權「可併」＋免責聲明（n=1、協議面）；**發版＝Full 連續 2 次通過＋Deep-cold ≥1 樣本**。
 - **驅動器協議紀律（approval）**：`approval_needed` 在 turn 內發射、turn 收尾才發 `complete(awaiting_approval)`，turn 活動期間伺服器**拒絕** `approve`（busy error 幀）——driver 一律**佇列決策、待 awaiting_approval 窗口開啟才沖刷**（殘餘微競速以 busy-reject 重試一次自癒）；終幀後不立即斷線（排水窗）。
 
@@ -68,6 +69,8 @@
 - 8898 與 8899 共用 repo 代碼：成員 git pull 瞬間兩實例版本同變——run 記錄兩者 HEAD。
 - **重跑裁定方法論（2026-09-18 對抗複審成文）**：為裁定單一門而重跑前必須——(a) 凍結記憶狀態（P3.1 側備份；n=1 與 n=2 之間 memory.db/KG 實變會讓兩跑不同世界）；(b) 優先**加鹽 prompt A/B**（保共用前綴、擾動尾綴）而非整跑重來；(c) 宣告 **vendor 快取不可觀測**——無法歸因的大額快取命中（案例：n=2 的 748,800-token 全額命中，n=1 僅能供 ~365k）**不得作為否定證據**；裁定結論應掛 per-call 穩定前綴中位數口徑（§4）而非跨 run 聚合值。
 - cache 口徑（§4 已改）：主門＝per-call 穩定前綴中位數 ≥90%（成長型 call〔input 較前 call 增 >20%〕與 <5k-token 輔助上下文〔summarizer/operator〕排除）；聚合值僅為報告欄（同代碼實測 54.2%↔98.6% 波動＝執行形狀）。
+- 巨型 call 的前綴形狀不可一概而論（R1-E）：2026-09-19 兩個洪粉巨型 call——t1 910,513-in **cached=0**（連不變前綴都沒中）vs t2 590,582-in cached=22,336（3.8%）——590k 與 910k 之間疑似存在 vendor 可快取前綴上限/驅逐；解讀 aggregate 時兩者不可混談。
+- statuses 顯示口徑（R1-B）：report 場景表與 adjudication 情境表統一為緊湊計數格式（`awaiting_approval×6→ok`）——保留完整序列，不再各自截尾。
 - 進程新舊門的兩個邊界：**未提交的工作樹產品碼編輯**不受門管（僅比對 commit 時間）；**未來時間戳 commit**（時鐘偏移/rebase）會誤觸發——兩者皆有 `--force` 逃生口，理由寫進 run 記錄。
 - surgery 相關：`/api/sessions` 非 200（含 503）一律**拒跑**（不能驗證≠放行）；`paused`（停在審批）視同 running 擋下；config 為 symlink 拒手術（atomic replace 會摧毀連結）；手術窗內成員編輯會被還原（ACTIVE 日誌已披露）。
 - 驅動器排水窗（late_drain_s）為**純觀測**：終幀後不再發送任何幀（watchdog/stop/approve 全有守衛），遲到 cost_update 不會激發 stop。

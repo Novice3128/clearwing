@@ -558,9 +558,13 @@ def test_adjudicate_and_export_gate(tmp_path, capsys):
         runner.cmd_adjudicate(a2)
     assert "DRAFT -->" in adj.read_text()
     # review record filled but verdict line still empty -> finalize refuses
+    # (limits filled here too: finalize demands BOTH non-empty, 2026-09-19 r2)
     adj.write_text(text.replace(
         "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
-        "四鏡複審完成：證據核實重算全數通過；對抗方法論確認無替代解釋；流程對照合規；交付一致。"))
+        "四鏡複審完成：證據核實重算全數通過；對抗方法論確認無替代解釋；流程對照合規；交付一致。")
+        .replace("## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n- \n",
+                 "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n"
+                 "- n=1 樣本限定；warm 記憶；scope=LAB .81/.82；口徑=per-call stable-prefix。\n"))
     with pytest.raises(SystemExit):
         runner.cmd_adjudicate(a2)
     # verdict line present but OVERRIDES EMPTY while flipping FAIL->PASS
@@ -591,18 +595,19 @@ def test_adjudicate_and_export_gate(tmp_path, capsys):
 # --------------------------------------- cache per-call / degenerate -----
 
 def test_cache_prefix_median_function():
-    med = analyze.cache_prefix_median(
+    r = analyze.cache_prefix_median(
         [(10000, 9500, 50), (10000, 9500, 50), (12000, 11400, 60), (24000, 120, 50)])
-    assert med == 95.0                       # growth call (24000) excluded, first excluded
-    assert analyze.cache_prefix_median([(10000, 9500, 50)]) is None   # needs >=2 ratios
-    assert analyze.cache_prefix_median([]) is None
+    assert r["median"] == 95.0 and r["n"] == 2 and r["min"] == 95.0   # growth call excluded
+    r1 = analyze.cache_prefix_median([(10000, 9500, 50)])             # first call only
+    assert r1["n"] == 0 and r1["median"] is None and r1["min"] is None
+    assert analyze.cache_prefix_median([])["n"] == 0
     # auxiliary contexts (<5k tokens: summarizer/operator) never count
     med_aux = analyze.cache_prefix_median(
         [(10000, 9500, 50), (452, 0, 615), (10100, 9600, 50), (10200, 9700, 50)])
-    assert med_aux == pytest.approx(95.07, abs=0.01)   # the 452-token call never drags
+    assert med_aux["median"] == pytest.approx(95.07, abs=0.01)   # the 452-token call never drags
     low = analyze.cache_prefix_median(
         [(10000, 5000, 50), (10000, 5050, 50), (12000, 6000, 60)])
-    assert low == 50.25                      # statistics.median([50.0, 50.5])
+    assert low["median"] == 50.25 and low["min"] == 50.0
 
 
 def _eval_with_audit(per_call, **summary_over):
@@ -623,14 +628,27 @@ def _eval_with_audit(per_call, **summary_over):
 
 def test_cache_prefix_median_gate_replaces_aggregate():
     """2026-09-18 round: the aggregate 54.2% FAILED a healthy run — the
-    per-call caliber must PASS it while still catching true degradation."""
+    per-call caliber must PASS it while still catching true degradation.
+    2026-09-19 r2: n>=3 to be hard (n=2 failed a run by 0.6pp — a young-
+    context artifact), plus a per-sample floor."""
     healthy = [(24000, 22300, 400), (25000, 23400, 300), (25500, 24000, 300),
                (29800, 24500, 1400), (30000, 28400, 100)]
     by = {g["gate"]: g for g in _eval_with_audit(healthy)}
     assert by["cache-prefix-median"]["pass"] is True
-    degraded = [(24000, 12000, 400), (25000, 12600, 300), (25500, 12800, 300)]
+    degraded = [(24000, 12000, 400), (25000, 12600, 300), (25500, 12800, 300),
+                (25600, 12900, 300)]
     by = {g["gate"]: g for g in _eval_with_audit(degraded)}
     assert by["cache-prefix-median"]["pass"] is False
+    # n=2 -> informational only, never a hard verdict (t1 2026-09-19 lesson)
+    two = [(24000, 22300, 400), (25000, 23400, 300)]
+    by = {g["gate"]: g for g in _eval_with_audit(two)}
+    assert "cache-prefix-median" not in by
+    assert by["cache-prefix-samples"]["severity"] == "trend"
+    # floor: healthy median but ONE collapsed sample still fails hard
+    floored = [(24000, 22300, 400), (25000, 23400, 300), (25500, 24000, 300),
+               (26000, 13000, 300)]
+    by = {g["gate"]: g for g in _eval_with_audit(floored)}
+    assert by["cache-prefix-median"]["pass"] is False and "floor" in by["cache-prefix-median"]["detail"]
 
 
 def test_degenerate_output_detector():
@@ -829,6 +847,9 @@ def test_flip_requires_per_gate_coverage(tmp_path):
     filled = adj.read_text().replace(
         "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
         "四鏡複審完成：核實、方法論、流程、交付四路全數通過，無保留意見，同意翻案。")
+    filled = filled.replace("## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n- \n",
+                            "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n"
+                            "- n=2 樣本；warm；scope=LAB；口徑=per-call。\n")
     filled = filled.replace("verdict: ", "verdict: PASS\n_", 1)
     hdr = "| gate | run/scenario | conclusion | evidence | limits |\n|---|---|---|---|---|\n"
     partial = filled.replace(
@@ -891,6 +912,9 @@ def test_verdict_vocabulary_and_override_evidence(tmp_path):
     filled = t0.replace(
         "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
         "四鏡複審完成，證據核實與方法論複核通過，流程合規，交付一致，無保留意見。")
+    filled = filled.replace("## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n- \n",
+                            "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n"
+                            "- n=1 樣本；warm；scope=LAB；口徑=per-call。\n")
     # mistyped vocabulary
     adj.write_text(filled.replace("verdict: ", "verdict: PAS\n_", 1))
     a2 = _Args()
@@ -996,7 +1020,7 @@ def test_cache_prefix_median_per_context():
     calls = [(10000, 9500, 50, "main"), (6000, 0, 60, "operator"),
              (10100, 9600, 50, "main"), (10200, 9700, 50, "main")]
     med = analyze.cache_prefix_median(calls)
-    assert med == pytest.approx(95.07, abs=0.01)   # main-only ratios; operator's
+    assert med["median"] == pytest.approx(95.07, abs=0.01)   # main-only ratios; operator's
     # single call is its context's first -> excluded entirely
 
 
@@ -1046,3 +1070,162 @@ def test_proc_start_and_product_head_epochs():
     assert start is not None and abs(start - time.time()) < 120
     head = runner._product_head_epoch()
     assert head is not None and head > 0
+
+
+# ------------------------------------- 2026-09-19 r2 hardening ----------
+
+def test_statuses_compact():
+    """R1-B: report/adjudication/frames showed 6 / 2 / 1 awaiting_approval
+    for the SAME run — the compact counter keeps the full sequence."""
+    assert analyze.statuses_compact([]) == "[]"
+    assert analyze.statuses_compact(["ok"]) == "ok"
+    assert analyze.statuses_compact(["awaiting_approval"] * 6 + ["ok"]) \
+        == "awaiting_approval×6→ok"
+    assert analyze.statuses_compact(["a", "b", "a"]) == "a→b→a"
+
+
+def test_finalize_requires_limits(tmp_path):
+    """R2-F2: the 2026-09-19 rev1 fill silently missed the limits anchor and
+    shipped an empty section — finalize must refuse an empty limits."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = d / "adjudication.md"
+    adj.write_text(adj.read_text().replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成：證據核實、對抗方法論、秘密運維、文件一致性四路全數通過。").replace("verdict: ", "verdict: FAIL\n_", 1))
+    a2 = _Args()
+    a2.run_dirs = [str(d)]
+    a2.finalize = True
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a2)
+    assert "adjudication-status: DRAFT" in adj.read_text()
+
+
+def test_export_mixed_is_round_aggregate_not_flip(tmp_path, capsys):
+    """R2 #4: MIXED over heterogeneous run verdicts is round AGGREGATION —
+    'see overrides' misled (the overrides table was empty); float residue
+    (2.3198000000000008) must be rounded in facts/export."""
+    _adj_run_dir(tmp_path, "20260101-000000-quick", verdict="PASS")
+    f = _adj_run_dir(tmp_path, "20260101-010000-full")
+    (f / "ledger.json").write_text(json.dumps(
+        {"cost_usd_product": 2.3198000000000008, "seconds": 1021}))
+    a = _Args()
+    a.run_dirs = [str(tmp_path / "20260101-000000-quick"), str(f)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    adj = f / "adjudication.md"
+    adj.write_text(adj.read_text().replace(
+        "<!-- paste the four-lens review summary here; 觸發: 判定翻案/對外開單前/發版判定 -->",
+        "四鏡複審完成：證據核實、對抗方法論、秘密運維、文件一致性四路全數通過。")
+        .replace("## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n- \n",
+                 "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n- n=1 樣本；warm 記憶；scope=LAB .81/.82；口徑=per-call stable-prefix。\n")
+        .replace("verdict: ", "verdict: MIXED\n_", 1))
+    a2 = _Args()
+    a2.run_dirs = [str(f)]
+    a2.finalize = True
+    runner.cmd_adjudicate(a2)
+    e = _Args()
+    e.run_dir = str(f)
+    e.out = None
+    runner.cmd_export(e)
+    out = capsys.readouterr().out
+    assert "round aggregate" in out and "see overrides" not in out
+    assert "不授權合併/發版" in out                     # MIXED auto-disclaimer
+    assert "2.3198" in out and "2.3198000000000008" not in out
+
+
+def test_expect_artifacts_gate(tmp_path):
+    """R2-F4: both deep scenarios skipped the prompt-mandated save_report and
+    still terminated ok — artifacts presence is now a hard expect."""
+    sm = {"status": None, "invariants": {"terminal_closure": True,
+                                         "approval_closure": True,
+                                         "no_complete_while_approval_open": True},
+          "approvals": 0, "error_count": 0, "complete_statuses": ["ok"], "tokens_in": 1}
+    fm = {"statuses": ["ok"], "dup_pairs": 0, "late_frames": 0}
+    (tmp_path / "scenarios").mkdir()
+    (tmp_path / "scenarios" / "partition-report-192.168.73.82.md").write_text("# r\n")
+    exp = {"artifacts": ["scenarios/partition-report-*.md", "scenarios/partition-report-*.json"]}
+
+    def run():
+        return {g["gate"]: g for g in
+                analyze.evaluate(sm, fm, "full", None, None, expect=exp, run_dir=tmp_path)}
+    assert run()["expect-artifacts"]["pass"] is False      # json missing
+    j = tmp_path / "scenarios" / "partition-report-192.168.73.82.json"
+    j.write_text("{}")
+    assert run()["expect-artifacts"]["pass"] is True
+    j.write_text("")                                       # empty file ≠ artifact
+    assert run()["expect-artifacts"]["pass"] is False
+
+
+def test_tmp_scratch_dir_aware(monkeypatch, tmp_path):
+    """R3 FAIL 2026-09-19: 9 empty clearwing_custom_tools_* dirs survived a
+    cleanup that asserted tmp-residue PASS — scan DIRECTORIES, remove the
+    empty ones in our window, fail on non-empty leftovers."""
+    monkeypatch.setattr(runner, "TMP_ROOT", tmp_path)
+    run_dir = tmp_path / "20260101-000000-full"
+    run_dir.mkdir()
+    (tmp_path / "clearwing_custom_tools_new_empty").mkdir()      # ours: removed
+    (tmp_path / "clearwing_custom_tools_new_full").mkdir()       # ours: fails
+    (tmp_path / "clearwing_custom_tools_new_full" / "x").write_text("payload")
+    old = tmp_path / "clearwing_custom_tools_old_empty"          # member's: untouched
+    old.mkdir()
+    import os as _os
+    _os.utime(old, (1577836800, 1577836800))
+    left = runner._tmp_scratch_left(run_dir)
+    assert left == ["clearwing_custom_tools_new_full"]
+    assert not (tmp_path / "clearwing_custom_tools_new_empty").exists()
+    assert old.exists()                                          # outside window: kept
+
+
+def test_tool_result_size_gate(tmp_path):
+    """R4: the 2.79MB scan_vulnerabilities result was invisible to every
+    gate — frames carry content_length; surface it as an informational watch."""
+    sm = {"status": None, "invariants": {"terminal_closure": True, "approval_closure": True,
+                                         "no_complete_while_approval_open": True},
+          "approvals": 0, "error_count": 0, "complete_statuses": ["ok"], "tokens_in": 1}
+    fr = tmp_path / "x.frames.jsonl"
+    fr.write_text(
+        '{"type":"tool_result","data":{"tool":"scan_vulnerabilities","content_length":2788762,"flags_found":21}}\n'
+        '{"type":"complete","data":{"status":"ok"}}\n')
+    fm = analyze.frames_metrics(fr)
+    assert fm["max_tool_result"] == (2788762, "scan_vulnerabilities")
+    by = {g["gate"]: g for g in analyze.evaluate(sm, fm, "full", None, None)}
+    assert by["tool-result-size"]["severity"] == "trend" and by["tool-result-size"]["pass"]
+    assert "2,788,762" in by["tool-result-size"]["detail"]
+    fr.write_text('{"type":"tool_result","data":{"tool":"t","content_length":100}}\n'
+                  '{"type":"complete","data":{"status":"ok"}}\n')
+    fm = analyze.frames_metrics(fr)
+    assert not any(g["gate"] == "tool-result-size"
+                   for g in analyze.evaluate(sm, fm, "full", None, None))
+
+
+def test_report_carries_trigger(monkeypatch, tmp_path):
+    """SPEC §3 dual-carrier: the run REPORT must state its trigger source
+    (round-log alone was the single carrier — R4 lens)."""
+    monkeypatch.setattr(analyze, "RESULTS", tmp_path)
+    d = _write_min_run(tmp_path, "20260101-000000-full")
+    (d / "state").mkdir()
+    (d / "state" / "pre-state.json").write_text(
+        json.dumps({"trigger": "使用者指示 2026-09-19", "suite_sha256": "abcd1234"}))
+    ver = {"git": {"head": "x" * 40, "webapi_commit": "y", "branch": "b"}}
+    analyze.render(d, "full", ver, [("k", True, "")])
+    assert "- trigger: 使用者指示 2026-09-19" in (d / "report.md").read_text()
+    (d / "state" / "pre-state.json").write_text(json.dumps({"trigger": ""}))
+    analyze.render(d, "full", ver, [("k", True, "")])
+    assert "⚠️ 未記錄" in (d / "report.md").read_text()
+
+
+def test_adjudicate_quotes_trigger(tmp_path):
+    """The adjudication draft auto-quotes the round's recorded trigger so the
+    honesty clause cannot be forgotten at fill time."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    (d / "state").mkdir()
+    (d / "state" / "pre-state.json").write_text(json.dumps({"trigger": "8899 HEAD 變更 #99"}))
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)
+    assert "8899 HEAD 變更 #99" in (d / "adjudication.md").read_text()

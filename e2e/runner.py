@@ -31,6 +31,7 @@ import yaml  # noqa: E402
 
 SUITE = yaml.safe_load((E2E_ROOT / "suite.yaml").read_text())
 RESULTS = E2E_ROOT / "results"
+TMP_ROOT = Path("/tmp")      # module constant so tests can monkeypatch the scratch-dir scan
 
 # Frozen safety policy (unchanged from comparison-test-v2 lineage) ...
 POLICY_DENY = re.compile(
@@ -671,7 +672,7 @@ def evaluate_key_gate(kf_bytes: bytes | None, environ_key: str | None,
     return ("key-files-info", True, "no mirror file, no /proc environ — unverified (info)")
 
 
-def verify(run_dir: Path | None, strict: bool = True) -> dict:
+def verify(run_dir: Path | None, strict: bool = True, trigger: str | None = None) -> dict:
     """Tier0 gates (SPEC §3). strict=True: hard failures abort the run."""
     checks: list[tuple[str, bool, str]] = []
     gi = git_info()
@@ -756,12 +757,18 @@ def verify(run_dir: Path | None, strict: bool = True) -> dict:
             suite_hash.update((E2E_ROOT / f).read_bytes())
         (st / "pre-state.json").write_text(json.dumps({
             "git": gi, "audit_dirs": audit_n,
+            "trigger": trigger or "",      # SPEC §3 trigger-honesty: run reports carry the source
             "memory_db": _sz("memory.db"), "knowledge_graph": _sz("knowledge_graph.json"),
             "pids_8899": pids,
             "suite_sha256": suite_hash.hexdigest()[:16],
             "target_snapshot": {t: {p: probe_majority(t, p) for p in (88, 445, 3389)} for t in SUITE["targets"]},
         }, indent=1))
 
+    if trigger is not None:
+        # soft nudge in run context only (standalone verify passes None) —
+        # the -info suffix keeps it from ever blocking (SPEC §3 dual-carrier)
+        checks.append(("trigger-recorded-info", bool(trigger),
+                       "SPEC §3 觸發源" + ("" if trigger else " 未記錄 — run --trigger '<來源>'")))
     for name, ok, note in checks:
         log(f"verify {'PASS' if ok else 'FAIL'} {name} {note}")
     if strict:
@@ -831,9 +838,41 @@ def scenario_hud(sc: dict, run_dir: Path, ws_url: str, keyfile: Path) -> dict:
               "report_cost": rep_cost, "report_tokens": rep_tokens, "pass": bool(match),
               # ledger-visible spend: the HUD turn billed real tokens (Codex #67 r6)
               "cost_usd_product": hc, "seconds": 0}
+    # numeric tokens from the session's own audit so run-level token totals
+    # stop silently excluding this session (R1-A: quick ledger omitted
+    # warm-hud's 23,584 tokens while its cost WAS counted)
+    if sid:
+        import analyze as _az
+        am = _az.audit_metrics(sid, Path.home() / ".clearwing")
+        if am:
+            result["tokens_in"], result["tokens_out"] = am["tokens_in"], am["tokens_out"]
     (run_dir / "scenarios" / "hud-proof.json").write_text(json.dumps(result, indent=1))
     log(f"  -> HUD footer {hud_cost}/{hud_tokens} vs report {rep_cost}/{rep_tokens} match={match}")
     return result
+
+
+def _tmp_scratch_left(run_dir: Path) -> list[str]:
+    """Scratch dirs the product's custom-tool runtime leaves per session. The
+    old file-only glob passed while 9 empty clearwing_custom_tools_* dirs
+    from our own sessions survived (R3 lens, 2026-09-19) — the assertion
+    was false. Window = dirs created since this run started (dir-name ts);
+    empty ones we remove ourselves, non-empty leftovers fail the gate."""
+    m_ts = re.match(r"(\d{8}-\d{6})", run_dir.name)
+    try:
+        run_start = time.mktime(time.strptime(m_ts.group(1), "%Y%m%d-%H%M%S")) if m_ts else 0.0
+    except ValueError:                     # non-timestamped (test) dirs: window = everything
+        run_start = 0.0
+    scratch_left = []
+    for d in TMP_ROOT.glob("clearwing_custom_tools_*"):
+        try:
+            if d.is_dir() and d.stat().st_mtime >= run_start:
+                if not any(d.iterdir()):
+                    d.rmdir()
+                else:
+                    scratch_left.append(d.name)
+        except OSError:
+            pass
+    return scratch_left
 
 
 def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] | None = None,
@@ -855,7 +894,10 @@ def cleanup_run(run_dir: Path, container_ids: list[str], before_8899: list[int] 
     remaining_ours = [c for c in left if c in ours]
     out.append(("kali-containers", not remaining_ours,
                 f"ours-remaining={remaining_ours} member-left={len(left) - len(remaining_ours)} (untouched)"))
-    out.append(("tmp-residue", not (list(Path('/tmp').glob('report_*')) or list(Path('/tmp').glob('kerbrute*'))), ""))
+    scratch_left = _tmp_scratch_left(run_dir)
+    out.append(("tmp-residue", not (list(TMP_ROOT.glob('report_*')) or list(TMP_ROOT.glob('kerbrute*'))
+                                    or scratch_left),
+                f"scratch-dirs-left={scratch_left}"))
     out.append(("tmux-none", subprocess.run(["tmux", "ls"], capture_output=True).returncode != 0, ""))
     for png in run_dir.rglob("*.png"):
         r = subprocess.run(["strings", str(png)], capture_output=True, text=True)
@@ -1120,7 +1162,10 @@ def _run_dir_facts(d: Path) -> dict:
             facts["verdict"] = m.group(1)
     try:
         led = json.loads((d / "ledger.json").read_text())
-        facts["cost"], facts["seconds"] = led.get("cost_usd_product"), led.get("seconds")
+        c = led.get("cost_usd_product")
+        # round(4) kills float residue like 2.3198000000000008 leaking into
+        # adjudication/export text (R1-C, 2026-09-19)
+        facts["cost"], facts["seconds"] = (round(c, 4) if c is not None else None), led.get("seconds")
     except (OSError, ValueError):
         pass
     try:
@@ -1131,9 +1176,10 @@ def _run_dir_facts(d: Path) -> dict:
     try:
         for sc in json.loads((d / "manifest.json").read_text()):
             s = sc.get("summary") or {}
+            import analyze as _az
             facts["scenarios"].append({
                 "name": sc.get("name"), "sid": s.get("session_id"),
-                "statuses": (s.get("complete_statuses") or [])[-2:],
+                "statuses": _az.statuses_compact(s.get("complete_statuses") or []),
                 "cost": s.get("cost_usd_product"), "type": s.get("type", "ws")})
     except (OSError, ValueError):
         pass
@@ -1174,6 +1220,13 @@ def cmd_adjudicate(args) -> None:
         if len(body) < 30:
             die("review-record section is empty/too short — the four-lens review "
                 "(REVIEW.md) must be pasted before finalize (SPEC §9 hard rule)")
+        lm = re.search(r"## limits[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
+        lbody = re.sub(r"<!--.*?-->", "", lm.group(1) if lm else "", flags=re.S)
+        lbody = re.sub(r"[\s#|>*-]", "", lbody)
+        if len(lbody) < 30:
+            die("limits section is empty/too short — every verdict carries its 限定欄 "
+                "(n= / warm-cold / scope / 口徑) before finalize; the 2026-09-19 rev1 "
+                "fill silently missed the template anchor and shipped an empty section")
         verdict = _adj_final_verdict(text)
         if not verdict:
             die("final verdict line is empty — set `verdict: PASS|FAIL|REGRESSION|MIXED` "
@@ -1240,6 +1293,10 @@ def cmd_adjudicate(args) -> None:
         "",
         "## run index (ALL run dirs of this round, incl. FATAL attempts)", "",
     ]
+    try:      # SPEC §3: the adjudication doc quotes the round's recorded trigger
+        trig = json.loads((dirs[-1] / "state" / "pre-state.json").read_text()).get("trigger")
+    except (OSError, ValueError):
+        trig = ""
     total_cost = 0.0
     for d in dirs:
         f = _run_dir_facts(d)
@@ -1260,6 +1317,7 @@ def cmd_adjudicate(args) -> None:
         "", "## overridden gates (HUMAN — a flipped verdict MUST live here with 論據)", "",
         "| gate | run/scenario | conclusion | evidence | limits |", "|---|---|---|---|---|",
         "", "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)", "",
+        *([f"- 觸發源（pre-state 自動引用）：{trig}"] if trig else []),
         "- ", "",
         "## final verdict (HUMAN — 翻案後的最終判定；未翻案則照抄機器判定)", "",
         "verdict: ",
@@ -1299,8 +1357,14 @@ def cmd_export(args) -> None:
     total_cost = round(sum(f["cost"] or 0 for f in all_facts), 4)
     machine = sorted({f["verdict"] for f in all_facts if f["verdict"] != "?"})
     final_verdict = _adj_final_verdict(text) or "MIXED"
-    machine_note = "" if final_verdict in machine or not machine else \
-        f" (machine verdict was {'/'.join(machine)} — adjudicated; see overrides)"
+    # MIXED over heterogeneous run verdicts is round AGGREGATION, not a flip —
+    # "see overrides" there misled readers of the 2026-09-19 export (R2 #4)
+    if final_verdict in machine or not machine:
+        machine_note = ""
+    elif len(machine) > 1 and final_verdict == "MIXED":
+        machine_note = f" (round aggregate — machine run verdicts were {'/'.join(machine)})"
+    else:
+        machine_note = f" (machine verdict was {'/'.join(machine)} — adjudicated; see overrides)"
     out = [f"cw-e2e round summary (auto-export {time.strftime('%F %T')} — "
            f"adjudicated, review on record)", "",
            f"- verdict: **{final_verdict}**{machine_note} · round ${total_cost} · "
@@ -1308,6 +1372,9 @@ def cmd_export(args) -> None:
     for f in all_facts:
         out.append(f"  - `{f['path']}` — {f['verdict']} · ${f['cost']} · "
                    + (f"failed: {', '.join(f['failed_gates'])}" if f["failed_gates"] else "clean"))
+    if final_verdict == "MIXED":
+        out.append("- ⚠️ MIXED＝輪級聚合（多 run 判定互異），非任一 run 的翻案——"
+                   "不授權合併/發版動作；各 run 判定以上列為準")
     if any(f["r3_pending"] for f in all_facts):
         out.append("- ⚠️ R3 人工抽核未完成（r3-manual.md 待填、無 r3-done）——"
                    "發版級宣稱（Full×2＋deep-cold）不應引用本輪")
@@ -1364,7 +1431,7 @@ def cmd_run(args) -> None:
     with SuiteLock():
         run_dir = new_run_dir(tier_name + ("-partial" if args.only else ""))
         log(f"run dir: {run_dir}")
-        ver = verify(run_dir, strict=not args.force)
+        ver = verify(run_dir, strict=not args.force, trigger=getattr(args, "trigger", None))
         if args.force:
             forced = [c for c in ver.get("checks", []) if not c[1]]
             (run_dir / "state" / "forced-gates.json").write_text(json.dumps(
@@ -1464,6 +1531,9 @@ def main() -> None:
     r.add_argument("--only", help="run a single scenario by name")
     r.add_argument("--approve-fallback", action="store_true",
                    help="authorize deep-fallback real-config surgery")
+    r.add_argument("--trigger",
+                   help="SPEC §3 trigger-honesty source (e.g. '使用者指示 2026-09-19' / "
+                        "'8899 HEAD 變更 #NN') — recorded in pre-state + report header")
     r.add_argument("--keyfile")
     a = sub.add_parser("analyze", help="re-render analysis+report for an existing run dir")
     a.add_argument("run_dir")
