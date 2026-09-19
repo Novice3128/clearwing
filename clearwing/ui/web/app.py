@@ -129,6 +129,47 @@ def _cors_origins() -> list[str]:
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 
+def _probe_dir_writable(directory: Path) -> tuple[bool, str]:
+    """Create+write+delete a uniquely-named probe file inside *directory*.
+
+    A directory that merely exists proves nothing: ``mkdir(exist_ok=True)``
+    succeeds on an already-existing read-only directory (e.g. a separately
+    mounted read-only volume), so only an actual create+write catches it
+    before the first real write raises.
+
+    The probe file name is unique per call: concurrent health polls used
+    to race on one fixed `.health_probe` path (one caller's unlink hit
+    another's write → FileNotFoundError → spurious 503s).
+
+    Returns ``(ok, reason)``; the reason carries the directory path and
+    errno for the server log — callers must keep it off the wire
+    (/api/health is unauthenticated).
+    The probe payload is non-empty: a zero-length create only allocates
+    an inode, so it succeeds on a volume with exhausted data blocks and
+    health would answer 200 while the next real write fails with ENOSPC.
+    """
+    probe = directory / f".health_probe.{uuid.uuid4().hex}"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+    except OSError as exc:
+        return False, f"{directory} is not writable: {exc}"
+    # PR #71 r3: cleanup failure is a health failure, not a cosmetic one.
+    # On a filesystem that allows create but denies delete (NFSv4
+    # ADD_FILE without DELETE_CHILD), a best-effort unlink left one
+    # .health_probe.* residue file per poll while health kept answering
+    # 200 — unbounded accumulation until the volume exhausts. A directory
+    # the service cannot keep clean is not a healthy write target:
+    # degrade. Deliberately stateless (no cross-request residue memory) —
+    # the 503 surfaces the condition immediately so the operator fixes
+    # the ACL, and both probe sites (home root and sessions BASE_DIR)
+    # inherit the behavior through this helper.
+    try:
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        return False, f"{directory} is not writable: probe cleanup failed: {exc}"
+    return True, ""
+
+
 def _state_dir_status() -> tuple[bool, str]:
     """Probe the clearwing state directory for writability (issue #7).
 
@@ -136,21 +177,17 @@ def _state_dir_status() -> tuple[bool, str]:
     a read-only volume) breaks SessionStore and every state-writing
     endpoint; /api/health must surface that instead of reporting "ok"
     while /api/sessions 500s on every call.
-
-    The probe file name is unique per call: concurrent health polls used
-    to race on one fixed `.health_probe` path (one caller's unlink hit
-    another's write → FileNotFoundError → spurious 503s).
     """
     from clearwing.core.config import clearwing_home
 
     home = clearwing_home()
     try:
         home.mkdir(parents=True, exist_ok=True)
-        probe = home / f".health_probe.{uuid.uuid4().hex}"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink(missing_ok=True)
     except OSError as exc:
         return False, f"state dir {home} is not writable: {exc}"
+    ok, reason = _probe_dir_writable(home)
+    if not ok:
+        return False, f"state dir {reason}"
     return True, ""
 
 
@@ -235,6 +272,32 @@ def create_app():
         # generic on the wire (this endpoint is unauthenticated — no
         # internal paths/errno); the full reason goes to the server log.
         ok, reason = _state_dir_status()
+        detail = "state directory unavailable"
+        if ok:
+            # Issue #49: home writable does not imply sessions persist —
+            # SessionStore mkdirs home/sessions and degrades independently
+            # (available=False). Probe the ACTUAL sessions persistence path
+            # so health cannot say "ok" while /api/sessions 503s. Reuse the
+            # same construction as /api/sessions: constructing the store IS
+            # the probe.
+            store = _make_session_store()
+            if not store.available:
+                ok = False
+                reason = store.unavailable_reason or "sessions dir unavailable"
+                detail = "session store unavailable"
+            else:
+                # Issue #77 (Codex PR-71 r1): the sessions dir can EXIST
+                # and still reject writes — a separately mounted read-only
+                # volume passes mkdir(exist_ok=True), so construction alone
+                # answers "ok" while the next SessionStore.save() raises.
+                # Write-probe the exact directory the store persists into
+                # (store.BASE_DIR — the same path save() writes to), using
+                # the unique-probe convention from _state_dir_status.
+                probe_ok, probe_reason = _probe_dir_writable(store.BASE_DIR)
+                if not probe_ok:
+                    ok = False
+                    reason = probe_reason
+                    detail = "session store unavailable"
         if not ok:
             logger.warning("Health degraded: %s", reason)
             return JSONResponse(
@@ -242,7 +305,7 @@ def create_app():
                 content={
                     "status": "degraded",
                     "service": "clearwing",
-                    "detail": "state directory unavailable",
+                    "detail": detail,
                 },
             )
         return {"status": "ok", "service": "clearwing"}

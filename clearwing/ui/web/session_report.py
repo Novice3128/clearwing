@@ -85,9 +85,48 @@ def _md_cell(value: Any) -> str:
     inert — the same neutralization level as :func:`_md_neutralize`.
     """
     text = _redact(str(value if value is not None else ""))
-    text = text.replace("|", "\\|").replace("\n", " ")
+    # #46: fold ALL line-break shapes, not just "\\n" — str.splitlines()
+    # also recognizes \\r, \\v, \\f, \\x1c-\\x1e, NEL (\\x85) and
+    # U+2028/U+2029 (WS-sourced strings — targets, tool args — can carry
+    # them raw); any survivor could split the table row or forge a heading
+    # in lenient renderers.
+    text = " ".join(text.splitlines())
+    text = text.replace("|", "\\|")
     text = text.replace("[", "\\[").replace("]", "\\]")
-    return html.escape(text, quote=False).strip()
+    # #46: escape tildes so a `~~~` run inside a cell can never read as a
+    # fence opener (and swallow the rest of the report) in a renderer that
+    # treats the line as block content.
+    text = text.replace("~", "\\~")
+    text = html.escape(text, quote=False)
+    # #46: GFM autolinks bare `scheme://...` URLs inside cells. The entity
+    # breaks the raw-text pattern match while still rendering as ":" —
+    # verified against GFM markdown-it (`http&#58;//x` in a cell renders
+    # plain, `http://x` becomes <a href>). Cells only: prose keeps
+    # clickable links (cells are data-like). After html.escape so the
+    # entity's `&` is not itself escaped.
+    text = text.replace("://", "&#58;//")
+    # PR #71 r2: linkify's fuzzy forms have no scheme to break — `www.*`
+    # bare domains (linkify matches case-insensitively and even mid-word:
+    # `awww.evil.com` linkifies whole) and emails (`user@host` →
+    # mailto:). Escape one char of each shape the same way; both decode
+    # back for display (verified: `www&#46;evil.com` / `user&#64;evil.com`
+    # render as plain text `www.evil.com` / `user@evil.com`, no <a>).
+    # Cells only; after html.escape, same discipline as `://` above.
+    text = re.sub(r"(?i)(www)\.", r"\1&#46;", text)
+    text = text.replace("@", "&#64;")
+    # PR #71 r3: the three rules above only neutralize their own shapes —
+    # a bare registrable domain (`evil.com`) has no scheme, `www` or `@` to
+    # break, so linkify still fuzzy-matched it (verified against GFM
+    # markdown-it + linkify: cell `evil.com` became <a href>, while
+    # `evil&#46;com` renders plain text). Escape EVERY intra-word dot — a
+    # dot with word chars on both sides — which breaks any contiguous
+    # label linkify needs, while `&#46;` decodes back to `.` everywhere.
+    # Sentence-ending dots (space follows) and dot-free tokens are
+    # untouched; dotted tokens that never linkified (`10.0.0.1`,
+    # `gpt-4.1-mini`) render byte-identically after unescape. Cells only;
+    # after html.escape, same discipline as the rules above.
+    text = re.sub(r"(\w)\.(\w)", r"\1&#46;\2", text)
+    return text.strip()
 
 
 # Issue #24: transcript text is attacker-controllable prose (operator input,
@@ -199,7 +238,14 @@ class SessionTranscript:
                 args = call.get("args")
                 args_text = _md_cell(args) if args else ""
                 if len(args_text) > 120:
-                    args_text = args_text[:117] + "..."
+                    args_text = args_text[:117]
+                    # #46: a cut landing inside a `\\|`/`\\[` escape leaves a
+                    # dangling backslash at the cell tail — back off past
+                    # every trailing backslash (an escaped-literal `\\` cut
+                    # in half is indistinguishable from a cut escape).
+                    while args_text.endswith("\\"):
+                        args_text = args_text[:-1]
+                    args_text += "..."
                 lines.append(
                     f"| {i} | {_md_cell(call.get('name', 'tool'))} "
                     f"| {args_text} | {_md_cell(call.get('content_length', ''))} |"

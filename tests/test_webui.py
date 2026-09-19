@@ -38,7 +38,13 @@ def unauth_client(unauth_app):
 
 
 class TestHealthEndpoint:
-    def test_health(self, client):
+    def test_health(self, client, monkeypatch, tmp_path):
+        # #49: health now also probes the sessions persistence path, so the
+        # happy path is tested against an isolated home (not the operator's
+        # real ~/.clearwing).
+        import clearwing.core.config as config_mod
+
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: tmp_path / "home")
         resp = client.get("/api/health")
         assert resp.status_code == 200
         data = resp.json()
@@ -81,6 +87,188 @@ class TestStateDirDegradation:
         resp = client.get("/api/sessions/abc123")
         assert resp.status_code == 503
         assert resp.json()["detail"] == "session store unavailable"
+
+
+class TestHealthSessionsProbe:
+    """#49: home writable but CLEARWING_HOME/sessions blocked must degrade
+    health — SessionStore degrades independently of the home write probe,
+    so health used to say "ok" while /api/sessions answered 503."""
+
+    def _writable_home(self, monkeypatch, tmp_path):
+        import clearwing.core.config as config_mod
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(config_mod, "clearwing_home", lambda: home)
+        return home
+
+    def test_sessions_path_blocked_degrades_health(self, client, monkeypatch, tmp_path):
+        home = self._writable_home(monkeypatch, tmp_path)
+        (home / "sessions").write_text("")  # a file where a directory is needed
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["service"] == "clearwing"
+        # Unauthenticated endpoint: generic wire detail; the sessions path
+        # and errno stay in the server log.
+        assert data["detail"] == "session store unavailable"
+        assert str(home) not in data["detail"]
+
+    def test_sessions_path_writable_health_ok(self, client, monkeypatch, tmp_path):
+        home = self._writable_home(monkeypatch, tmp_path)
+        # Poll repeatedly: every probe (home root AND sessions dir) must
+        # clean up after itself — no .health_probe.* residue either way.
+        for _ in range(3):
+            resp = client.get("/api/health")
+            assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        sessions = home / "sessions"
+        assert not [
+            p for p in sessions.iterdir() if p.name.startswith(".health_probe")
+        ]
+        assert not [
+            p for p in home.iterdir() if p.name.startswith(".health_probe")
+        ]
+
+    def test_sessions_dir_read_only_degrades_health(self, client, monkeypatch, tmp_path):
+        # #77: mkdir(exist_ok=True) SUCCEEDS on an already-existing
+        # read-only sessions dir (e.g. a separately mounted read-only
+        # volume), so the construction probe alone answers "ok" while the
+        # next SessionStore.save() raises. Health must write-test the dir.
+        home = self._writable_home(monkeypatch, tmp_path)
+        sessions = home / "sessions"
+        sessions.mkdir()
+        sessions.chmod(0o500)
+        try:
+            # Permission bits are advisory for root: verify the
+            # restriction actually bites before asserting on it.
+            canary = sessions / ".canary"
+            try:
+                canary.write_text("", encoding="utf-8")
+            except OSError:
+                restricted = True
+            else:
+                restricted = False
+                canary.unlink(missing_ok=True)
+            if not restricted:
+                pytest.skip("chmod cannot restrict this user (running as root)")
+            resp = client.get("/api/health")
+            assert resp.status_code == 503
+            data = resp.json()
+            assert data["status"] == "degraded"
+            assert data["service"] == "clearwing"
+            # Unauthenticated endpoint: generic wire detail; the sessions
+            # path and errno stay in the server log.
+            assert data["detail"] == "session store unavailable"
+            assert str(home) not in data["detail"]
+            assert str(sessions) not in data["detail"]
+        finally:
+            sessions.chmod(0o700)  # let tmp_path cleanup remove it
+
+    def test_sessions_dir_unwritable_degrades_health_for_root(
+        self, client, monkeypatch, tmp_path
+    ):
+        # Same regression as above, but via an injected OSError so the
+        # case is exercised even where chmod cannot restrict (root CI).
+        from pathlib import Path
+
+        home = self._writable_home(monkeypatch, tmp_path)
+        sessions = home / "sessions"
+        sessions.mkdir()
+        real_write_text = Path.write_text
+
+        def _deny_sessions_writes(self, data, *args, **kwargs):
+            if self.parent == sessions:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_write_text(self, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _deny_sessions_writes)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["detail"] == "session store unavailable"
+        assert str(sessions) not in data["detail"]
+
+    def test_probe_writes_nonempty_data(self, client, monkeypatch, tmp_path):
+        """Codex PR-71 r2 (P1): `write_text("")` is a zero-length create —
+        it only allocates an inode, so it succeeds on a volume with
+        exhausted data blocks (free inodes) and health answered 200 while
+        the next real write failed with ENOSPC. Every probe write (home
+        root AND sessions dir) must carry at least one byte."""
+        from pathlib import Path
+
+        self._writable_home(monkeypatch, tmp_path)
+        real_write_text = Path.write_text
+        probe_payloads = []
+
+        def _spy_write_text(self, data, *args, **kwargs):
+            if self.name.startswith(".health_probe"):
+                probe_payloads.append(data)
+            return real_write_text(self, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _spy_write_text)
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        # Both probe sites fired (home root + sessions dir), each with data.
+        assert len(probe_payloads) >= 2
+        assert all(len(payload) > 0 for payload in probe_payloads)
+
+    def test_probe_cleanup_failure_degrades_health(self, client, monkeypatch, tmp_path):
+        """Codex PR-71 r3 (P2): on a filesystem that allows create but
+        denies delete (NFSv4 ADD_FILE without DELETE_CHILD), cleanup was
+        best-effort — every poll left a .health_probe.* residue file
+        while health kept answering 200, accumulating until the volume
+        exhausts. A cleanup failure must degrade health instead. Both
+        probe sites flow through _probe_dir_writable: this variant breaks
+        unlink at the HOME probe (first to fire)."""
+        from pathlib import Path
+
+        home = self._writable_home(monkeypatch, tmp_path)
+        real_unlink = Path.unlink
+
+        def _deny_probe_unlink(self, *args, **kwargs):
+            if self.name.startswith(".health_probe"):
+                raise PermissionError(1, "Operation not permitted", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _deny_probe_unlink)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        # Unauthenticated endpoint: generic wire detail; path + errno stay
+        # in the server log.
+        assert data["detail"] == "state directory unavailable"
+        assert str(home) not in data["detail"]
+
+    def test_probe_cleanup_failure_sessions_dir_degrades_health(
+        self, client, monkeypatch, tmp_path
+    ):
+        """Same regression, sessions-BASE_DIR variant: the home probe
+        cleans up fine but the sessions-dir probe's unlink fails (site
+        mounts can differ) — health must still degrade, with the sessions
+        detail."""
+        from pathlib import Path
+
+        home = self._writable_home(monkeypatch, tmp_path)
+        sessions = home / "sessions"
+        sessions.mkdir()
+        real_unlink = Path.unlink
+
+        def _deny_sessions_probe_unlink(self, *args, **kwargs):
+            if self.parent == sessions and self.name.startswith(".health_probe"):
+                raise PermissionError(1, "Operation not permitted", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _deny_sessions_probe_unlink)
+        resp = client.get("/api/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["detail"] == "session store unavailable"
+        assert str(sessions) not in data["detail"]
 
 
 class TestHealthProbeConcurrency:
@@ -899,6 +1087,190 @@ class TestSessionReportHardening:
         assert not re_module.search(r"^\|---\|---\|", content, re_module.MULTILINE)
         # Everything after the pseudo-fence is still rendered as prose.
         assert "real answer after the fence attempt" in content
+
+    def test_exotic_line_breaks_in_cells_cannot_split_rows(self, monkeypatch, tmp_path):
+        """#46 item 1: \\r / \\v / \\x1c / \\x85 / U+2028 in a cell survive a
+        lone "\\n" replace; fold every splitlines()-recognized break so no
+        cell can break out of its row or forge a heading."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00008",
+            target="t1\r# Forged Heading",
+            model="m\u2028## Also Forged",
+        )
+        transcript.add_tool("run", args="a\vb\x1cc\x1dd\x1ee\x85f")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # No line may start with a heading forged inside a cell.
+        assert not re_module.search(r"^# Forged Heading", content, re_module.MULTILINE)
+        assert not re_module.search(r"^## Also Forged", content, re_module.MULTILINE)
+        # The breaks were folded into spaces, not preserved.
+        assert "t1 # Forged Heading" in content
+        assert "m ## Also Forged" in content
+
+    def test_tilde_run_in_cell_cannot_open_fence(self, monkeypatch, tmp_path):
+        """#46 item 1: a `~~~` inside a table cell must stay escaped so no
+        renderer can read it as a fence opener."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00009", target="~~~", model="m")
+        transcript.add_agent("answer after the tilde cell")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert not re_module.search(r"^~", content, re_module.MULTILINE)
+        assert "\\~\\~\\~" in content  # escaped, renders back to tildes
+        assert "answer after the tilde cell" in content
+
+    def test_bare_url_in_cell_not_autolinked_prose_untouched(
+        self, monkeypatch, tmp_path
+    ):
+        """#46 item 2: GFM autolinks bare `scheme://` URLs inside cells —
+        escape the colon as `&#58;` (renders back to ":" but never
+        linkifies, verified against GFM markdown-it); prose keeps raw
+        clickable links."""
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00010", target="http://evil.example", model="m"
+        )
+        transcript.add_user("see https://docs.example.com/guide for details")
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Cell: the raw bare-URL pattern must not survive (r3 adds
+        # intra-word dot escapes on top of the scheme-colon escape).
+        assert "http://evil.example" not in content
+        assert "http&#58;//evil&#46;example" in content
+        # Prose: links stay clickable (readability tradeoff, per issue).
+        assert "https://docs.example.com/guide" in content
+
+    def test_fuzzy_bare_url_and_email_in_cell_not_autolinked(
+        self, monkeypatch, tmp_path
+    ):
+        """Codex PR-71 r2 (P2): linkify autolinks more than `scheme://` —
+        fuzzy `www.` bare domains (case-insensitively and even mid-word)
+        and emails (`user@host` → mailto:). Cells escape one char of each
+        shape as an entity — it never matches linkify but decodes back
+        for display (verified against GFM markdown-it + linkify: cell
+        `www&#46;evil…`/`user&#64;evil…` render plain text, no <a>);
+        prose keeps raw clickable forms."""
+        import html as html_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00012", target="www.evil.example", model="WWW.EVIL.example"
+        )
+        transcript.add_tool("download", args="contact user@evil.example")
+        transcript.add_user(
+            "mail user@host.example or see www.docs.example "
+            "and https://docs.example.com/guide"
+        )
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Cells: the raw fuzzy forms must not survive anywhere a cell
+        # rendered them (Target, Model, tool args).
+        assert "www.evil.example" not in content
+        assert "www&#46;evil&#46;example" in content
+        assert "WWW.EVIL.example" not in content
+        assert "WWW&#46;EVIL&#46;example" in content
+        assert "user@evil.example" not in content
+        assert "user&#64;evil&#46;example" in content
+        # Entities decode back for display: rendered text is unchanged.
+        cell = session_report._md_cell("www.evil.example user@evil.example")
+        assert html_module.unescape(cell) == "www.evil.example user@evil.example"
+        # Prose: fuzzy forms and emails stay raw and clickable.
+        assert "user@host.example" in content
+        assert "www.docs.example" in content
+        assert "https://docs.example.com/guide" in content
+
+    def test_bare_registrable_domain_in_cell_not_fuzzy_linked(
+        self, monkeypatch, tmp_path
+    ):
+        """Codex PR-71 r3 (P2): the r1/r2 escapes only break their own
+        shapes — a bare registrable domain (`evil.com`) carries no scheme,
+        `www` or `@`, so GFM markdown-it + linkify still fuzzy-linked it
+        in cells (verified empirically: `evil.com` renders <a href>).
+        Every intra-word dot is now entity-escaped — linkify-it is not
+        entity-aware, so the split labels never match, while `&#46;`
+        decodes back to `.` and rendered text is identical (including
+        dotted tokens that never linkified); prose keeps raw forms."""
+        import html as html_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript(
+            "sec00013", target="evil.com", model="sub.evil.example"
+        )
+        transcript.add_tool("lookup", args="host 10.0.0.1 model gpt-4.1-mini")
+        transcript.add_user(
+            "docs at www.docs.example and https://docs.example.com/guide"
+        )
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        # Cells: no contiguous bare-domain token survives to linkify.
+        assert "evil.com" not in content
+        assert "evil&#46;com" in content
+        assert "sub.evil.example" not in content
+        assert "sub&#46;evil&#46;example" in content
+        # Entities decode back for display: rendered text is identical,
+        # and non-link dotted tokens render byte-unchanged.
+        for raw in ("evil.com", "sub.evil.example", "10.0.0.1", "gpt-4.1-mini"):
+            cell = session_report._md_cell(raw)
+            assert html_module.unescape(cell) == raw
+        # Prose: bare domains and URLs stay raw and clickable.
+        assert "www.docs.example" in content
+        assert "https://docs.example.com/guide" in content
+
+    def test_truncated_args_cell_has_no_dangling_backslash(
+        self, monkeypatch, tmp_path
+    ):
+        """#46: `[:117]` could cut a `\\|` escape leaving a dangling
+        backslash at the cell tail — back off past trailing backslashes."""
+        import re as re_module
+
+        import clearwing.ui.web.session_report as session_report
+
+        monkeypatch.setattr(
+            session_report, "default_results_dir", lambda sub: tmp_path / sub
+        )
+        transcript = session_report.SessionTranscript("sec00011", model="m")
+        # _md_cell escapes the pipe into `\\|`; 116 z's + `\\|` + filler makes
+        # the escaped form 128 chars, so [:117] lands exactly on the backslash
+        # (z's, not a's: a 32+ run of [A-Fa-f0-9] would be redacted as a hash).
+        transcript.add_tool("download", args="z" * 116 + "|" + "b" * 10)
+        path = transcript.write()
+
+        content = path.read_text(encoding="utf-8")
+        assert len(session_report._md_cell("z" * 116 + "|" + "b" * 10)) == 128
+        # No backslash may sit immediately before the truncation ellipsis
+        # (it would escape the following char inside the row).
+        assert not re_module.search(r"\\\.\.\.", content)
+        assert "z" * 116 + "..." in content
 
     def test_ws_message_with_null_content_still_writes_report(
         self, client, monkeypatch, results_dir
