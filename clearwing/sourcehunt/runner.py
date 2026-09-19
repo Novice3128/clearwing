@@ -114,6 +114,13 @@ MAX_TARGET_WINDOW_BYTES = 512 * 1024
 # stage string verbatim so a new stage is always attributed, just not
 # aliased. The hunter's own _arun booking is skipped when its client is
 # such a view (the view books under these tags instead).
+# Review round (role-tag continuity): the production verifier sites pass
+# stage ``verify`` (the ``_verify_finding`` client and
+# ``_preflight_budget_clients``) — a ``verifier`` key never matched and
+# verifiers booked as the literal "verify". The hunter-driven stages
+# (``hunt``, ``subsystem_hunt``, ``elaboration``) map to ``hunter`` so
+# runner-driven hunts keep the SAME audit tag as the standalone hunter's
+# historical rows (agent="hunter") — analytics continuity, not a new tag.
 _SPECIALIST_BOOK_ROLES: dict[str, str] = {
     "auto_patch": "patcher",
     "exploit": "exploiter",
@@ -125,8 +132,11 @@ _SPECIALIST_BOOK_ROLES: dict[str, str] = {
     "proof_frontier": "proof",
     "proof_exploration": "proof",
     "proof_falsifier": "proof",
-    "verifier": "verifier",
+    "verify": "verifier",
     "dynamic_verification": "verifier",
+    "hunt": "hunter",
+    "subsystem_hunt": "hunter",
+    "elaboration": "hunter",
 }
 
 # Sentinel distinguishing "not resolved yet" from init_session_audit_logger's
@@ -4000,6 +4010,15 @@ class SourceHuntRunner:
         # transports. Production native clients are AsyncLLMClient; the
         # isinstance gate BEFORE with_bookkeeping keeps the seams untouched.
         if not isinstance(client, AsyncLLMClient):
+            self._remember_model_role(task, client)
+            return client
+        # Review round (double-wrap guard): an override that is ALREADY a
+        # with_bookkeeping view must pass through as-is — wrapping it again
+        # would stack a second booking layer and double-charge every call.
+        # Currently unreachable (no production caller passes a booked view
+        # as an override); the guard exists so that one never becomes a
+        # silent double-booking foot-gun.
+        if getattr(client, "_book_agent", None) is not None:
             self._remember_model_role(task, client)
             return client
         stage = budget_stage or task

@@ -35,7 +35,7 @@ from genai_pyo3 import (
 from openinference.instrumentation import get_input_attributes, get_output_attributes
 from pydantic import BaseModel, ConfigDict, RootModel
 
-from clearwing.observability.bookkeeping import book_llm_call
+from clearwing.observability.bookkeeping import book_llm_call, init_session_audit_logger
 from clearwing.observability.otel import get_oi_tracer
 
 from .budget import (
@@ -1016,7 +1016,13 @@ class AsyncLLMClient:
         self._book_agent: str | None = None
         self._book_session_id: str | None = None
         self._book_tracker: CostTracker | None = None
-        self._book_audit_logger: AuditLogger | None = None
+        # Review round (reconciliation contract): the audit row must land
+        # under the SAME resolved id as the tracker bucket, so a view holds
+        # an AuditLogger cache PER session id (seeded with the fallback
+        # id's logger at construction; other resolved ids — the ambient
+        # webui/operator session — are built lazily via
+        # init_session_audit_logger and cached). None on the base client.
+        self._book_audit_loggers: dict[str, AuditLogger | None] | None = None
         # Optional retry-visibility hook (issue #17): invoked whenever a
         # retry is scheduled so UI layers can surface the wait as it
         # happens instead of only in the final error's attempts count.
@@ -1091,14 +1097,48 @@ class AsyncLLMClient:
         resolves at call time: the ambient ``current_session_id()`` wins
         (webui/operator parents), falling back to *session_id* for contexts
         where ContextVars do not propagate (e.g. HarnessGenerator's
-        ThreadPoolExecutor workers).
+        ThreadPoolExecutor workers). Review round (reconciliation contract):
+        the audit row follows the SAME resolved id as the bucket — the
+        *audit_logger* argument is the logger for *session_id* (the
+        fallback id, e.g. the runner's own); any OTHER resolved id gets its
+        own lazily-built logger via ``init_session_audit_logger`` so rows
+        always land in ``audit/<resolved-id>/audit.jsonl``. When ambient ==
+        fallback (every normal configuration) exactly one logger exists and
+        no extra directory is ever created.
         """
         bound = copy.copy(self)
         bound._book_agent = agent
         bound._book_session_id = session_id
         bound._book_tracker = tracker
-        bound._book_audit_logger = audit_logger
+        bound._book_audit_loggers = {}
+        if session_id is not None:
+            bound._book_audit_loggers[session_id] = audit_logger
         return bound
+
+    def _book_audit_logger_for(self, session_id: str | None) -> AuditLogger | None:
+        """The AuditLogger for the RESOLVED session id, or None.
+
+        Review round: the reconciliation contract
+        (``sum(audit rows) == CostTracker.session_total(sid)``) only holds
+        when both halves share ONE id, so the audit row must never ride a
+        logger bound to a different session than the tracker bucket.
+        Loggers are cached PER id — AuditLogger mkdirs
+        ``audit/<session_id>/`` on construction, so constructing per call
+        would churn the filesystem (and a gated/failed factory result of
+        None must not be retried per call either). The seed entry for the
+        fallback id comes from :meth:`with_bookkeeping` (the runner's own
+        logger — zero factory calls in the normal ambient==fallback case).
+
+        Thread-safety: the check-then-set race can at worst construct one
+        duplicate logger for an id (both append to the same file with
+        O_APPEND atomic positioning); the last write wins the cache. The
+        dict itself is safe under the GIL.
+        """
+        if self._book_audit_loggers is None or not session_id:
+            return None
+        if session_id not in self._book_audit_loggers:
+            self._book_audit_loggers[session_id] = init_session_audit_logger(session_id)
+        return self._book_audit_loggers[session_id]
 
     def _book_call_usage(self, response: Any) -> None:
         """Single-entry bookkeeping for one successful call (issue #64).
@@ -1120,7 +1160,7 @@ class AsyncLLMClient:
         would die with the loop), and CostTracker/EventBus/AuditLogger are
         thread-safe under their own locks.
         """
-        if self._book_tracker is None and self._book_audit_logger is None:
+        if self._book_tracker is None and self._book_audit_loggers is None:
             return
         usage = getattr(response, "usage", None)
         input_tokens = getattr(usage, "prompt_tokens", None)
@@ -1138,16 +1178,27 @@ class AsyncLLMClient:
             # would be circular.
             from clearwing.agent.tooling import current_session_id
 
-            session_id = current_session_id() or self._book_session_id
+            ambient = current_session_id()
         except Exception:
-            session_id = self._book_session_id
+            ambient = None
+        session_id = ambient or self._book_session_id
+        if ambient is not None and ambient != self._book_session_id:
+            # Observability for the split case: the bucket AND the audit
+            # row both follow the ambient id, leaving the view's fallback
+            # id (e.g. the runner's own sh-*) unused for this call.
+            logger.debug(
+                "Bookkeeping session split: ambient id %r wins over view fallback %r; "
+                "tracker bucket and audit row follow the ambient id",
+                ambient,
+                self._book_session_id,
+            )
         try:
             book_llm_call(
                 input_tokens,
                 output_tokens,
                 model=self.model_name,
                 tracker=self._book_tracker,
-                audit_logger=self._book_audit_logger,
+                audit_logger=self._book_audit_logger_for(session_id),
                 # Audit keeps the served model echo for forensics while
                 # pricing stays on the configured key (hunter/runtime split).
                 audit_model=getattr(response, "provider_model_name", None)

@@ -834,7 +834,14 @@ class TestSpecialistAudit:
         ("verifier", "stability", "stability"),
         ("verifier", "mechanism_extraction", "mechanism"),
         ("proof_local", "proof_local", "proof"),
-        ("verifier", "verifier", "verifier"),
+        # Review round: production verifier sites pass stage "verify"
+        # (the _verify_finding client + _preflight_budget_clients) — the
+        # old ("verifier","verifier") tuple pinned a phantom stage that
+        # never reached a real client.
+        ("verifier", "verify", "verifier"),
+        # Review round: hunter stages keep the historical "hunter" audit
+        # tag (analytics continuity with standalone-hunt rows).
+        ("hunter", "hunt", "hunter"),
     ]
 
     def _make_booked_runner(
@@ -885,10 +892,16 @@ class TestSpecialistAudit:
         # Any unlisted proof_* route still maps to the proof role.
         assert _specialist_book_role("proof_some_new_route") == "proof"
         assert _specialist_book_role("dynamic_verification") == "verifier"
+        # Review round: production verifier sites pass stage "verify".
+        assert _specialist_book_role("verify") == "verifier"
+        # Review round: hunter stages keep the historical "hunter" audit
+        # tag for analytics continuity with standalone-hunt rows.
+        assert _specialist_book_role("hunt") == "hunter"
+        assert _specialist_book_role("subsystem_hunt") == "hunter"
+        assert _specialist_book_role("elaboration") == "hunter"
         # Unknown stages fall back to the stage string verbatim.
-        assert _specialist_book_role("hunt") == "hunt"
-        assert _specialist_book_role("subsystem_hunt") == "subsystem_hunt"
-        assert _specialist_book_role("elaboration") == "elaboration"
+        assert _specialist_book_role("rank") == "rank"
+        assert _specialist_book_role("some_new_stage") == "some_new_stage"
 
     @pytest.mark.parametrize("task,stage,role", _STAGES)
     def test_each_stage_books_both_halves(self, monkeypatch, tmp_path, task, stage, role):
@@ -958,13 +971,20 @@ class TestSpecialistAudit:
         # The bookkeeping half landed too, on the SAME view.
         rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
         assert len(rows) == 1
-        assert rows[0]["agent"] == "hunt"
+        assert rows[0]["agent"] == "hunter"  # hunt stage → historical tag
         assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
             CostTracker().session_total(runner._session_id)
         )
         runner._reclaim_minted_cost_bucket()
 
     def test_ambient_session_wins_over_runner_fallback(self, monkeypatch, tmp_path):
+        """Review round: the reconciliation contract holds for BOTH halves
+        under the SAME resolved id. The tracker bucket always followed the
+        ambient webui session, but the audit row used to ride the runner's
+        single AuditLogger (its own fallback id) — breaking
+        ``sum(audit rows) == tracker.session_total(sid)`` for BOTH ids.
+        The audit logger must resolve per resolved id, exactly like the
+        bucket."""
         from clearwing.agent.tooling import session_scope
 
         runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
@@ -974,23 +994,24 @@ class TestSpecialistAudit:
         with session_scope(ambient):
             asyncio.run(view.aask_text(system="s", user="u"))
 
-        # Tracker BUCKET attribution follows the ambient webui session —
-        # the hunt spend lands in the parent session's total, not the
-        # runner's fallback bucket.
-        assert CostTracker().session_total(ambient) > 0.0
-        assert CostTracker().session_total(runner._session_id) == 0.0
-        # The audit ROW rides the runner's ONE AuditLogger (its own
-        # session file — spec: one per runner, no per-call mkdir churn),
-        # so the row lives in the runner's trail while its cost is
-        # attributed to the ambient bucket above.
-        rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
+        # BOTH halves follow the ambient id: the audit rows land in
+        # audit/<ambient>/audit.jsonl AND the ambient bucket equals their
+        # sum — the reconciliation contract, same id, both halves.
+        rows = _llm_cost_rows(_audit_rows(audit_home, ambient))
         assert len(rows) == 1
-        assert rows[0]["agent"] == "hunt"
-        assert rows[0]["details"]["cost_usd"] == pytest.approx(
-            CostTracker().session_total(ambient)
-        )
-        # No minted-fallback trail was created for the ambient id.
-        assert not _audit_rows(audit_home, ambient)
+        assert rows[0]["agent"] == "hunter"
+        total = sum(r["details"]["cost_usd"] for r in rows)
+        assert total > 0.0
+        assert CostTracker().session_total(ambient) == pytest.approx(total)
+        # No rows for the runner id — nothing landed in the fallback trail
+        # (its empty dir may exist from the runner's eager logger, but no
+        # audit.jsonl row is ever written there for this call).
+        assert not _audit_rows(audit_home, runner._session_id)
+        assert CostTracker().session_total(runner._session_id) == 0.0
+        # The ambient bucket is process-global (CostTracker is a singleton)
+        # — reclaim it so the test does not leak the entry.
+        CostTracker().forget_session(ambient)
+        runner._reclaim_minted_cost_bucket()
 
     def test_none_usage_fields_skip_booking_and_call_succeeds(self, monkeypatch, tmp_path):
         runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
@@ -1022,8 +1043,9 @@ class TestSpecialistAudit:
     ):
         """Regression guard for the double-booking blocker: when the runner
         hands NativeHunter a booked view, the VIEW books the call (role =
-        the stage tag, here "hunt") and the hunter's own booking stands
-        down — exactly one audit row per call, never two."""
+        the stage tag; "hunt" maps to the historical "hunter") and the
+        hunter's own booking stands down — exactly one audit row per call,
+        never two."""
         runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
         view = runner._get_native_client("hunter", self._real_client(), budget_stage="hunt")
 
@@ -1048,18 +1070,84 @@ class TestSpecialistAudit:
         # The view booked under the RUNNER's session (its fallback), once.
         rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
         assert len(rows) == 1
-        assert rows[0]["agent"] == "hunt"  # stage role, not "hunter"
-        # The hunter's minted standalone trail exists but carries NO
-        # llm_call row — its booking stood down (the view books instead).
+        assert rows[0]["agent"] == "hunter"  # stage role = historical tag
+        # Review round: under a booked view the hunter builds NO per-
+        # execution AuditLogger at all (it would only mkdir an empty
+        # audit/<ctx-id>-<8hex>/ shell) — no minted trail exists, so the
+        # hunter's own site could not have added a duplicate row either.
         minted_dirs = _audit_session_dirs(audit_home, ctx_sid)
+        assert minted_dirs == []
         hunter_rows = [
             r
             for name in minted_dirs
             for r in _llm_cost_rows(_audit_rows(audit_home, name))
         ]
         assert hunter_rows == []
-        # And nowhere did a "hunter"-tagged duplicate land.
-        assert all(r["agent"] != "hunter" for r in rows + hunter_rows)
+        # Exactly one row exists anywhere for this call — the count (not
+        # the tag: view and standalone site now share "hunter") is what
+        # pins the no-double-booking invariant.
+        assert len(rows) + len(hunter_rows) == 1
+        runner._reclaim_minted_cost_bucket()
+
+    def test_hunter_with_booked_view_summarizer_books_once_under_stage_role(
+        self, monkeypatch, tmp_path
+    ):
+        """Review round: the summarizer booking guard had ZERO coverage —
+        the view test above runs max_steps=1 with no compaction, so the
+        guarded site at hunter.py (agent="summarizer") was never exercised
+        under a booked view. Force a summarizer run (same seam as
+        TestHunterAudit: a ~125k-token initial message trips the 150k
+        window's 80% threshold) and assert each LLM call — the summary
+        AND the main call — booked EXACTLY once under the stage role tag,
+        with no "summarizer"-tagged duplicate from the hunter's own site.
+
+        Runs under session_scope(runner id) so a broken guard is caught
+        by reconciliation: the hunter's site would charge the SAME id's
+        tracker bucket with no matching audit row (its audit logger is
+        skipped under a booked view), breaking the sum==total equation."""
+        from clearwing.agent.tooling import session_scope
+
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        view = runner._get_native_client("hunter", self._real_client(), budget_stage="hunt")
+
+        ctx_sid = f"sh-{uuid.uuid4().hex[:8]}"
+        ctx = HunterContext(
+            repo_path=str(_FIXTURE_C),
+            findings=[],
+            file_path="src/codec_a.c",
+            session_id=ctx_sid,
+            specialist="general",
+        )
+        hunter = NativeHunter(
+            llm=view,
+            prompt="system prompt",
+            tools=[],
+            ctx=ctx,
+            max_steps=1,
+            summarizer=ContextSummarizer(),
+            # ~125k estimated tokens > 80% of the summarizer's default
+            # 150k window, with a coverable old segment — trips the
+            # summary path on the hunt's first model step.
+            initial_user_message="x " * 250_000,
+        )
+        with session_scope(runner._session_id):
+            result = asyncio.run(hunter.arun())
+        assert result.findings == []
+
+        # Two LLM calls ran (summary + main); each booked EXACTLY once via
+        # the view — both rows carry the stage role tag "hunter", and no
+        # standalone-site "summarizer" duplicate exists anywhere.
+        rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
+        assert len(rows) == 2
+        assert all(r["agent"] == "hunter" for r in rows)
+        assert "summarizer" not in [r["agent"] for r in rows]
+        # Reconciliation on the runner's id, both halves: a broken guard
+        # at either hunter site would inflate the tracker side only.
+        total = sum(r["details"]["cost_usd"] for r in rows)
+        assert total > 0.0
+        assert CostTracker().session_total(runner._session_id) == pytest.approx(total)
+        # Under a booked view no per-execution minted trail exists.
+        assert _audit_session_dirs(audit_home, ctx_sid) == []
         runner._reclaim_minted_cost_bucket()
 
     def test_minted_bucket_forgotten_parent_never(self, monkeypatch, tmp_path):
