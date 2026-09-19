@@ -24,6 +24,7 @@ cold-start hunters remain the fallback.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import re
@@ -153,7 +154,24 @@ class HarnessGenerator:
 
         # Run in parallel, respecting total time budget
         with ThreadPoolExecutor(max_workers=self.config.max_parallel) as pool:
-            futures = {pool.submit(self._fuzz_one, ft, repo_path): ft for ft in eligible}
+            # Codex PR-69 r1 (run identity fix): ThreadPoolExecutor workers
+            # do NOT inherit this thread's contextvars, so the ambient
+            # session scope (webui turn / operator job — visible here
+            # because the tool runs the whole runner inside one
+            # asyncio.to_thread worker that copies its caller's context)
+            # has to be handed to each worker explicitly. Each submit
+            # copies its OWN context: one Context object entered
+            # concurrently from two pool workers would raise RuntimeError.
+            # Inside the worker, current_session_id() then resolves to the
+            # invoking session, so a booked view's call-time attribution
+            # (ambient or fallback) books harness calls under the PARENT
+            # bucket; spend_metadata rides along the same way.
+            futures = {
+                pool.submit(
+                    contextvars.copy_context().run, self._fuzz_one, ft, repo_path
+                ): ft
+                for ft in eligible
+            }
             deadline = start + self.config.total_time_budget_seconds
             for future in as_completed(futures):
                 if time.monotonic() > deadline:

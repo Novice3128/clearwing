@@ -24,7 +24,8 @@ the audit file as the source of truth, not ``session_total``.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import math
+from typing import TYPE_CHECKING, Any
 
 from clearwing.observability.telemetry import CostTracker
 
@@ -36,6 +37,30 @@ if TYPE_CHECKING:  # pragma: no cover
     from clearwing.safety.audit import AuditLogger
 
 logger = logging.getLogger(__name__)
+
+
+def _endpoint_pricing_row(pricing: Any) -> dict[str, float] | None:
+    """Convert an endpoint pricing object to a PRICING row, or None.
+
+    Duck-typed like the ``AuditLogger`` argument (keeps this module
+    import-cycle-free): callers pass the client's ``EndpointPricing`` (USD
+    per 1M tokens; ``cached_per_mtok`` optional and falling back to the
+    input rate, matching the ledger's ``_pricing_value`` doctrine).
+    Missing fields or non-finite/negative values degrade to ``None`` so
+    booking falls back to the pricing table instead of raising — the
+    ledger's ``BudgetConfigurationError`` contract has no place in a
+    never-raise bookkeeping path.
+    """
+    try:
+        row_input = float(pricing.input_per_mtok)
+        row_output = float(pricing.output_per_mtok)
+        raw_cached = getattr(pricing, "cached_per_mtok", None)
+        row_cached = row_input if raw_cached is None else float(raw_cached)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) and v >= 0 for v in (row_input, row_output, row_cached)):
+        return None
+    return {"input": row_input, "output": row_output, "cached_input": row_cached}
 
 
 def book_llm_call(
@@ -50,6 +75,7 @@ def book_llm_call(
     provider: str | None = None,
     session_id: str | None = None,
     agent: str = "main",
+    pricing: Any = None,
 ) -> float:
     """Record one LLM call in the cost tracker AND the audit log.
 
@@ -65,11 +91,19 @@ def book_llm_call(
       the model name written to the audit row (the runtime prices versioned
       provider echoes under the configured name while auditing the served
       one). Defaults to ``model``.
+    - ``pricing`` (Codex PR-69 r1) is the client's authoritative endpoint
+      price (``EndpointPricing``-like, USD per 1M tokens). When valid it
+      replaces the tracker's pricing-table lookup for BOTH the tracker
+      record and the audit row — on custom endpoints whose model names
+      have no PRICING entry the table would silently bill Sonnet rates
+      and diverge from the spend ledger. ``None``/invalid falls back to
+      the table (with the usual one-time warning).
     - Audit writes must never break cost tracking; failures are logged and
       swallowed (same doctrine as telemetry's EventBus emit).
     """
     if tracker is None and audit_logger is None:
         return 0.0
+    row = _endpoint_pricing_row(pricing) if pricing is not None else None
     if tracker is not None:
         cost = tracker.record_llm_call(
             input_tokens,
@@ -78,9 +112,12 @@ def book_llm_call(
             cached_tokens=cached_tokens,
             provider=provider,
             session_id=session_id,
+            pricing=row,
         )
     else:
-        cost = CostTracker.estimate_cost(input_tokens, output_tokens, model, cached_tokens)
+        cost = CostTracker.estimate_cost(
+            input_tokens, output_tokens, model, cached_tokens, pricing=row
+        )
     if audit_logger is not None:
         try:
             audit_logger.log_llm_call(

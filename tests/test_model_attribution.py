@@ -105,7 +105,13 @@ class TestEffectiveModelAttribution:
         await graph._aassistant_step(state)
 
         cost.record_llm_call.assert_called_once_with(
-            100, 50, "glm-5.3", cached_tokens=0, provider="zai", session_id=None
+            100,
+            50,
+            "glm-5.3",
+            cached_tokens=0,
+            provider="zai",
+            session_id=None,
+            pricing=None,
         )
         # Audit rows carry the PER-CALL cost returned by the tracker —
         # not its process-wide running total (issue #10 live evidence).

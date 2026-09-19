@@ -233,6 +233,10 @@ class CrashClassifier:
                 session_id=session_id,
                 audit_logger=audit_logger,
                 agent="bench",
+                # Codex PR-69 r1: the classifier's client may carry
+                # authoritative endpoint pricing — book with it (not the
+                # table's Sonnet fallback) when present.
+                pricing=getattr(self._llm, "pricing", None),
             )
         except Exception:
             logger.warning("bench classification bookkeeping failed", exc_info=True)
@@ -242,7 +246,13 @@ class CrashClassifier:
         """Reclaim the classifier's minted tracker bucket at sweep end.
 
         Safe to call when no LLM-assisted classification ever ran (no
-        bucket was minted). Failure is logged, never propagated.
+        bucket was minted). Failure is logged, never propagated. Codex
+        PR-69 r1: the retained id and audit logger are cleared afterwards
+        so a SECOND sweep on the same classifier instance lazily mints a
+        fresh ``bench-*`` identity — reusing them would keep appending
+        rows to the stale audit file from BOTH sweeps while
+        ``session_total()`` holds only the current one, breaking the
+        reconciliation contract.
         """
         if self._bench_bucket is None:
             return
@@ -252,6 +262,9 @@ class CrashClassifier:
             logger.warning(
                 "Failed to reclaim bench cost bucket %s", self._bench_bucket, exc_info=True
             )
+        finally:
+            self._bench_bucket = None
+            self._bench_audit_logger = None
 
     def _parse_llm_response(self, text: str) -> tuple[int, str]:
         """Parse LLM JSON response into (tier, rationale)."""

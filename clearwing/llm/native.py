@@ -1207,6 +1207,11 @@ class AsyncLLMClient:
                 provider=self.provider_name,
                 session_id=session_id,
                 agent=self._book_agent or "main",
+                # Codex PR-69 r1: price with the endpoint's authoritative
+                # rates (the same self.pricing the spend ledger uses) so
+                # tracker/audit totals cannot diverge from the ledger on
+                # custom endpoints whose model has no PRICING entry.
+                pricing=self.pricing,
             )
         except Exception:
             logger.warning("llm call bookkeeping failed", exc_info=True)

@@ -38,6 +38,7 @@ from clearwing.observability.bookkeeping import (
     init_session_audit_logger,
 )
 from clearwing.observability.telemetry import CostTracker
+from clearwing.providers.env import EndpointPricing
 from clearwing.safety.audit import AuditLogger
 from clearwing.sourcehunt.hunter import NativeHunter
 from clearwing.sourcehunt.runner import SourceHuntRunner, _specialist_book_role
@@ -172,6 +173,60 @@ class TestBookLlmCallHelper:
 
     def test_both_none_is_a_noop(self):
         assert book_llm_call(100, 100, tracker=None, model="m") == 0.0
+
+    def test_endpoint_pricing_overrides_table_for_both_halves(self, monkeypatch, tmp_path):
+        """Codex PR-69 r1 (P2): the booked path must price with the
+        client's authoritative ``EndpointPricing`` when it has one — the
+        tracker table's Sonnet fallback would diverge from the spend
+        ledger on custom endpoints whose model has no PRICING entry."""
+        self._patch_audit_home(monkeypatch, tmp_path)
+        sid = f"bk-{uuid.uuid4().hex[:8]}"
+        tracker = CostTracker()
+
+        cost = book_llm_call(
+            1000,
+            500,
+            cached_tokens=400,
+            tracker=tracker,
+            model="custom-endpoint-model",  # no PRICING entry
+            session_id=sid,
+            audit_logger=init_session_audit_logger(sid),
+            pricing=EndpointPricing(
+                input_per_mtok=2.0, output_per_mtok=6.0, cached_per_mtok=0.2
+            ),
+        )
+
+        # 600 uncached * 2.0 + 400 cached * 0.2 + 500 out * 6.0, per 1M.
+        expected = (600 * 2.0 + 400 * 0.2 + 500 * 6.0) / 1_000_000
+        assert cost == pytest.approx(expected)
+        # NOT the Sonnet fallback tier the table would use.
+        fallback = CostTracker.estimate_cost(1000, 500, "custom-endpoint-model", 400)
+        assert expected != pytest.approx(fallback)
+        # BOTH halves carry the endpoint price: audit row + tracker bucket.
+        rows = _llm_cost_rows(_audit_rows(tmp_path / "audit-home", sid))
+        assert rows[0]["details"]["cost_usd"] == pytest.approx(expected)
+        assert tracker.session_total(sid) == pytest.approx(expected)
+
+    def test_invalid_endpoint_pricing_falls_back_to_table(self, monkeypatch, tmp_path):
+        """Never-raise doctrine: a malformed pricing object degrades to the
+        table lookup instead of raising into the bookkeeping path."""
+        self._patch_audit_home(monkeypatch, tmp_path)
+        sid = f"bk-{uuid.uuid4().hex[:8]}"
+        for bad in (
+            EndpointPricing(input_per_mtok=-1.0, output_per_mtok=6.0),  # negative
+            object(),  # no pricing fields at all
+        ):
+            cost = book_llm_call(
+                10,
+                5,
+                tracker=CostTracker(),
+                model="claude-sonnet-4-6",
+                session_id=sid,
+                pricing=bad,
+            )
+            assert cost == pytest.approx(
+                CostTracker.estimate_cost(10, 5, "claude-sonnet-4-6")
+            )
 
     def test_audit_write_failure_never_breaks_accounting(self, monkeypatch):
         class _ExplodingAudit:
@@ -929,6 +984,36 @@ class TestSpecialistAudit:
         assert CostTracker().session_total(sid) == pytest.approx(total)
         runner._reclaim_minted_cost_bucket()
 
+    def test_booked_view_prices_with_endpoint_pricing(self, monkeypatch, tmp_path):
+        """Codex PR-69 r1 (P2): the with_bookkeeping view prices each call
+        with the client's authoritative ``EndpointPricing`` (the same
+        ``self.pricing`` the spend ledger reads) — the tracker's table
+        lookup would bill unknown custom models at Sonnet rates and make
+        audit/COST_UPDATE totals diverge from the ledger."""
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        client = AsyncLLMClient(
+            model_name="custom-endpoint-model",  # no PRICING entry
+            provider_name="openai",
+            api_key="test",
+            pricing=EndpointPricing(input_per_mtok=1.0, output_per_mtok=3.0),
+        )
+        view = runner._get_native_client("hunter", client, budget_stage="hunt")
+        asyncio.run(view.aask_text(system="s", user="u"))
+
+        sid = runner._session_id
+        rows = _llm_cost_rows(_audit_rows(audit_home, sid))
+        assert len(rows) == 1
+        # 210 in * 1.0 + 90 out * 3.0 per 1M — the endpoint's rates.
+        expected = (210 * 1.0 + 90 * 3.0) / 1_000_000
+        assert rows[0]["details"]["cost_usd"] == pytest.approx(expected)
+        assert CostTracker().session_total(sid) == pytest.approx(expected)
+        # Guard: the table would have billed the Sonnet fallback tier.
+        assert not CostTracker.has_pricing("custom-endpoint-model")
+        assert expected != pytest.approx(
+            CostTracker.estimate_cost(210, 90, "custom-endpoint-model")
+        )
+        runner._reclaim_minted_cost_bucket()
+
     def test_mock_seams_pass_through_untouched(self, monkeypatch, tmp_path):
         runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
         seam = AsyncMock()
@@ -1272,6 +1357,63 @@ class TestBenchAudit:
         assert len(_llm_cost_rows(_audit_rows(audit_home, bucket))) == 2
 
     @pytest.mark.asyncio
+    async def test_second_sweep_on_same_classifier_mints_fresh_bucket(
+        self, monkeypatch, tmp_path
+    ):
+        """Codex PR-69 r1 (P2): forget_bench_bucket must also CLEAR the
+        retained bucket id / audit logger. A second sweep on the same
+        classifier instance reused them, so the stale audit file kept
+        accumulating rows from BOTH sweeps while ``session_total()``
+        held only the current one — a reconciliation break."""
+        audit_home = self._pin(monkeypatch, tmp_path)
+        classifier = CrashClassifier(llm=_BenchLLM())
+
+        await classifier.aclassify(exit_code=1, stdout="", stderr=_ASAN_STDERR, poc="")
+        bucket1 = classifier._bench_bucket
+        assert bucket1 is not None
+        rows1 = _llm_cost_rows(_audit_rows(audit_home, bucket1))
+        assert len(rows1) == 1
+        # Reconciliation holds while sweep 1's bucket is alive.
+        assert CostTracker().session_total(bucket1) == pytest.approx(
+            rows1[0]["details"]["cost_usd"]
+        )
+
+        classifier.forget_bench_bucket()
+        # The retained identity is cleared — the next sweep starts fresh.
+        assert classifier._bench_bucket is None
+        assert classifier._bench_audit_logger is None
+
+        await classifier.aclassify(exit_code=1, stdout="", stderr=_ASAN_STDERR, poc="")
+        bucket2 = classifier._bench_bucket
+        assert bucket2 is not None and bucket2 != bucket1
+        rows2 = _llm_cost_rows(_audit_rows(audit_home, bucket2))
+        # Sweep 2 wrote to ITS OWN trail: one row here, still exactly one
+        # row in sweep 1's file (the old bug appended both to bucket1).
+        assert len(rows2) == 1
+        assert len(_llm_cost_rows(_audit_rows(audit_home, bucket1))) == 1
+        assert CostTracker().session_total(bucket2) == pytest.approx(
+            rows2[0]["details"]["cost_usd"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_classifier_prices_with_endpoint_pricing(self, monkeypatch, tmp_path):
+        """Codex PR-69 r1 (P2): the classifier books with its client's
+        authoritative endpoint pricing when present, not the table."""
+        self._pin(monkeypatch, tmp_path)
+
+        class _PricedBenchLLM(_BenchLLM):
+            model_name = "custom-bench-model"  # no PRICING entry
+            pricing = EndpointPricing(input_per_mtok=1.0, output_per_mtok=4.0)
+
+        classifier = CrashClassifier(llm=_PricedBenchLLM())
+        result = await classifier.aclassify(
+            exit_code=1, stdout="", stderr=_ASAN_STDERR, poc=""
+        )
+        # 120 in * 1.0 + 45 out * 4.0 per 1M — the endpoint's rates.
+        assert result.cost_usd == pytest.approx((120 * 1.0 + 45 * 4.0) / 1_000_000)
+        classifier.forget_bench_bucket()
+
+    @pytest.mark.asyncio
     async def test_magicmock_usage_skips_booking_and_never_mints(
         self, monkeypatch, tmp_path
     ):
@@ -1318,8 +1460,15 @@ class TestBenchAudit:
         )
         result = asyncio.run(bench.arun([target]))
 
-        bucket = bench._classifier._bench_bucket
-        assert bucket is not None
+        # The sweep's finally called forget_bench_bucket — Codex PR-69 r1:
+        # the retained id is now CLEARED there too, so recover the run's
+        # bucket from the surviving disk trail instead of the attribute.
+        assert bench._classifier._bench_bucket is None
+        bench_dirs = sorted(
+            d.name for d in audit_home.iterdir() if d.name.startswith("bench-")
+        )
+        assert len(bench_dirs) == 1
+        bucket = bench_dirs[0]
         rows = _llm_cost_rows(_audit_rows(audit_home, bucket))
         assert len(rows) == 1
         assert rows[0]["agent"] == "bench"

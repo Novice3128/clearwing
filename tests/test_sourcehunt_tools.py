@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from clearwing.agent.prompts import SYSTEM_PROMPT_TEMPLATE
+from clearwing.agent.tooling import session_scope
 from clearwing.agent.tools import get_all_tools
 from clearwing.agent.tools.meta.sourcehunt_tools import (
     _RECENT_SESSIONS,
@@ -61,6 +62,47 @@ def test_hunt_source_code_returns_summary_for_empty_repo(tmp_path):
     assert "Source hunt complete" in summary
     # Files ranked = 0 because there are no source files
     assert "Files ranked: 0" in summary
+
+
+def test_two_hunts_mint_distinct_session_ids_under_one_ambient_session(tmp_path):
+    """Codex PR-69 r1 (P1): run identity must stay separate from billing.
+
+    The tool must NOT pass the ambient (stable, long-lived) webui/operator
+    session id down as the runner's ``parent_session_id``: two hunts from
+    the same session would then share one output/checkpoint directory,
+    auto-load each other's checkpoints, and replace each other in
+    ``_RECENT_SESSIONS``. Each invocation mints its own ``sh-`` execution
+    id instead — billing attribution to the parent is covered by the
+    booked views' ambient resolution, not by hijacking run identity."""
+    _RECENT_SESSIONS.clear()
+    ambient = "webui-abc12345"
+
+    with session_scope(ambient):
+        hunt_source_code.invoke(
+            {
+                "repo_url_or_path": str(FIXTURE_PY_SQLI),
+                "depth": "quick",
+                "output_dir": str(tmp_path),
+            }
+        )
+        hunt_source_code.invoke(
+            {
+                "repo_url_or_path": str(FIXTURE_PY_SQLI),
+                "depth": "quick",
+                "output_dir": str(tmp_path),
+            }
+        )
+
+    session_ids = list(_RECENT_SESSIONS.keys())
+    assert len(session_ids) == 2
+    assert session_ids[0] != session_ids[1]
+    for sid in session_ids:
+        assert sid.startswith("sh-")
+        assert sid != ambient  # the ambient id never became the run id
+    # Distinct run identity means distinct session directories on disk.
+    out_dirs = [tmp_path / sid for sid in session_ids]
+    assert all(d.is_dir() for d in out_dirs)
+    assert out_dirs[0] != out_dirs[1]
 
 
 def test_list_sourcehunt_findings_recalls_recent_run(tmp_path):
