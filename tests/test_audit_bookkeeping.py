@@ -19,6 +19,8 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from genai_pyo3 import ChatResponse, Usage
@@ -26,7 +28,11 @@ from genai_pyo3 import ChatResponse, Usage
 from clearwing.agent.operator import OperatorAgent, OperatorConfig
 from clearwing.agent.runtime import NativeAgentGraph
 from clearwing.agent.tools.hunt import HunterContext
+from clearwing.bench.crash_classifier import CrashClassifier
+from clearwing.bench.ossfuzz import BenchmarkTarget, OssFuzzBenchmark
+from clearwing.bench.results import TargetResult
 from clearwing.data.memory.summarizer import ContextSummarizer
+from clearwing.llm.native import AsyncLLMClient
 from clearwing.observability.bookkeeping import (
     book_llm_call,
     init_session_audit_logger,
@@ -34,6 +40,7 @@ from clearwing.observability.bookkeeping import (
 from clearwing.observability.telemetry import CostTracker
 from clearwing.safety.audit import AuditLogger
 from clearwing.sourcehunt.hunter import NativeHunter
+from clearwing.sourcehunt.runner import SourceHuntRunner, _specialist_book_role
 
 _FIXTURE_C = Path(__file__).parent / "fixtures" / "vuln_samples" / "c_propagation"
 
@@ -805,3 +812,430 @@ class TestEndToEndReconciliation:
         assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
             CostTracker().session_total(sid)
         )
+
+
+class TestSpecialistAudit:
+    """Issue #64: sourcehunt specialist LLM calls were completely unmetered.
+
+    The runner now attaches a ``with_bookkeeping`` view to every REAL
+    AsyncLLMClient it hands out, so every successful ``achat`` lands BOTH
+    halves (CostTracker bucket + audit row) under the stage's role tag,
+    with ambient-or-runner session attribution. AsyncMock/MagicMock test
+    seams pass through the isinstance gate untouched.
+    """
+
+    # (task, budget_stage, expected agent role) — the production call
+    # shapes for every specialist that used to run unmetered.
+    _STAGES = [
+        ("sourcehunt_exploit", "auto_patch", "patcher"),
+        ("sourcehunt_exploit", "exploit", "exploiter"),
+        ("verifier", "variant_loop", "variant"),
+        ("hunter", "harness", "harness"),
+        ("verifier", "stability", "stability"),
+        ("verifier", "mechanism_extraction", "mechanism"),
+        ("proof_local", "proof_local", "proof"),
+        ("verifier", "verifier", "verifier"),
+    ]
+
+    def _make_booked_runner(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        parent_session_id: str | None = None,
+        usage: Usage | None = None,
+    ) -> tuple[SourceHuntRunner, Path]:
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        monkeypatch.setattr(AsyncLLMClient, "_build_client", lambda self, cls: object())
+
+        effective_usage = usage or Usage(
+            prompt_tokens=210, completion_tokens=90, total_tokens=300
+        )
+
+        async def fake_policy(self, client_obj, request, options):
+            return ChatResponse(
+                content=[{"text": "done"}],
+                usage=effective_usage,
+                provider_model_name="specialist-served",
+            )
+
+        monkeypatch.setattr(AsyncLLMClient, "_achat_with_provider_policy", fake_policy)
+        runner = SourceHuntRunner(
+            repo_url=str(tmp_path),
+            local_path=str(tmp_path),
+            depth="quick",
+            output_dir=str(tmp_path / "out"),
+            parent_session_id=parent_session_id,
+            enable_knowledge_graph=False,
+            enable_mechanism_memory=False,
+        )
+        return runner, audit_home
+
+    @staticmethod
+    def _real_client() -> AsyncLLMClient:
+        return AsyncLLMClient(
+            model_name="claude-sonnet-4-6", provider_name="anthropic", api_key="test"
+        )
+
+    def test_role_map_aliases_and_verbatim_fallback(self):
+        assert _specialist_book_role("auto_patch") == "patcher"
+        assert _specialist_book_role("proof_frontier") == "proof"
+        # Any unlisted proof_* route still maps to the proof role.
+        assert _specialist_book_role("proof_some_new_route") == "proof"
+        assert _specialist_book_role("dynamic_verification") == "verifier"
+        # Unknown stages fall back to the stage string verbatim.
+        assert _specialist_book_role("hunt") == "hunt"
+        assert _specialist_book_role("subsystem_hunt") == "subsystem_hunt"
+        assert _specialist_book_role("elaboration") == "elaboration"
+
+    @pytest.mark.parametrize("task,stage,role", _STAGES)
+    def test_each_stage_books_both_halves(self, monkeypatch, tmp_path, task, stage, role):
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        view = runner._get_native_client(task, self._real_client(), budget_stage=stage)
+        assert isinstance(view, AsyncLLMClient)
+
+        asyncio.run(view.aask_text(system="s", user="u"))
+
+        sid = runner._session_id
+        rows = _llm_cost_rows(_audit_rows(audit_home, sid))
+        assert len(rows) == 1
+        assert rows[0]["agent"] == role
+        assert rows[0]["details"]["input_tokens"] == 210
+        assert rows[0]["details"]["output_tokens"] == 90
+        # Audit keeps the served model echo; pricing stays on the
+        # configured key (the hunter/runtime audit_model split).
+        assert rows[0]["details"]["model"] == "specialist-served"
+        total = sum(r["details"]["cost_usd"] for r in rows)
+        assert total == pytest.approx(
+            CostTracker.estimate_cost(210, 90, "claude-sonnet-4-6")
+        )
+        assert total > 0.0
+        # BOTH halves: the tracker bucket holds the same total.
+        assert CostTracker().session_total(sid) == pytest.approx(total)
+        runner._reclaim_minted_cost_bucket()
+
+    def test_mock_seams_pass_through_untouched(self, monkeypatch, tmp_path):
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        seam = AsyncMock()
+        out = runner._get_native_client("verifier", seam, budget_stage="verify")
+        assert out is seam  # no with_bookkeeping on test doubles
+        assert not _audit_rows(audit_home, runner._session_id)
+
+    def test_no_ledger_runner_still_books(self, monkeypatch, tmp_path):
+        """Metering is independent of budget enforcement (issue #64)."""
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        assert runner._spend_ledger is None  # _ensure_spend_ledger never ran
+        view = runner._get_native_client(
+            "sourcehunt_exploit", self._real_client(), budget_stage="auto_patch"
+        )
+        asyncio.run(view.aask_text(system="s", user="u"))
+        rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
+        assert len(rows) == 1
+        assert rows[0]["agent"] == "patcher"
+        runner._reclaim_minted_cost_bucket()
+
+    def test_ledger_runner_composes_settle_and_book(self, monkeypatch, tmp_path):
+        """A ledger run gets ONE view that both settles the reservation
+        AND books the audit/tracker pair — not two competing clients."""
+        runner, audit_home = self._make_booked_runner(
+            monkeypatch,
+            tmp_path,
+            usage=Usage(prompt_tokens=210, completion_tokens=1, total_tokens=211),
+        )
+        runner.budget_usd = 1.0
+        runner.input_price_per_million = 0.0
+        runner.output_price_per_million = 1_000_000.0  # 1 output token = $1
+        ledger = runner._ensure_spend_ledger()
+        assert ledger.enforcing
+
+        view = runner._get_native_client("hunter", self._real_client(), budget_stage="hunt")
+        asyncio.run(view.aask_text(system="s", user="u"))
+
+        # The ledger half settled.
+        assert ledger.spent_usd == pytest.approx(1.0)
+        # The bookkeeping half landed too, on the SAME view.
+        rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
+        assert len(rows) == 1
+        assert rows[0]["agent"] == "hunt"
+        assert sum(r["details"]["cost_usd"] for r in rows) == pytest.approx(
+            CostTracker().session_total(runner._session_id)
+        )
+        runner._reclaim_minted_cost_bucket()
+
+    def test_ambient_session_wins_over_runner_fallback(self, monkeypatch, tmp_path):
+        from clearwing.agent.tooling import session_scope
+
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        view = runner._get_native_client("hunter", self._real_client(), budget_stage="hunt")
+        ambient = f"webui-{uuid.uuid4().hex[:8]}"
+
+        with session_scope(ambient):
+            asyncio.run(view.aask_text(system="s", user="u"))
+
+        # Tracker BUCKET attribution follows the ambient webui session —
+        # the hunt spend lands in the parent session's total, not the
+        # runner's fallback bucket.
+        assert CostTracker().session_total(ambient) > 0.0
+        assert CostTracker().session_total(runner._session_id) == 0.0
+        # The audit ROW rides the runner's ONE AuditLogger (its own
+        # session file — spec: one per runner, no per-call mkdir churn),
+        # so the row lives in the runner's trail while its cost is
+        # attributed to the ambient bucket above.
+        rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
+        assert len(rows) == 1
+        assert rows[0]["agent"] == "hunt"
+        assert rows[0]["details"]["cost_usd"] == pytest.approx(
+            CostTracker().session_total(ambient)
+        )
+        # No minted-fallback trail was created for the ambient id.
+        assert not _audit_rows(audit_home, ambient)
+
+    def test_none_usage_fields_skip_booking_and_call_succeeds(self, monkeypatch, tmp_path):
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        # Older genai-pyo3 responses and lightweight doubles may expose
+        # None token fields — the documented hole: skip booking silently.
+        async def none_usage_policy(self, client_obj, request, options):
+            return SimpleNamespace(
+                usage=SimpleNamespace(
+                    prompt_tokens=None,
+                    completion_tokens=None,
+                    prompt_tokens_details=None,
+                ),
+                tool_calls=[],
+            )
+
+        monkeypatch.setattr(
+            AsyncLLMClient, "_achat_with_provider_policy", none_usage_policy
+        )
+        view = runner._get_native_client("hunter", self._real_client(), budget_stage="hunt")
+
+        response = asyncio.run(view.aask_text(system="s", user="u"))
+
+        assert response is not None  # the call itself succeeded
+        assert not _audit_rows(audit_home, runner._session_id)
+        assert CostTracker().session_total(runner._session_id) == 0.0
+
+    def test_hunter_with_booked_view_books_once_under_stage_role(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression guard for the double-booking blocker: when the runner
+        hands NativeHunter a booked view, the VIEW books the call (role =
+        the stage tag, here "hunt") and the hunter's own booking stands
+        down — exactly one audit row per call, never two."""
+        runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
+        view = runner._get_native_client("hunter", self._real_client(), budget_stage="hunt")
+
+        ctx_sid = f"sh-{uuid.uuid4().hex[:8]}"
+        ctx = HunterContext(
+            repo_path=str(_FIXTURE_C),
+            findings=[],
+            file_path="src/codec_a.c",
+            session_id=ctx_sid,
+            specialist="general",
+        )
+        hunter = NativeHunter(
+            llm=view,
+            prompt="system prompt",
+            tools=[],
+            ctx=ctx,
+            max_steps=1,
+        )
+        result = asyncio.run(hunter.arun())
+        assert result.findings == []
+
+        # The view booked under the RUNNER's session (its fallback), once.
+        rows = _llm_cost_rows(_audit_rows(audit_home, runner._session_id))
+        assert len(rows) == 1
+        assert rows[0]["agent"] == "hunt"  # stage role, not "hunter"
+        # The hunter's minted standalone trail exists but carries NO
+        # llm_call row — its booking stood down (the view books instead).
+        minted_dirs = _audit_session_dirs(audit_home, ctx_sid)
+        hunter_rows = [
+            r
+            for name in minted_dirs
+            for r in _llm_cost_rows(_audit_rows(audit_home, name))
+        ]
+        assert hunter_rows == []
+        # And nowhere did a "hunter"-tagged duplicate land.
+        assert all(r["agent"] != "hunter" for r in rows + hunter_rows)
+        runner._reclaim_minted_cost_bucket()
+
+    def test_minted_bucket_forgotten_parent_never(self, monkeypatch, tmp_path):
+        forgotten: list[str] = []
+        original_forget = CostTracker.forget_session
+
+        def _forget_spy(tracker_self, session_id):
+            forgotten.append(session_id)
+            original_forget(tracker_self, session_id)
+
+        monkeypatch.setattr(CostTracker, "forget_session", _forget_spy)
+
+        def _explode():
+            raise RuntimeError("pipeline exploded")
+
+        # Minted sh-* id: arun's finally reclaims it on the failure path.
+        runner, _ = self._make_booked_runner(monkeypatch, tmp_path)
+        monkeypatch.setattr(runner, "_preprocess", _explode)
+        with pytest.raises(RuntimeError, match="pipeline exploded"):
+            asyncio.run(runner.arun())
+        assert runner._session_id in forgotten
+        assert runner._session_id.startswith("sh-")
+
+        # Parent id: NEVER forgotten — its bucket belongs to the parent.
+        parent = f"webui-{uuid.uuid4().hex[:8]}"
+        runner2, _ = self._make_booked_runner(monkeypatch, tmp_path, parent_session_id=parent)
+        monkeypatch.setattr(runner2, "_preprocess", _explode)
+        with pytest.raises(RuntimeError, match="pipeline exploded"):
+            asyncio.run(runner2.arun())
+        assert parent not in forgotten
+        assert runner2._session_id == parent
+
+        # The proof flow's exit path reclaims a minted id too.
+        runner3, _ = self._make_booked_runner(monkeypatch, tmp_path)
+        runner3._flow = "proof"
+
+        async def _proof_explode(self):
+            raise RuntimeError("proof flow exploded")
+
+        monkeypatch.setattr(SourceHuntRunner, "_arun_proof_flow", _proof_explode)
+        with pytest.raises(RuntimeError, match="proof flow exploded"):
+            asyncio.run(runner3.arun())
+        assert runner3._session_id in forgotten
+
+    def test_run_belt_and_braces_reclaim(self, monkeypatch, tmp_path):
+        """run() adds an idempotent reclaim after arun — even a stubbed
+        arun that bypasses the internal finally blocks gets cleaned up."""
+        forgotten: list[str] = []
+        original_forget = CostTracker.forget_session
+
+        def _forget_spy(tracker_self, session_id):
+            forgotten.append(session_id)
+            original_forget(tracker_self, session_id)
+
+        monkeypatch.setattr(CostTracker, "forget_session", _forget_spy)
+        runner, _ = self._make_booked_runner(monkeypatch, tmp_path)
+
+        async def _ok_arun(self):
+            return "stub-result"
+
+        monkeypatch.setattr(SourceHuntRunner, "arun", _ok_arun)
+        assert runner.run() == "stub-result"
+        assert runner._session_id in forgotten
+
+
+_ASAN_STDERR = (
+    "==1== ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000010\n"
+    "READ of size 4 at 0x602000000010 thread T0"
+)
+
+
+class _BenchLLM:
+    model_name = "claude-sonnet-4-6"
+    provider_name = "anthropic"
+
+    async def aask_text(self, **kwargs):
+        return ChatResponse(
+            content=[{"text": '{"tier": 2, "rationale": "no attacker control"}'}],
+            usage=Usage(prompt_tokens=120, completion_tokens=45, total_tokens=165),
+            provider_model_name="bench-served",
+        )
+
+
+class TestBenchAudit:
+    """Issue #64 bench half: the crash classifier's aask_text was priced
+    from a dead ``cost_usd`` attribute read (native responses never carry
+    it) — every bench classification was free by construction. It now
+    books for real under one minted bench-* bucket per classifier, which
+    the sweep forgets at the end."""
+
+    def _pin(self, monkeypatch, tmp_path) -> Path:
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        return audit_home
+
+    @pytest.mark.asyncio
+    async def test_classifier_books_each_call_into_one_bucket(self, monkeypatch, tmp_path):
+        audit_home = self._pin(monkeypatch, tmp_path)
+        classifier = CrashClassifier(llm=_BenchLLM())
+
+        await classifier.aclassify(exit_code=1, stdout="", stderr=_ASAN_STDERR, poc="")
+        bucket = classifier._bench_bucket
+        assert bucket is not None and bucket.startswith("bench-")
+        await classifier.aclassify(exit_code=1, stdout="", stderr=_ASAN_STDERR, poc="")
+
+        # ONE bucket per classifier instance: both calls landed together.
+        rows = _llm_cost_rows(_audit_rows(audit_home, bucket))
+        assert len(rows) == 2
+        assert all(r["agent"] == "bench" for r in rows)
+        assert rows[0]["details"]["model"] == "bench-served"
+        total = sum(r["details"]["cost_usd"] for r in rows)
+        assert total == pytest.approx(
+            CostTracker.estimate_cost(120, 45, "claude-sonnet-4-6") * 2
+        )
+        # Reconciliation holds while the bucket is alive.
+        assert CostTracker().session_total(bucket) == pytest.approx(total)
+
+        classifier.forget_bench_bucket()
+        assert CostTracker().session_total(bucket) == 0.0
+        # Disk trail survives the forget (bookkeeping doctrine).
+        assert len(_llm_cost_rows(_audit_rows(audit_home, bucket))) == 2
+
+    @pytest.mark.asyncio
+    async def test_magicmock_usage_skips_booking_and_never_mints(
+        self, monkeypatch, tmp_path
+    ):
+        self._pin(monkeypatch, tmp_path)
+        mock_llm = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.first_text = '{"tier": 2, "rationale": "none"}'
+        mock_llm.aask_text = AsyncMock(return_value=mock_response)
+        classifier = CrashClassifier(llm=mock_llm)
+
+        result = await classifier.aclassify(
+            exit_code=1, stdout="", stderr=_ASAN_STDERR, poc=""
+        )
+
+        # No crash, no cost, no minted bucket: non-int usage skips booking.
+        assert result.tier == 2
+        assert result.cost_usd == 0.0
+        assert classifier._bench_bucket is None
+        classifier.forget_bench_bucket()  # no-op, must not raise
+
+    def test_sweep_forgets_bucket_at_end(self, monkeypatch, tmp_path):
+        audit_home = self._pin(monkeypatch, tmp_path)
+        bench = OssFuzzBenchmark(
+            llm=_BenchLLM(),
+            mode="standard",
+            output_dir=str(tmp_path / "bench-out"),
+            llm_classify=True,
+        )
+
+        async def fake_run_target(self, target):
+            classification = await self._classifier.aclassify(
+                exit_code=1, stdout="", stderr=_ASAN_STDERR, poc=""
+            )
+            return TargetResult(
+                project_name=target.project_name,
+                entry_point=target.entry_point,
+                tier=classification.tier,
+                cost_usd=classification.cost_usd,
+            )
+
+        monkeypatch.setattr(OssFuzzBenchmark, "_run_target", fake_run_target)
+        target = BenchmarkTarget(
+            project_name="proj", repo_path="/tmp/proj", entry_point="fuzz.c", language="c"
+        )
+        result = asyncio.run(bench.arun([target]))
+
+        bucket = bench._classifier._bench_bucket
+        assert bucket is not None
+        rows = _llm_cost_rows(_audit_rows(audit_home, bucket))
+        assert len(rows) == 1
+        assert rows[0]["agent"] == "bench"
+        # The booked per-call cost is what the sweep totals charged.
+        assert rows[0]["details"]["cost_usd"] == pytest.approx(result.total_cost_usd)
+        # Sweep end reclaimed the minted bucket; the disk trail survives.
+        assert CostTracker().session_total(bucket) == 0.0

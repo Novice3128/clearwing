@@ -11,7 +11,7 @@ import logging
 import os
 from typing import Any
 
-from clearwing.agent.tooling import tool
+from clearwing.agent.tooling import current_session_id, tool
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,13 @@ def hunt_source_code(
             target_files=target_files,
             target_window_lines=target_window_lines,
             provider_manager=provider_manager,
+            # Issue #64 specialist metering: parent the run's bookkeeping to
+            # the invoking session. The tool already runs under
+            # session_scope (webui turn / operator job), so the runner's
+            # specialist views book into the PARENT bucket and the minted
+            # sh-* fallback is never forgotten-by-the-runner (its lifecycle
+            # belongs to this session).
+            parent_session_id=current_session_id(),
         )
         result = runner.run()
     except Exception as e:

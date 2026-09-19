@@ -32,7 +32,9 @@ from clearwing.core.event_payloads import SourcehuntStagePayload
 from clearwing.core.events import EventBus
 from clearwing.llm.budget import BudgetExceeded, SpendLedger
 from clearwing.llm.native import AsyncLLMClient
+from clearwing.observability.bookkeeping import init_session_audit_logger
 from clearwing.observability.otel import get_oi_tracer
+from clearwing.observability.telemetry import CostTracker
 from clearwing.providers import (
     ProviderManager,
     resolve_llm_endpoint,
@@ -104,6 +106,41 @@ MAX_TARGET_FILE_BYTES = 2 * 1024 * 1024
 MAX_TARGET_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_TARGET_WINDOWS = 512
 MAX_TARGET_WINDOW_BYTES = 512 * 1024
+
+# Specialist metering role tags (issue #64): the ``agent=`` dimension for
+# the with_bookkeeping views the runner attaches to every real
+# AsyncLLMClient it hands to a specialist. Keyed by the budget stage (or
+# the task when no stage was given); unknown stages fall back to the
+# stage string verbatim so a new stage is always attributed, just not
+# aliased. The hunter's own _arun booking is skipped when its client is
+# such a view (the view books under these tags instead).
+_SPECIALIST_BOOK_ROLES: dict[str, str] = {
+    "auto_patch": "patcher",
+    "exploit": "exploiter",
+    "variant_loop": "variant",
+    "harness": "harness",
+    "stability": "stability",
+    "mechanism_extraction": "mechanism",
+    "proof_local": "proof",
+    "proof_frontier": "proof",
+    "proof_exploration": "proof",
+    "proof_falsifier": "proof",
+    "verifier": "verifier",
+    "dynamic_verification": "verifier",
+}
+
+# Sentinel distinguishing "not resolved yet" from init_session_audit_logger's
+# legitimate None returns (stripped install / no capability) — without it the
+# lazy per-runner cache would re-run the factory (and its mkdir) per call.
+_AUDIT_LOGGER_UNSET = object()
+
+
+def _specialist_book_role(stage: str) -> str:
+    if stage in _SPECIALIST_BOOK_ROLES:
+        return _SPECIALIST_BOOK_ROLES[stage]
+    if stage.startswith("proof_"):
+        return "proof"
+    return stage
 
 
 @dataclass
@@ -603,6 +640,13 @@ class SourceHuntRunner:
                 raise ValueError(f"Sourcehunt session {resume_session_id!r} does not exist")
         self._resuming = resume_session_id is not None
         self._session_id = resume_session_id or parent_session_id or f"sh-{uuid.uuid4().hex[:8]}"
+        # Specialist metering (issue #64): only a sh-* id WE minted may be
+        # forgotten from the process-global CostTracker when the run ends —
+        # a resume/parent id's bucket belongs to its owner (webui socket
+        # teardown, operator job, the resumed session). Hunter arun doctrine.
+        self._session_id_minted = (
+            resume_session_id is None and parent_session_id is None
+        )
         self._checkpoint_path = (
             Path(checkpoint_path)
             if checkpoint_path is not None
@@ -650,7 +694,16 @@ class SourceHuntRunner:
         self._live = live
         self._spend_ledger: SpendLedger | None = None
         self._spend_instrumented = False
-        self._metered_clients: dict[tuple[int, str], AsyncLLMClient] = {}
+        # Cache key: (base client identity, stage, ledger-ness) -> bound view.
+        # The bool dimension matters because _ensure_spend_ledger can run
+        # lazily: a booked-only view cached before the ledger existed must
+        # never be reused for an enforcing run (it would bypass the ledger).
+        self._metered_clients: dict[tuple[int, str, bool], AsyncLLMClient] = {}
+        # ONE AuditLogger per runner (issue #64): lazily built for
+        # self._session_id — AuditLogger mkdirs on construction, so it must
+        # not be created per _get_native_client call. _AUDIT_LOGGER_UNSET
+        # separates "not yet resolved" from a legitimate None.
+        self._session_audit_logger: Any = _AUDIT_LOGGER_UNSET
         self._flow = flow
         self._proof_compile_commands = proof_compile_commands
         self._proof_validation_manifest = proof_validation_manifest
@@ -1092,7 +1145,13 @@ class SourceHuntRunner:
                 getattr(self, "_otel_span_id", None),
             ),
         ):
-            return asyncio.run(self.arun())
+            try:
+                return asyncio.run(self.arun())
+            finally:
+                # arun's own finally blocks cover every exit path already;
+                # this second reclaim is idempotent belt-and-braces for
+                # callers that bypass/short-circuit arun internals.
+                self._reclaim_minted_cost_bucket()
 
     async def _arun_proof_flow(self) -> SourceHuntResult:
         """Run the proof-carrying engine and adapt its typed output."""
@@ -1331,6 +1390,7 @@ class SourceHuntRunner:
                 return await self._arun_proof_flow()
             finally:
                 self._finalize_instrumentation("failed")
+                self._reclaim_minted_cost_bucket()
         start_time = time.monotonic()
         self._ensure_output_dir_layout()
         self._ensure_spend_ledger()
@@ -2126,6 +2186,7 @@ class SourceHuntRunner:
             if self._spend_ledger is not None:
                 self._finalize_spend_ledger("failed")
             self._finalize_instrumentation("failed")
+            self._reclaim_minted_cost_bucket()
             if self._sandbox_manager is not None:
                 try:
                     self._sandbox_manager.cleanup(remove_image=False)
@@ -3904,6 +3965,14 @@ class SourceHuntRunner:
         When a provider_manager is injected (the normal CLI path), it is
         the single source of truth — failures propagate instead of
         silently falling through to a different provider/model.
+
+        Issue #64: every REAL AsyncLLMClient return carries single-entry
+        bookkeeping (tracker + audit row per successful call, role-tagged
+        per stage). Metering is independent of budget enforcement — a
+        no-ledger run still gets a booked view; a ledger run composes
+        base -> with_spend_ledger -> with_bookkeeping into ONE cached bound
+        client so each successful achat is settled AND booked on the same
+        view.
         """
         client: AsyncLLMClient | None = None
         if override is not None:
@@ -3924,22 +3993,65 @@ class SourceHuntRunner:
                     exc_info=True,
                 )
 
-        if client is None or self._spend_ledger is None:
+        if client is None:
             self._remember_model_role(task, client)
             return client
         # AsyncMock/MagicMock overrides are test seams rather than real
-        # transports. Production native clients expose with_spend_ledger.
+        # transports. Production native clients are AsyncLLMClient; the
+        # isinstance gate BEFORE with_bookkeeping keeps the seams untouched.
         if not isinstance(client, AsyncLLMClient):
             self._remember_model_role(task, client)
             return client
         stage = budget_stage or task
-        key = (id(client), stage)
+        key = (id(client), stage, self._spend_ledger is not None)
         bound = self._metered_clients.get(key)
         if bound is None:
-            bound = client.with_spend_ledger(self._spend_ledger, stage=stage)
+            if self._spend_ledger is not None:
+                bound = client.with_spend_ledger(self._spend_ledger, stage=stage)
+            else:
+                bound = client
+            bound = bound.with_bookkeeping(
+                agent=_specialist_book_role(stage),
+                session_id=self._session_id,
+                tracker=CostTracker(),
+                audit_logger=self._get_session_audit_logger(),
+            )
             self._metered_clients[key] = bound
         self._remember_model_role(task, bound)
         return bound
+
+    def _get_session_audit_logger(self) -> Any:
+        """The runner's lazily-built AuditLogger for its session id, or None.
+
+        Cached on the runner — AuditLogger mkdirs ``~/.clearwing/audit/
+        <session_id>/`` on construction, so per-call construction would
+        churn the filesystem for no benefit.
+        """
+        if self._session_audit_logger is _AUDIT_LOGGER_UNSET:
+            self._session_audit_logger = init_session_audit_logger(self._session_id)
+        return self._session_audit_logger
+
+    def _reclaim_minted_cost_bucket(self) -> None:
+        """Forget the runner's minted sh-* CostTracker bucket (issue #64).
+
+        Without this, every standalone run leaks one ``_session_totals``/
+        ``_session_tokens`` entry in the process-global tracker forever
+        (campaign mode runs many). Only the id WE minted is dropped — a
+        resume/parent id's bucket lifecycle belongs to its owner, exactly
+        like the hunter's arun reclaim. Cleanup never raises (a failed
+        reclaim is logged, not propagated) and the disk audit trail plus
+        already-emitted COST_UPDATE frames survive the forget.
+        """
+        if not self._session_id_minted:
+            return
+        try:
+            CostTracker().forget_session(self._session_id)
+        except Exception:
+            logger.warning(
+                "Failed to reclaim sourcehunt cost bucket %s",
+                self._session_id,
+                exc_info=True,
+            )
 
     def _remember_model_role(self, task: str, client: Any) -> None:
         if client is None:

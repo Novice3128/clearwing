@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from clearwing.llm import extract_json_object
+from clearwing.observability.bookkeeping import book_llm_call, init_session_audit_logger
+from clearwing.observability.telemetry import CostTracker
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,13 @@ class CrashClassifier:
 
     def __init__(self, llm: Any = None):
         self._llm = llm
+        # Issue #64 bench metering: ONE bookkeeping bucket per classifier
+        # instance, lazily minted on the first LLM-assisted classification
+        # and reclaimed by the sweep (OssFuzzBenchmark.arun) via
+        # forget_bench_bucket() so long-lived processes do not leak the
+        # tracker entry. The bucket id and its AuditLogger move together.
+        self._bench_bucket: str | None = None
+        self._bench_audit_logger: Any = None
 
     def classify_automated(
         self,
@@ -177,10 +187,71 @@ class CrashClassifier:
             system=CLASSIFIER_SYSTEM_PROMPT, user=user_msg,
         )
         text = response.first_text if hasattr(response, "first_text") else str(response)
-        cost = getattr(response, "cost_usd", 0.0) or 0.0
+        # Issue #64: the old ``getattr(response, "cost_usd")`` read was dead
+        # — native responses never carry a cost field, so every bench
+        # classification was free by construction. Book the call for real
+        # (tracker + audit row, single-entry) and use the per-call USD.
+        cost = self._book_bench_call(response)
 
         tier, rationale = self._parse_llm_response(text)
         return tier, rationale, cost
+
+    def _bench_session(self) -> tuple[str, Any]:
+        """The classifier's minted bench bucket + its audit logger."""
+        if self._bench_bucket is None:
+            self._bench_bucket = f"bench-{uuid.uuid4().hex[:8]}"
+            self._bench_audit_logger = init_session_audit_logger(self._bench_bucket)
+        return self._bench_bucket, self._bench_audit_logger
+
+    def _book_bench_call(self, response: Any) -> float:
+        """Single-entry bookkeeping for one classification call (issue #64).
+
+        Usage unpacking is isinstance-defensive: responses whose token
+        fields are not ints (None, MagicMock test doubles) skip booking
+        silently — the call itself still succeeds. Never raises.
+        """
+        usage = getattr(response, "usage", None)
+        usage_in = getattr(usage, "prompt_tokens", None)
+        usage_out = getattr(usage, "completion_tokens", None)
+        if not isinstance(usage_in, int) or not isinstance(usage_out, int):
+            return 0.0
+        if not (usage_in or usage_out):
+            return 0.0
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", None) if details is not None else None
+        model = getattr(self._llm, "model_name", None) or "unknown"
+        session_id, audit_logger = self._bench_session()
+        try:
+            return book_llm_call(
+                usage_in,
+                usage_out,
+                tracker=CostTracker(),
+                model=model,
+                audit_model=getattr(response, "provider_model_name", None) or model,
+                cached_tokens=cached if isinstance(cached, int) else 0,
+                provider=getattr(self._llm, "provider_name", None),
+                session_id=session_id,
+                audit_logger=audit_logger,
+                agent="bench",
+            )
+        except Exception:
+            logger.warning("bench classification bookkeeping failed", exc_info=True)
+            return 0.0
+
+    def forget_bench_bucket(self) -> None:
+        """Reclaim the classifier's minted tracker bucket at sweep end.
+
+        Safe to call when no LLM-assisted classification ever ran (no
+        bucket was minted). Failure is logged, never propagated.
+        """
+        if self._bench_bucket is None:
+            return
+        try:
+            CostTracker().forget_session(self._bench_bucket)
+        except Exception:
+            logger.warning(
+                "Failed to reclaim bench cost bucket %s", self._bench_bucket, exc_info=True
+            )
 
     def _parse_llm_response(self, text: str) -> tuple[int, str]:
         """Parse LLM JSON response into (tier, rationale)."""

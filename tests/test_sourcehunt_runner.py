@@ -526,8 +526,15 @@ class TestAdversarialVerifierDefault:
 
 
 class TestErrorHandling:
-    def test_no_llm_at_all_runs_quick_path(self, tmp_path):
-        # No ranker LLM, no provider manager — fallback should kick in
+    def test_no_llm_at_all_runs_quick_path(self, tmp_path, monkeypatch):
+        # No ranker LLM, no provider manager — fallback should kick in.
+        # With a configured default endpoint this test resolves a REAL
+        # client (issue #64 now meters that call); pin the audit home so
+        # the booked row lands in tmp instead of ~/.clearwing/audit.
+        from clearwing.safety.audit import AuditLogger
+
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", tmp_path / "audit-home")
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
         runner = SourceHuntRunner(
             repo_url=str(FIXTURE_C_PROPAGATION),
             local_path=str(FIXTURE_C_PROPAGATION),

@@ -18,6 +18,7 @@ from clearwing.llm.budget import (
 )
 from clearwing.llm.native import AsyncLLMClient
 from clearwing.providers import EndpointPricing, LLMEndpoint
+from clearwing.safety.audit import AuditLogger
 from clearwing.sourcehunt.pool import HunterPool, HuntPoolConfig
 from clearwing.sourcehunt.runner import SourceHuntRunner
 
@@ -387,6 +388,11 @@ def test_runner_manifest_uses_ranker_ledger_not_hunter_totals(tmp_path, monkeypa
     repo.mkdir()
     (repo / "app.py").write_text("def main():\n    return 0\n", encoding="utf-8")
     output = tmp_path / "out"
+    # Issue #64: the runner's ranker client now carries a with_bookkeeping
+    # view — pin the audit home or the run writes a real
+    # ~/.clearwing/audit/sh-*/ trail.
+    monkeypatch.setattr(AuditLogger, "BASE_DIR", tmp_path / "audit-home")
+    monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
     client = AsyncLLMClient(
         model_name="private-priced-model",
         provider_name="anthropic",
@@ -445,6 +451,11 @@ def test_runner_returns_clean_partial_result_when_budget_cannot_fit_call(
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "app.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    # Issue #64: the enforcing preflight builds a booked view for the
+    # ranker before refusing dispatch — pin the audit home so the view's
+    # AuditLogger does not mkdir the real ~/.clearwing/audit tree.
+    monkeypatch.setattr(AuditLogger, "BASE_DIR", tmp_path / "audit-home")
+    monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
     client = AsyncLLMClient(
         model_name="private-priced-model",
         provider_name="anthropic",

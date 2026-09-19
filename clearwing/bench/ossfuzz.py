@@ -175,51 +175,57 @@ class OssFuzzBenchmark:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         bus = EventBus()
-        for idx, target in enumerate(active_targets):
-            target_result = await self._run_target(target)
-            result.results.append(target_result)
+        try:
+            for idx, target in enumerate(active_targets):
+                target_result = await self._run_target(target)
+                result.results.append(target_result)
 
-            if target_result.error is None:
-                result.targets_succeeded += 1
-            else:
-                result.targets_failed += 1
+                if target_result.error is None:
+                    result.targets_succeeded += 1
+                else:
+                    result.targets_failed += 1
 
-            result.total_cost_usd += target_result.cost_usd
+                result.total_cost_usd += target_result.cost_usd
 
-            bus.emit_benchmark_progress(BenchmarkProgressPayload(
-                mode=self._mode_name,
-                targets_completed=idx + 1,
-                targets_total=len(active_targets),
-                current_project=target.project_name,
-                tier_distribution=compute_tier_distribution(result.results),
-                cost_usd=result.total_cost_usd,
-            ))
+                bus.emit_benchmark_progress(BenchmarkProgressPayload(
+                    mode=self._mode_name,
+                    targets_completed=idx + 1,
+                    targets_total=len(active_targets),
+                    current_project=target.project_name,
+                    tier_distribution=compute_tier_distribution(result.results),
+                    cost_usd=result.total_cost_usd,
+                ))
 
-            # Write per-target result immediately for resumability
-            target_file = out_dir / f"{target.project_name}.json"
-            try:
-                target_file.write_text(
-                    json.dumps({
-                        "project_name": target_result.project_name,
-                        "entry_point": target_result.entry_point,
-                        "tier": target_result.tier,
-                        "cost_usd": target_result.cost_usd,
-                        "duration_seconds": target_result.duration_seconds,
-                        "error": target_result.error,
-                    }, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
+                # Write per-target result immediately for resumability
+                target_file = out_dir / f"{target.project_name}.json"
+                try:
+                    target_file.write_text(
+                        json.dumps({
+                            "project_name": target_result.project_name,
+                            "entry_point": target_result.entry_point,
+                            "tier": target_result.tier,
+                            "cost_usd": target_result.cost_usd,
+                            "duration_seconds": target_result.duration_seconds,
+                            "error": target_result.error,
+                        }, indent=2),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
 
-        result.tier_distribution = compute_tier_distribution(result.results)
-        result.total_duration_seconds = time.monotonic() - start_time
+            result.tier_distribution = compute_tier_distribution(result.results)
+            result.total_duration_seconds = time.monotonic() - start_time
 
-        # Save full result
-        result_path = out_dir / f"benchmark_{self._mode_name}_{self._model_name}.json"
-        save_result(result, str(result_path))
+            # Save full result
+            result_path = out_dir / f"benchmark_{self._mode_name}_{self._model_name}.json"
+            save_result(result, str(result_path))
 
-        return result
+            return result
+        finally:
+            # Issue #64 bench metering: reclaim the classifier's minted
+            # tracker bucket when the sweep ends (every exit path), so a
+            # long-lived process does not leak one entry per sweep.
+            self._classifier.forget_bench_bucket()
 
     async def _run_target(self, target: BenchmarkTarget) -> TargetResult:
         """Run the benchmark against a single target."""
