@@ -1629,7 +1629,19 @@ class NativeHunter:
         # appending from the same event loop's synchronous segments plus a
         # single ``write()`` per append under open("a") (O_APPEND), which
         # the kernel positions atomically.
-        audit_logger = init_session_audit_logger(book_session_id)
+        # Review round (issue #64): when the runner handed us a
+        # with_bookkeeping view, BOTH of this method's book_llm_call sites
+        # stand down (the view books at its achat return) — the per-
+        # execution AuditLogger would only ever mkdir an empty
+        # ``audit/<ctx-id>-<8hex>/`` shell per runner-driven hunt, so skip
+        # it. ``self.llm`` is a fixed dataclass field (never reassigned),
+        # so the guard is computed once. The minted book_session_id BUCKET
+        # lifecycle in arun() is untouched — under a booked view that
+        # bucket simply stays empty.
+        llm_already_booked = getattr(self.llm, "_book_agent", None) is not None
+        audit_logger = (
+            None if llm_already_booked else init_session_audit_logger(book_session_id)
+        )
         total_input_tokens = 0
         total_output_tokens = 0
         total_cost_usd = 0.0
@@ -1833,25 +1845,33 @@ class NativeHunter:
                         # Single-entry bookkeeping (#61): priced AND audited
                         # together, same attribution id as the main calls
                         # below — the summary call used to reach the tracker
-                        # but never the audit trail. The agent dimension is
-                        # the ROLE ("summarizer", matching the runtime's
-                        # context-summarizer rows), not the subsystem.
-                        book_llm_call(
-                            s_in,
-                            s_out,
-                            tracker=CostTracker(),
-                            model=self.llm.model_name,
-                            # Audit prefers the provider's model ECHO on the
-                            # summary response (Codex PR-63 r2) — the same
-                            # pricing/audit split as the main call below,
-                            # which the summary path used to miss entirely.
-                            audit_model=result.get("served_model") or self.llm.model_name,
-                            cached_tokens=s_cached,
-                            provider=getattr(self.llm, "provider_name", None),
-                            session_id=book_session_id,
-                            audit_logger=audit_logger,
-                            agent="summarizer",
-                        )
+                        # but never the audit trail. On the STANDALONE path
+                        # (no booked view) the agent dimension is the ROLE
+                        # "summarizer", matching the runtime's
+                        # context-summarizer rows.
+                        # Issue #64 view guard: under a with_bookkeeping
+                        # view the summary row instead carries the view's
+                        # stage role tag (hunt/subsystem_hunt/elaboration →
+                        # "hunter"), booked by the view at its achat return
+                        # (the summary call rides achat too) — this site
+                        # stands down rather than double-charge the call.
+                        if not llm_already_booked:
+                            book_llm_call(
+                                s_in,
+                                s_out,
+                                tracker=CostTracker(),
+                                model=self.llm.model_name,
+                                # Audit prefers the provider's model ECHO on the
+                                # summary response (Codex PR-63 r2) — the same
+                                # pricing/audit split as the main call below,
+                                # which the summary path used to miss entirely.
+                                audit_model=result.get("served_model") or self.llm.model_name,
+                                cached_tokens=s_cached,
+                                provider=getattr(self.llm, "provider_name", None),
+                                session_id=book_session_id,
+                                audit_logger=audit_logger,
+                                agent="summarizer",
+                            )
                     visible_read_ranges.clear()
                     overlapping_refreshes.clear()
                     if len(messages) < pre:
@@ -1959,19 +1979,32 @@ class NativeHunter:
                 # hunter attribution); the audit row prefers the served
                 # model echo for forensics, mirroring the runtime's
                 # effective_model.
-                book_llm_call(
-                    input_tokens,
-                    output_tokens,
-                    tracker=CostTracker(),
-                    model=self.llm.model_name,
-                    audit_model=getattr(response, "provider_model_name", None)
-                    or self.llm.model_name,
-                    cached_tokens=cached_tokens,
-                    provider=provider_name,
-                    session_id=book_session_id,
-                    audit_logger=audit_logger,
-                    agent="hunter",
-                )
+                # Issue #64 view guard: when the runner handed us a
+                # with_bookkeeping view (sourcehunt specialist metering),
+                # the view already booked this call at its achat return
+                # under the stage role tag — "hunter", the same tag this
+                # standalone site uses (the map keeps analytics continuity
+                # for hunt/subsystem_hunt/elaboration). Booking here too
+                # would double-charge every hunt step. The minted
+                # book_session_id lifecycle above is unaffected: it still
+                # governs bucket reclamation for standalone hunts
+                # (ambient=None); under a booked view no audit logger is
+                # built for it at all (the view's own per-resolved-id
+                # logger carries the rows).
+                if not llm_already_booked:
+                    book_llm_call(
+                        input_tokens,
+                        output_tokens,
+                        tracker=CostTracker(),
+                        model=self.llm.model_name,
+                        audit_model=getattr(response, "provider_model_name", None)
+                        or self.llm.model_name,
+                        cached_tokens=cached_tokens,
+                        provider=provider_name,
+                        session_id=book_session_id,
+                        audit_logger=audit_logger,
+                        agent="hunter",
+                    )
 
             last_assistant_text = response.first_text or ""
             last_reasoning_content = response.reasoning_content or ""

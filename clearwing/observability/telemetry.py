@@ -129,6 +129,8 @@ class CostTracker:
         output_tokens: int,
         model: str,
         cached_tokens: int = 0,
+        *,
+        pricing: dict[str, float] | None = None,
     ) -> float:
         """USD cost for one call. Prices are per 1M tokens.
 
@@ -137,17 +139,28 @@ class CostTracker:
         Versioned echoes of known models (prefix match) bill at their tier;
         unknown models fall back to the default (Sonnet) pricing with a
         one-time-per-model warning.
+
+        ``pricing`` (optional, keyword-only) is an authoritative per-call
+        row (``{"input", "output"[, "cached_input"]}``, USD per 1M tokens)
+        from the endpoint's configured ``EndpointPricing``. When supplied
+        it REPLACES the table lookup entirely — no fallback and no warning,
+        the caller priced the call on purpose — so the tracker, audit rows,
+        and COST_UPDATE totals agree with the spend ledger on custom
+        endpoints whose model names have no PRICING entry.
         """
-        pricing = cls._resolve_pricing(model)
-        if pricing is None:
-            cls._warn_pricing_fallback(model)
-            pricing = cls.PRICING[cls._DEFAULT_MODEL]
-        cached_rate = pricing.get("cached_input", pricing["input"])
+        if pricing is not None:
+            row = pricing
+        else:
+            row = cls._resolve_pricing(model)
+            if row is None:
+                cls._warn_pricing_fallback(model)
+                row = cls.PRICING[cls._DEFAULT_MODEL]
+        cached_rate = row.get("cached_input", row["input"])
         uncached = max(input_tokens - cached_tokens, 0)
         return (
-            uncached * pricing["input"]
+            uncached * row["input"]
             + cached_tokens * cached_rate
-            + output_tokens * pricing["output"]
+            + output_tokens * row["output"]
         ) / 1_000_000
 
     def __new__(cls) -> CostTracker:
@@ -196,6 +209,7 @@ class CostTracker:
         elapsed_ms: float | None = None,
         provider: str | None = None,
         session_id: str | None = None,
+        pricing: dict[str, float] | None = None,
     ) -> float:
         """Record token usage for a single LLM call and update the running cost.
 
@@ -210,9 +224,13 @@ class CostTracker:
         lets scoped consumers attribute the call to a session, and also
         accumulates a per-session cost total queryable via
         :meth:`session_total`. Keyword-only to keep call sites explicit and
-        future additions non-breaking.
+        future additions non-breaking. ``pricing`` (an authoritative
+        per-call row from the endpoint's ``EndpointPricing``) likewise
+        overrides the table lookup — see :meth:`estimate_cost`.
         """
-        cost = self.estimate_cost(input_tokens, output_tokens, model, cached_tokens)
+        cost = self.estimate_cost(
+            input_tokens, output_tokens, model, cached_tokens, pricing=pricing
+        )
 
         with self._lock:
             self.input_tokens += input_tokens

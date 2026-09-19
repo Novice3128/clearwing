@@ -526,8 +526,15 @@ class TestAdversarialVerifierDefault:
 
 
 class TestErrorHandling:
-    def test_no_llm_at_all_runs_quick_path(self, tmp_path):
-        # No ranker LLM, no provider manager — fallback should kick in
+    def test_no_llm_at_all_runs_quick_path(self, tmp_path, monkeypatch):
+        # No ranker LLM, no provider manager — fallback should kick in.
+        # With a configured default endpoint this test resolves a REAL
+        # client (issue #64 now meters that call); pin the audit home so
+        # the booked row lands in tmp instead of ~/.clearwing/audit.
+        from clearwing.safety.audit import AuditLogger
+
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", tmp_path / "audit-home")
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
         runner = SourceHuntRunner(
             repo_url=str(FIXTURE_C_PROPAGATION),
             local_path=str(FIXTURE_C_PROPAGATION),
@@ -551,3 +558,32 @@ class TestErrorHandling:
         assert runner.session_id.startswith("sh-")
         result = runner.run()
         assert result.session_id == runner.session_id
+
+    def test_two_runners_mint_distinct_session_ids_and_dirs(self, tmp_path):
+        """Codex PR-69 r1 (P1): run identity must stay per-invocation.
+
+        Without resume/parent ids every runner mints its own ``sh-``
+        execution id — two hunts from one ambient session (the webui tool)
+        must NEVER share an output/checkpoint directory or auto-load each
+        other's checkpoints."""
+        runners = [
+            SourceHuntRunner(
+                repo_url=str(FIXTURE_C_PROPAGATION),
+                local_path=str(FIXTURE_C_PROPAGATION),
+                depth="quick",
+                output_dir=str(tmp_path),
+                ranker_llm=_make_ranker_llm(["x"]),
+            )
+            for _ in range(2)
+        ]
+        ids = [r.session_id for r in runners]
+        assert all(sid.startswith("sh-") for sid in ids)
+        assert ids[0] != ids[1]
+        # Distinct ids → distinct session dirs and checkpoint paths, even
+        # under one shared output_dir.
+        dirs = [Path(tmp_path) / sid for sid in ids]
+        assert dirs[0] != dirs[1]
+        for runner in runners:
+            runner._ensure_output_dir_layout()
+        assert all(d.is_dir() for d in dirs)
+        assert runners[0]._checkpoint_path != runners[1]._checkpoint_path

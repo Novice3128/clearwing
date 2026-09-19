@@ -35,6 +35,7 @@ from genai_pyo3 import (
 from openinference.instrumentation import get_input_attributes, get_output_attributes
 from pydantic import BaseModel, ConfigDict, RootModel
 
+from clearwing.observability.bookkeeping import book_llm_call, init_session_audit_logger
 from clearwing.observability.otel import get_oi_tracer
 
 from .budget import (
@@ -44,7 +45,9 @@ from .budget import (
 )
 
 if TYPE_CHECKING:
+    from clearwing.observability.telemetry import CostTracker
     from clearwing.providers.env import EndpointPricing
+    from clearwing.safety.audit import AuditLogger
 
 logger = logging.getLogger(__name__)
 tracer = get_oi_tracer(__name__)
@@ -1005,6 +1008,21 @@ class AsyncLLMClient:
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
         self._spend_ledger: SpendLedger | None = None
         self._spend_stage = "llm"
+        # Specialist metering (issue #64): single-entry bookkeeping view
+        # state. A with_bookkeeping() view books every successful achat
+        # into the CostTracker + AuditLogger pair (sourcehunt specialists,
+        # bench) so spend that never touched the runtime gets metered.
+        # None on the base client — only views carry them.
+        self._book_agent: str | None = None
+        self._book_session_id: str | None = None
+        self._book_tracker: CostTracker | None = None
+        # Review round (reconciliation contract): the audit row must land
+        # under the SAME resolved id as the tracker bucket, so a view holds
+        # an AuditLogger cache PER session id (seeded with the fallback
+        # id's logger at construction; other resolved ids — the ambient
+        # webui/operator session — are built lazily via
+        # init_session_audit_logger and cached). None on the base client.
+        self._book_audit_loggers: dict[str, AuditLogger | None] | None = None
         # Optional retry-visibility hook (issue #17): invoked whenever a
         # retry is scheduled so UI layers can surface the wait as it
         # happens instead of only in the final error's attempts count.
@@ -1052,6 +1070,151 @@ class AsyncLLMClient:
         """The run-scoped ledger attached to this client view, if any."""
 
         return self._spend_ledger
+
+    def with_bookkeeping(
+        self,
+        *,
+        agent: str,
+        session_id: str | None,
+        tracker: CostTracker | None,
+        audit_logger: AuditLogger | None,
+    ) -> AsyncLLMClient:
+        """Return a metered view that books every successful call (issue #64).
+
+        Mirrors :meth:`with_spend_ledger` — a shallow ``copy.copy`` view over
+        the shared transport client — but for single-entry bookkeeping
+        instead of budget enforcement: each successful ``achat`` lands in the
+        ``CostTracker`` + ``AuditLogger`` pair via :func:`book_llm_call`,
+        tagged with the *agent* role. Sourcehunt specialists (patcher,
+        exploiter, variant loop, harness generator, stability, proof,
+        verifier) and the bench classifier call LLMs completely unmetered
+        otherwise (issue #64); the runtime keeps booking its own calls, so
+        only views created here book.
+
+        Deliberately NO validation and NO raise path — metering must never
+        veto a call (contrast ``with_spend_ledger``'s validate_model
+        preflight, which stays the only raising view). Session attribution
+        resolves at call time: the ambient ``current_session_id()`` wins
+        (webui/operator parents), falling back to *session_id* for contexts
+        where ContextVars do not propagate (e.g. HarnessGenerator's
+        ThreadPoolExecutor workers). Review round (reconciliation contract):
+        the audit row follows the SAME resolved id as the bucket — the
+        *audit_logger* argument is the logger for *session_id* (the
+        fallback id, e.g. the runner's own); any OTHER resolved id gets its
+        own lazily-built logger via ``init_session_audit_logger`` so rows
+        always land in ``audit/<resolved-id>/audit.jsonl``. When ambient ==
+        fallback (every normal configuration) exactly one logger exists and
+        no extra directory is ever created.
+        """
+        bound = copy.copy(self)
+        bound._book_agent = agent
+        bound._book_session_id = session_id
+        bound._book_tracker = tracker
+        bound._book_audit_loggers = {}
+        if session_id is not None:
+            bound._book_audit_loggers[session_id] = audit_logger
+        return bound
+
+    def _book_audit_logger_for(self, session_id: str | None) -> AuditLogger | None:
+        """The AuditLogger for the RESOLVED session id, or None.
+
+        Review round: the reconciliation contract
+        (``sum(audit rows) == CostTracker.session_total(sid)``) only holds
+        when both halves share ONE id, so the audit row must never ride a
+        logger bound to a different session than the tracker bucket.
+        Loggers are cached PER id — AuditLogger mkdirs
+        ``audit/<session_id>/`` on construction, so constructing per call
+        would churn the filesystem (and a gated/failed factory result of
+        None must not be retried per call either). The seed entry for the
+        fallback id comes from :meth:`with_bookkeeping` (the runner's own
+        logger — zero factory calls in the normal ambient==fallback case).
+
+        Thread-safety: the check-then-set race can at worst construct one
+        duplicate logger for an id (both append to the same file with
+        O_APPEND atomic positioning); the last write wins the cache. The
+        dict itself is safe under the GIL.
+        """
+        if self._book_audit_loggers is None or not session_id:
+            return None
+        if session_id not in self._book_audit_loggers:
+            self._book_audit_loggers[session_id] = init_session_audit_logger(session_id)
+        return self._book_audit_loggers[session_id]
+
+    def _book_call_usage(self, response: Any) -> None:
+        """Single-entry bookkeeping for one successful call (issue #64).
+
+        Duck-typed on purpose (``Any``): mypy narrows ``response`` to
+        ``ChatResponse | None`` at the achat success return (the same
+        pre-existing narrowing that flags ``return response`` itself), and
+        the unpacking below is getattr-defensive regardless.
+
+        Runs at the ``achat`` success return of a :meth:`with_bookkeeping`
+        view. Never raises into the call path — a bookkeeping failure is
+        logged and swallowed (the call itself already succeeded). Usage
+        unpacking is isinstance-defensive: responses whose token fields are
+        not ints (None, lightweight test doubles) skip booking silently —
+        the same documented hole as the hunter's booking.
+
+        Stays SYNCHRONOUS on purpose: harness-generator workers run on
+        throwaway ``asyncio.run`` loops (an ``asyncio.create_task`` here
+        would die with the loop), and CostTracker/EventBus/AuditLogger are
+        thread-safe under their own locks.
+        """
+        if self._book_tracker is None and self._book_audit_loggers is None:
+            return
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        output_tokens = getattr(usage, "completion_tokens", None)
+        if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+            return
+        if not (input_tokens or output_tokens):
+            return
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", None) if details is not None else None
+        cached_tokens = cached if isinstance(cached, int) else 0
+        try:
+            # Lazy import: clearwing.agent.tooling imports this module at
+            # module level (NativeToolSpec), so a module-level import here
+            # would be circular.
+            from clearwing.agent.tooling import current_session_id
+
+            ambient = current_session_id()
+        except Exception:
+            ambient = None
+        session_id = ambient or self._book_session_id
+        if ambient is not None and ambient != self._book_session_id:
+            # Observability for the split case: the bucket AND the audit
+            # row both follow the ambient id, leaving the view's fallback
+            # id (e.g. the runner's own sh-*) unused for this call.
+            logger.debug(
+                "Bookkeeping session split: ambient id %r wins over view fallback %r; "
+                "tracker bucket and audit row follow the ambient id",
+                ambient,
+                self._book_session_id,
+            )
+        try:
+            book_llm_call(
+                input_tokens,
+                output_tokens,
+                model=self.model_name,
+                tracker=self._book_tracker,
+                audit_logger=self._book_audit_logger_for(session_id),
+                # Audit keeps the served model echo for forensics while
+                # pricing stays on the configured key (hunter/runtime split).
+                audit_model=getattr(response, "provider_model_name", None)
+                or self.model_name,
+                cached_tokens=cached_tokens,
+                provider=self.provider_name,
+                session_id=session_id,
+                agent=self._book_agent or "main",
+                # Codex PR-69 r1: price with the endpoint's authoritative
+                # rates (the same self.pricing the spend ledger uses) so
+                # tracker/audit totals cannot diverge from the ledger on
+                # custom endpoints whose model has no PRICING entry.
+                pricing=self.pricing,
+            )
+        except Exception:
+            logger.warning("llm call bookkeeping failed", exc_info=True)
 
     def _reserve_spend_call(
         self,
@@ -1340,6 +1503,13 @@ class AsyncLLMClient:
             ok=True,
             cached_tokens=cached_tokens,
         )
+
+        # Specialist metering (issue #64): a with_bookkeeping view books
+        # BOTH halves (tracker + audit) at the single success return of
+        # achat — achat_stream/aask_text/aask_json/chat all route through
+        # here. achat_stream keeps its own (unbooked) path.
+        if self._book_agent is not None:
+            self._book_call_usage(response)
 
         return response
 

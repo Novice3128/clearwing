@@ -8,10 +8,12 @@ mocked sandbox so they run fast and don't need docker or gcc.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from genai_pyo3 import ChatResponse
+import pytest
+from genai_pyo3 import ChatResponse, Usage
 
 from clearwing.sandbox.container import ExecResult
 from clearwing.sourcehunt.harness_generator import (
@@ -25,6 +27,8 @@ from clearwing.sourcehunt.harness_generator import (
 from clearwing.sourcehunt.pool import HunterPool, HuntPoolConfig
 
 FIXTURE_C_PROPAGATION = Path(__file__).parent / "fixtures" / "vuln_samples" / "c_propagation"
+
+_HARNESS_C = "int LLVMFuzzerTestOneInput(const uint8_t *D, size_t S) { return 0; }"
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -352,6 +356,128 @@ class TestRunTopLevel:
         assert result.harnesses_generated == 2
         assert result.harnesses_crashed == 1
         assert len(result.seeded_crashes) == 1
+
+
+# --- Ambient session propagation into pool workers (Codex PR-69 r1) --------
+
+
+class TestPoolWorkerContextPropagation:
+    """ThreadPoolExecutor workers do NOT inherit the submitting thread's
+    contextvars. The webui/operator session scope is visible where
+    ``run()`` executes (the whole runner rides one ``asyncio.to_thread``
+    worker that copies its caller's context), so each ``pool.submit``
+    wraps the task in ``contextvars.copy_context().run`` to hand the
+    ambient id (and any other contextvars state) to the worker — closing
+    the attribution gap the reverted ``parent_session_id`` pass used to
+    cover."""
+
+    def _write_source(self, tmp_path) -> Path:
+        src_file = tmp_path / "parser.c"
+        src_file.write_text(
+            "int decode(const unsigned char *d, unsigned n) { return 0; }\n"
+        )
+        return src_file
+
+    def test_worker_sees_ambient_session_scope(self, tmp_path):
+        from clearwing.agent.tooling import current_session_id, session_scope
+
+        seen: list[str | None] = []
+
+        class _ProbeLLM:
+            async def aask_text(self, **kwargs):
+                seen.append(current_session_id())
+                return ChatResponse(content=[{"text": _HARNESS_C}])
+
+        src_file = self._write_source(tmp_path)
+        fake = _FakeSandbox(
+            [
+                ExecResult(0, "", "", 0.1),  # compile
+                ExecResult(0, "", "", 2.0),  # run
+            ]
+        )
+        gen = HarnessGenerator(
+            _ProbeLLM(), sandbox_factory=lambda: fake, config=HarnessGeneratorConfig()
+        )
+        ft = _ft("parser.c", str(src_file), tags=["parser"], surface=5)
+
+        with session_scope("sid-x"):
+            result = gen.run([ft], str(tmp_path))
+
+        assert result.harnesses_generated == 1
+        # The LLM ran INSIDE the pool worker thread and still resolved the
+        # ambient session id (a bare pool.submit would observe None there).
+        assert seen == ["sid-x"]
+
+    def test_booked_view_books_pool_worker_call_under_ambient_session(
+        self, monkeypatch, tmp_path
+    ):
+        """End-to-end attribution: a with_bookkeeping view handed to the
+        generator books the worker's LLM call under the AMBIENT session
+        (bucket + audit row, reconciliation contract), not the view's
+        sh-* fallback — the runner-mints-its-own-id revert leaves this as
+        the only parent-attribution path for harness calls."""
+        from clearwing.agent.tooling import session_scope
+        from clearwing.llm.native import AsyncLLMClient
+        from clearwing.observability.telemetry import CostTracker
+        from clearwing.safety.audit import AuditLogger
+
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setattr(AuditLogger, "BASE_DIR", audit_home)
+        monkeypatch.setenv("CLEARWING_HOME", str(tmp_path / "clearwing-home"))
+        monkeypatch.setattr(AsyncLLMClient, "_build_client", lambda self, cls: object())
+
+        async def fake_policy(self, client_obj, request, options):
+            return ChatResponse(
+                content=[{"text": _HARNESS_C}],
+                usage=Usage(prompt_tokens=210, completion_tokens=90, total_tokens=300),
+                provider_model_name="harness-served",
+            )
+
+        monkeypatch.setattr(AsyncLLMClient, "_achat_with_provider_policy", fake_policy)
+
+        client = AsyncLLMClient(
+            model_name="claude-sonnet-4-6", provider_name="anthropic", api_key="t"
+        )
+        view = client.with_bookkeeping(
+            agent="harness", session_id="sh-fallback", tracker=CostTracker(), audit_logger=None
+        )
+
+        src_file = self._write_source(tmp_path)
+        fake = _FakeSandbox(
+            [
+                ExecResult(0, "", "", 0.1),  # compile
+                ExecResult(0, "", "", 2.0),  # run
+            ]
+        )
+        gen = HarnessGenerator(view, sandbox_factory=lambda: fake)
+        ft = _ft("parser.c", str(src_file), tags=["parser"], surface=5)
+
+        ambient = "sid-x"
+        with session_scope(ambient):
+            result = gen.run([ft], str(tmp_path))
+
+        assert result.harnesses_generated == 1
+
+        rows_path = audit_home / ambient / "audit.jsonl"
+        assert rows_path.exists()
+        rows = [
+            json.loads(line)
+            for line in rows_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        rows = [r for r in rows if r.get("event_type") == "llm_call"]
+        assert len(rows) == 1
+        assert rows[0]["agent"] == "harness"
+        total = sum(r["details"]["cost_usd"] for r in rows)
+        assert total == pytest.approx(
+            CostTracker.estimate_cost(210, 90, "claude-sonnet-4-6")
+        )
+        # Reconciliation under the ambient id, both halves.
+        assert CostTracker().session_total(ambient) == pytest.approx(total)
+        # The view's fallback id got no rows and no bucket.
+        assert not (audit_home / "sh-fallback" / "audit.jsonl").exists()
+        assert CostTracker().session_total("sh-fallback") == 0.0
+        CostTracker().forget_session(ambient)
 
 
 # --- HuntPoolConfig plumbing -----------------------------------------------
