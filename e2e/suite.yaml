@@ -62,7 +62,7 @@ tiers:
     scenarios:
       - {name: probe-partial-fill, type: probe_partial_fill}
       - {name: fc-approval, type: ws, prompt: quick-fc.txt, target: "192.168.73.82", max_seconds: 300,
-         cost_cap: 1.0, trust_status: true, expect: {approvals: ">=1", dup_pairs: 0, late_frames: 0}}
+         cost_cap: 1.0, trust_status: true, expect: {approvals: ">=1"}}     # dup/late are standalone hard gates — expect keys they never consumed (second-round P1)
       - {name: stop-frame, type: ws, prompt: quick-scan.txt, target: "192.168.73.82", max_seconds: 300,
          cost_cap: 1.0, stop_after_tools: 1, expect: {cancelled_turn: true}}   # scan => deterministic tool_start (fc prompt lets the LLM skip tools)
       - {name: watchdog-lowcap, type: ws, prompt: quick-scan.txt, target: "192.168.73.82", max_seconds: 300,

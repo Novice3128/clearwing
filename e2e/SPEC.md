@@ -88,7 +88,7 @@
 
 **機制化（不可繞過）**：
 1. 任何 FAIL run 的翻案判定、或任何對外輸出（issue/PR 貼文素材）前，必須先 `cw-e2e adjudicate <run-dirs...>` 產出 round 級判定文件（含全部 run-dir 索引〔FATAL 廢輪亦然〕、被推翻門及論據、限定欄、複審紀錄節）。
-2. 複審紀錄非空才可 `--finalize`（蓋 FINAL 標記）；`cw-e2e export` 只對 FINAL 判定文件產出對外草稿——DRAFT 一律拒絕。
+2. 複審紀錄非空才可 `--finalize`（蓋 FINAL 標記）；`cw-e2e export` 只對 FINAL 判定文件產出對外草稿——DRAFT 一律拒絕；export 的 MIXED 僅限多 run 判定互異之輪級聚合（語意見 §4）。
 3. 綠燈輪（全 PASS 且無對外輸出）可免審；`--force` 逃生口存在但理由必須寫進判定文件。
 
 
@@ -111,7 +111,7 @@
 | `web-api.md` 加版本頭（gh/ 草稿） | verify 增加版本比對、報告記版本 | `runner.py git_info` |
 | 新端點/埠 | `suite.yaml webui` | 無代碼 |
 
-**離線回歸**：改動套件任何檔案後先跑 `.venv/bin/python e2e/runner.py selftest`（項數以 `cw-e2e selftest` 輸出為準（勿在文件寫死——歷史上已 stale 兩次）
+**離線回歸**：改動套件任何檔案後先跑 `.venv/bin/python e2e/runner.py selftest`（項數以 `cw-e2e selftest` 輸出為準、零 LLM 成本（勿在文件寫死——歷史上已 stale 兩次）
 
 **契約紀律**：套件斷言壞掉時優先懷疑產品改了（歷史六輪皆如此）；修套件前先跑
 `git log -- docs/web-api.md` 對照。連續兩次維護只是追協議、零新發現 → 觸發 §6 棄用條款檢討。

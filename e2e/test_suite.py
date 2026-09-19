@@ -1242,14 +1242,11 @@ def test_trigger_verify_nudge_chain():
     """lens-3 gap #1: the verify leg of the SPEC §3 dual-carrier — empty
     trigger appends the -info nudge (never blocking) and standalone verify
     (trigger=None) shows nothing."""
-    checks = []
-    import runner as _r
-    orig_append = None
-    # exercise the branch logic directly: simulate the two call shapes
     import inspect
-    src = inspect.getsource(_r.verify)
+    src = inspect.getsource(runner.verify)
     assert "trigger-recorded-info" in src and "觸發源" in src
     assert "if trigger is not None:" in src          # standalone verify (None) stays silent
+    assert 'endswith("-info")' in src                # the nudge can never block a run
 
 
 def test_trend_gate_baseline_annotation(monkeypatch, tmp_path):
@@ -1272,3 +1269,17 @@ def test_trend_gate_baseline_annotation(monkeypatch, tmp_path):
     prev["_baseline_dir"] = str(prev_dir)
     gates = analyze.trend_gate({"seconds": 110, "cost_usd_product": 1.05}, prev)
     assert all("[baseline" not in g["detail"] for g in gates)
+
+
+def test_suite_yaml_expect_keys_all_consumed():
+    """Second-round P1 pin: every expect key in suite.yaml must be a key the
+    evaluate() dispatcher consumes — the unknown-key hard gate would otherwise
+    fire on the suite's OWN dead keys at the next live run (fc-approval
+    carried dup_pairs/late_frames since v1: standalone gates, never expect
+    consumers)."""
+    legal = {"approvals", "cancelled_turn", "watchdog", "complete_status",
+             "errors", "chaos_hits", "graceful", "artifacts"}
+    for tier in analyze.SUITE["tiers"].values():
+        for sc in tier.get("scenarios", []):
+            for k in (sc.get("expect") or {}):
+                assert k in legal, f"suite.yaml expect key {k!r} ({sc['name']}) has no consumer"
