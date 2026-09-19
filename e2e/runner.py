@@ -1290,6 +1290,10 @@ def cmd_adjudicate(args) -> None:
                 "destroy them; delete it consciously first (SPEC §2.7)")
         lm = re.search(r"## limits[^\n]*\n(.*?)(?=\n## |\Z)", existing, re.S)
         lbody = (lm.group(1) if lm else "").strip()
+        # the auto-injected trigger line is machine text — with it, a recorded
+        # --trigger made every regeneration hit the human-limits guard (Codex #68 r1)
+        lbody = "\n".join(ln for ln in lbody.splitlines()
+                           if not ln.lstrip("- ").startswith("觸發源（pre-state 自動引用）")).strip()
         if lbody and lbody != "-":
             die(f"{adj} already carries human limits — regenerating would "
                 "destroy them; delete it consciously first (SPEC §2.7)")

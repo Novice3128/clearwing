@@ -1283,3 +1283,27 @@ def test_suite_yaml_expect_keys_all_consumed():
         for sc in tier.get("scenarios", []):
             for k in (sc.get("expect") or {}):
                 assert k in legal, f"suite.yaml expect key {k!r} ({sc['name']}) has no consumer"
+
+
+def test_adjudicate_regen_allowed_with_auto_trigger_line(tmp_path):
+    """Codex #68 r1: a run carrying --trigger injects an auto line into the
+    draft's limits — regeneration (e.g. adding a run to the round index)
+    must NOT hit the human-limits refuse-overwrite guard because of it."""
+    d = _adj_run_dir(tmp_path, "20260101-000000-full")
+    (d / "state").mkdir()
+    (d / "state" / "pre-state.json").write_text(json.dumps({"trigger": "使用者指示 X"}))
+    a = _Args()
+    a.run_dirs = [str(d)]
+    a.finalize = False
+    runner.cmd_adjudicate(a)                       # draft WITH auto trigger line
+    adj = d / "adjudication.md"
+    assert "使用者指示 X" in adj.read_text()
+    runner.cmd_adjudicate(a)                       # regen: must NOT die
+    assert "adjudication-status: DRAFT" in adj.read_text()
+    # but a genuinely human-filled limits still refuses regeneration
+    adj.write_text(adj.read_text().replace(
+        "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n- 觸發源（pre-state 自動引用）：使用者指示 X\n",
+        "## limits (每判定限定欄：n= / warm-cold / scope / 口徑)\n\n"
+        "- 觸發源（pre-state 自動引用）：使用者指示 X\n- n=3 樣本限定；口徑 per-call。\n"))
+    with pytest.raises(SystemExit):
+        runner.cmd_adjudicate(a)
