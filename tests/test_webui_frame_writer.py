@@ -1317,7 +1317,9 @@ class TestHalfDeadSocketHandlerPark:
     stays a hard never-delivered guarantee) and the handler breaks into
     the existing teardown."""
 
-    def test_stop_wait_is_bounded_and_teardown_runs(self, client, monkeypatch):
+    def test_stop_wait_is_bounded_and_teardown_runs(
+        self, client, monkeypatch, results_dir
+    ):
         import asyncio
         import threading
         import time
@@ -1440,7 +1442,7 @@ class TestHalfDeadSocketHandlerPark:
             assert all('"complete"' not in d for d in delivered)
 
     def test_busy_rejection_wait_is_bounded_and_tears_down(
-        self, client, monkeypatch
+        self, client, monkeypatch, results_dir
     ):
         import threading
 

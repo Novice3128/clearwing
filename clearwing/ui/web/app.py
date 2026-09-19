@@ -990,8 +990,17 @@ def create_app():
             already cancelled it; the explicit `fut.cancel()` is an
             idempotent no-op that documents intent — so the writer's
             existing `fut.cancelled()` stale guard skips the still-queued
-            entry and False stays a hard guarantee the frame never reaches
-            the wire (a recovering transport can never deliver it late).
+            entry. The hard never-delivered guarantee holds for the
+            discard paths — the single send attempt failed, the writer
+            was already gone, the entry was cancelled before dequeue —
+            where a recovering transport can never deliver the frame
+            late. One narrow qualifier on the expiry path: a send
+            already in flight when the wait expires may still complete
+            delivery — the first-attempt window (the writer dequeued the
+            entry and passed the stale guard before the cancel landed; a
+            benign race that pre-exists identically for stop-cancelled
+            turn tasks — the writer's `if not fut.done()` guards absorb
+            the late resolve, no crash, just a frame that went out).
             The caller then breaks into the normal teardown path, which
             cancels+joins the writer. Turn-task callers pass no timeout on
             purpose: stop/disconnect cancels the turn task, which rescues
