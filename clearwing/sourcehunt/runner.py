@@ -4013,15 +4013,29 @@ class SourceHuntRunner:
             self._remember_model_role(task, client)
             return client
         # Review round (double-wrap guard): an override that is ALREADY a
-        # with_bookkeeping view must pass through as-is — wrapping it again
-        # would stack a second booking layer and double-charge every call.
-        # Currently unreachable (no production caller passes a booked view
-        # as an override); the guard exists so that one never becomes a
-        # silent double-booking foot-gun.
+        # with_bookkeeping view must never be booked again — wrapping it in
+        # a second with_bookkeeping would stack another booking layer and
+        # double-charge every call. Codex PR-69 r2 (P1): the guard used to
+        # return such an override as-is BEFORE with_spend_ledger ran, so a
+        # budget_usd run handed a booked override got NO reservations at
+        # all — a spend-cap hole. The runner's ledger is attached here too
+        # now; with_spend_ledger is a copy.copy view that only sets
+        # _spend_ledger/_spend_stage, so the booking attrs (_book_agent
+        # and friends) carry over unchanged and double-booking stays
+        # impossible, while its validate_model preflight now covers this
+        # path like every other ledger-bound client. Still unreachable in
+        # production (no caller passes a booked view as an override today).
+        stage = budget_stage or task
         if getattr(client, "_book_agent", None) is not None:
+            if self._spend_ledger is not None:
+                # Built per call, not cached in _metered_clients: its key
+                # convention (id, stage, ledger-ness) does not distinguish
+                # a booked override from a base client, and this path is
+                # rare enough (currently unreachable) that a per-call
+                # shallow copy beats widening the key.
+                client = client.with_spend_ledger(self._spend_ledger, stage=stage)
             self._remember_model_role(task, client)
             return client
-        stage = budget_stage or task
         key = (id(client), stage, self._spend_ledger is not None)
         bound = self._metered_clients.get(key)
         if bound is None:

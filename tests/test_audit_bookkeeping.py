@@ -1021,6 +1021,70 @@ class TestSpecialistAudit:
         assert out is seam  # no with_bookkeeping on test doubles
         assert not _audit_rows(audit_home, runner._session_id)
 
+    def test_booked_override_still_binds_spend_ledger(self, monkeypatch, tmp_path):
+        """Codex PR-69 r2 (P1): the double-wrap guard must not bypass the
+        spend ledger. An override that already carries a with_bookkeeping
+        view must keep its booking attrs, but under budget_usd the runner
+        still attaches its spend ledger — the old guard returned the
+        override before with_spend_ledger, so a booked override ran with
+        ZERO reservations. with_spend_ledger is a copy.copy view that only
+        sets _spend_ledger/_spend_stage: the booking survives unchanged
+        and the call settles AND books exactly once."""
+        runner, _ = self._make_booked_runner(
+            monkeypatch,
+            tmp_path,
+            usage=Usage(prompt_tokens=210, completion_tokens=1, total_tokens=211),
+        )
+        runner.budget_usd = 1.0
+        runner.input_price_per_million = 0.0
+        runner.output_price_per_million = 1_000_000.0  # 1 output token = $1
+        ledger = runner._ensure_spend_ledger()
+        assert ledger.enforcing
+
+        booked = self._real_client().with_bookkeeping(
+            agent="harness",
+            session_id="sh-external",
+            tracker=CostTracker(),
+            audit_logger=None,
+        )
+        out = runner._get_native_client("hunter", booked, budget_stage="hunt")
+
+        # A NEW view — the ledger landed on the booked override.
+        assert out is not booked
+        assert out.spend_ledger is ledger
+        assert out._spend_stage == "hunt"
+        # The booking attrs carried over via the shallow copy, unchanged.
+        assert out._book_agent == "harness"
+        assert out._book_session_id == "sh-external"
+
+        asyncio.run(out.aask_text(system="s", user="u"))
+
+        # The ledger half settled — the reservation the old guard skipped.
+        assert ledger.spent_usd == pytest.approx(1.0)
+        # The bookkeeping half ran EXACTLY once (a second stacked layer
+        # would double it): one call, one charge in the override's own
+        # bucket (no ambient session → the view's fallback id).
+        assert CostTracker().session_total("sh-external") == pytest.approx(
+            CostTracker.estimate_cost(210, 1, "claude-sonnet-4-6")
+        )
+        CostTracker().forget_session("sh-external")
+        runner._reclaim_minted_cost_bucket()
+
+    def test_booked_override_without_ledger_returns_unchanged(self, monkeypatch, tmp_path):
+        """No ledger → nothing to attach: the booked override passes
+        through as-is (the original double-wrap-guard contract)."""
+        runner, _ = self._make_booked_runner(monkeypatch, tmp_path)
+        assert runner._spend_ledger is None
+        booked = self._real_client().with_bookkeeping(
+            agent="harness",
+            session_id="sh-external",
+            tracker=CostTracker(),
+            audit_logger=None,
+        )
+        out = runner._get_native_client("hunter", booked, budget_stage="hunt")
+        assert out is booked
+        assert out.spend_ledger is None
+
     def test_no_ledger_runner_still_books(self, monkeypatch, tmp_path):
         """Metering is independent of budget enforcement (issue #64)."""
         runner, audit_home = self._make_booked_runner(monkeypatch, tmp_path)
