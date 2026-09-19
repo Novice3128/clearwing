@@ -42,6 +42,19 @@ _LLM_PROGRESS_INTERVAL_SECONDS = 10
 # Module-level so tests can shorten it.
 _PUMP_SEND_RETRY_SECONDS = 0.5
 
+# Bound on a HANDLER-side terminal frame wait (issue #66): a half-dead
+# socket (sends fail, receives still work) parks a no-future frame at the
+# head of the outbound queue forever — the writer retries it on the backoff
+# above and never reaches the terminal entry behind it, so the receive
+# loop's flush handshake would never resolve and teardown would never run.
+# Handler-side sends give up after this many retry cadences, cancel their
+# handshake (the writer's fut.cancelled() stale guard then skips the
+# still-queued entry) and fall into the normal teardown path. Only the head
+# frame can block — the writer is strictly FIFO — so six cadences is
+# generous for a slow-but-alive transport. Module-level so tests can
+# shorten it; read at call time.
+_HANDLER_SEND_TIMEOUT_SECONDS = _PUMP_SEND_RETRY_SECONDS * 6
+
 
 def _ai_text_stats(values: dict[str, Any] | None) -> tuple[int, str]:
     """(count of AI messages carrying text, last such text) for a snapshot.
@@ -894,7 +907,8 @@ def create_app():
                 return False
 
         async def _reject_busy_frame() -> bool:
-            """True when the handler may keep serving; False when the client is gone."""
+            """True when the handler may keep serving; False when the client
+            is gone (or the bounded wait below expired — same reaction)."""
             return await _send_frame(
                 {
                     "type": "error",
@@ -904,7 +918,8 @@ def create_app():
                             'send {"type": "stop"} to cancel it first'
                         )
                     },
-                }
+                },
+                timeout=_HANDLER_SEND_TIMEOUT_SECONDS,
             )
 
         async def _reject_pending_approval_frame() -> bool:
@@ -918,7 +933,8 @@ def create_app():
                             'discard it with {"type": "stop"} first'
                         )
                     },
-                }
+                },
+                timeout=_HANDLER_SEND_TIMEOUT_SECONDS,
             )
 
         def _enqueue_frame(
@@ -945,7 +961,9 @@ def create_app():
             outbound_queue.put_nowait((text, payload, fut))
             return True
 
-        async def _send_frame(payload: dict) -> bool:
+        async def _send_frame(
+            payload: dict, *, timeout: float | None = None
+        ) -> bool:
             """Enqueue a terminal frame and wait for the writer to deliver it.
 
             Returns True when the writer sent it (every frame enqueued
@@ -961,6 +979,33 @@ def create_app():
             pending here until the transport recovers (FIFO still
             delivers), the writer dies (`_writer_died`), or the socket
             goes away (disconnect-path cancellation).
+
+            `timeout` bounds that wait and is reserved for HANDLER-side
+            sends (the receive loop's own terminal frames: rejections,
+            `started`, `stopped`, post-stop `complete`). A half-dead
+            socket parks a no-future frame at the queue head forever, and
+            nothing else rescues the receive loop — stop/disconnect
+            cancellation cannot reach it because it IS the loop (issue
+            #66). On expiry the handshake future is CANCELLED — wait_for
+            already cancelled it; the explicit `fut.cancel()` is an
+            idempotent no-op that documents intent — so the writer's
+            existing `fut.cancelled()` stale guard skips the still-queued
+            entry. The hard never-delivered guarantee holds for the
+            discard paths — the single send attempt failed, the writer
+            was already gone, the entry was cancelled before dequeue —
+            where a recovering transport can never deliver the frame
+            late. One narrow qualifier on the expiry path: a send
+            already in flight when the wait expires may still complete
+            delivery — the first-attempt window (the writer dequeued the
+            entry and passed the stale guard before the cancel landed; a
+            benign race that pre-exists identically for stop-cancelled
+            turn tasks — the writer's `if not fut.done()` guards absorb
+            the late resolve, no crash, just a frame that went out).
+            The caller then breaks into the normal teardown path, which
+            cancels+joins the writer. Turn-task callers pass no timeout on
+            purpose: stop/disconnect cancels the turn task, which rescues
+            their unbounded waits, and their recover-on-retry semantics
+            are pinned by tests.
             """
             # Yield once before entering the FIFO: a bus event emitted just
             # before the turn ended (a late worker-thread booking) reaches
@@ -981,7 +1026,22 @@ def create_app():
             try:
                 if not _enqueue_frame(payload, fut):
                     return False
-                return await fut
+                if timeout is None:
+                    return await fut
+                try:
+                    return await asyncio.wait_for(fut, timeout)
+                except (asyncio.TimeoutError, TimeoutError):
+                    # Never let the timeout escape: callers use
+                    # `if not await _send_frame(...)` and a raised
+                    # TimeoutError would masquerade as a handler crash.
+                    # The cancel is idempotent (wait_for already cancelled
+                    # the future on expiry) and makes the still-queued
+                    # entry observably stale for the writer's skip guard —
+                    # only OUR future is cancelled, never a
+                    # resolve-all-pending sweep: later waiters stay pending
+                    # so a recovering transport still delivers them FIFO.
+                    fut.cancel()
+                    return False
             finally:
                 flush_futures.discard(fut)
 
@@ -1478,7 +1538,8 @@ def create_app():
                             {
                                 "type": "error",
                                 "data": {"message": f"Failed to start agent: {e}"},
-                            }
+                            },
+                            timeout=_HANDLER_SEND_TIMEOUT_SECONDS,
                         ):
                             break
                         continue
@@ -1500,7 +1561,8 @@ def create_app():
                             "session_id": session_id,
                             "target": target,
                             "model": resolved_model,
-                        }
+                        },
+                        timeout=_HANDLER_SEND_TIMEOUT_SECONDS,
                     ):
                         break
 
@@ -1576,7 +1638,10 @@ def create_app():
                     # `stopped`/`complete` ride the same FIFO queue as the
                     # cancelled turn's pending bus frames (issue #45): they
                     # go out only after every earlier frame, without the old
-                    # explicit tail drain.
+                    # explicit tail drain. Handler-side sends are bounded
+                    # (issue #66): a no-future frame parked at the head by a
+                    # half-dead socket must not stall the stop handshake
+                    # forever — on expiry the handler tears down instead.
                     if not await _send_frame(
                         {
                             "type": "stopped",
@@ -1584,10 +1649,14 @@ def create_app():
                                 "cancelled_turn": cancelled_turn,
                                 "discarded_approval": discarded,
                             },
-                        }
+                        },
+                        timeout=_HANDLER_SEND_TIMEOUT_SECONDS,
                     ):
                         break
-                    if not await _send_frame(_complete_payload(status="stopped")):
+                    if not await _send_frame(
+                        _complete_payload(status="stopped"),
+                        timeout=_HANDLER_SEND_TIMEOUT_SECONDS,
+                    ):
                         break
 
                 elif msg_type in ("message", "approve"):
@@ -1599,7 +1668,8 @@ def create_app():
                             "data": {
                                 "message": "No active agent — send a start frame first"
                             },
-                        }
+                        },
+                        timeout=_HANDLER_SEND_TIMEOUT_SECONDS,
                     ):
                         break
 
