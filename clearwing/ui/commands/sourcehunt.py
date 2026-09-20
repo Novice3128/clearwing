@@ -1894,8 +1894,10 @@ def _run_elaborate_auto(cli, args, targets, session_id, endpoint, provider_manag
         sys.exit(1)
 
     # Issue #76: book the autonomous elaboration runs under an
-    # elaborate-auto-<session> id (the auto twin of the HITL shape) and
-    # reclaim the bucket when the batch ends.
+    # elaborate-auto-<session> id — session-level bucket by design (the
+    # internal per-finding HunterContext ids `elaborate-<fid>` are distinct),
+    # unlike HITL which reuses its HunterContext id verbatim — and reclaim
+    # the bucket when the batch ends.
     book_id = f"elaborate-auto-{session_id}"
     agent = ElaborationAgent(
         llm=_booked_cli_client(llm, agent="elaboration", session_id=book_id),
