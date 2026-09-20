@@ -760,6 +760,9 @@ async def execute_sourcehunt_run(
             output_dir=str(output_root),
             output_formats=["sarif", "markdown", "json"],
             parent_session_id=spec.id,
+            # Issue #78: the eval harness minted spec.id itself and nothing
+            # else reclaims that bucket — the runner owns it.
+            owns_parent_session=True,
             provider_manager=provider_manager,
             model_override=spec.model,
             campaign_hint=spec.campaign_hint(),
