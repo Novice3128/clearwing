@@ -114,6 +114,28 @@ class TestRedactionFilterShapes:
         assert record.args[1] == "/ws/agent?api%5Fkey=[REDACTED]"
         assert "SECRET" not in record.getMessage()
 
+    def test_any_encoded_spelling_of_api_key_redacts(self):
+        """Codex r2 P1: starlette decodes param NAMES, so EVERY encoding that
+        decodes to api_key passes auth — ``%61pi_key=``, ``api_%6Bey=``, the
+        fully-encoded form — and enumeration-based regexes can never be
+        complete. The filter decodes each param name and compares it to the
+        exact auth name; the wire spelling is preserved."""
+        for wire in (
+            "%61pi_key",  # 'a' encoded
+            "api_%6Bey",  # 'k' encoded
+            "%61%70%69_%6B%65%79",  # every letter encoded
+            "%41PI_KEY",  # decodes to API_KEY — auth does NOT read this name
+        ):
+            record = _record("uvicorn.error", WS_MSG, ("127.0.0.1:1", f"/ws/agent?{wire}=SECRET"))
+            assert _ApiKeyRedactionFilter().filter(record) is True
+            if wire == "%41PI_KEY":
+                # Not the auth param name — nothing to leak past auth; the
+                # line passes through untouched.
+                assert record.args[1] == f"/ws/agent?{wire}=SECRET"
+            else:
+                assert record.args[1] == f"/ws/agent?{wire}=[REDACTED]", wire
+                assert "SECRET" not in record.getMessage()
+
 
 class TestInstallFunction:
     # Dependency note (issue #84): handle() installs these filters BEFORE

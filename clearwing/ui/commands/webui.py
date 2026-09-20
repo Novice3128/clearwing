@@ -2,6 +2,7 @@
 
 import logging
 import re
+from urllib.parse import unquote
 
 
 class _ApiKeyRedactionFilter(logging.Filter):
@@ -12,20 +13,62 @@ class _ApiKeyRedactionFilter(logging.Filter):
     authenticated request writes the operator key to the log file.
     """
 
-    # The param name itself may arrive percent-encoded (``api%5Fkey=``):
-    # starlette's parse_qs percent-decodes param NAMES, so that spelling
-    # passes auth and must be redacted on the wire form too.
-    _QUERY_RE = re.compile(r"(api(?:%5[Ff]|_)key=)[^&\s]+")
-    # ``api_key=`` followed by anything OTHER than the redaction marker —
-    # detects a live secret. A plain substring test cannot do this: the
-    # redacted form ``api_key=[REDACTED]`` still contains ``api_key=``, so a
-    # literal "still contains api_key=" check would collapse EVERY matching
-    # record (the original bug: it re-rendered the already-clean message and
-    # set args=None unconditionally).
-    _LEAK_RE = re.compile(r"api(?:%5[Ff]|_)key=(?!\[REDACTED\])[^&\s]")
+    # A query parameter is `name=value`. The name charset (unreserved chars
+    # + percent escapes) anchors the match INSIDE the parameter — a greedy
+    # "anything but =" would swallow the path prefix ("/api/x?api_key") as
+    # part of the name. The value stops at '&' and whitespace (query
+    # grammar) and at '?' — a rendered request target carries '?' only as
+    # the path/query separator, so a value crossing it is really two params
+    # abutting ("url=/x?api_key=…" in a message template must not hide the
+    # api_key token). Matching is DECODE-AWARE, not spelling-enumeration:
+    # starlette's parse_qs percent-decodes param NAMES, so ANY encoded
+    # spelling that decodes to ``api_key`` passes auth (``api%5Fkey=``,
+    # ``%61pi_key=``, ``api_%6Bey=``, …) — enumerating spellings in the
+    # regex can never be complete. Instead every param-shaped token is
+    # decoded and compared to the exact name the auth reads
+    # (case-sensitive, matching parse_qs semantics); the WIRE spelling of
+    # the name is preserved in the redacted output. The value pattern
+    # requires at least one character: an empty value carries no secret.
+    _PARAM_RE = re.compile(r"([A-Za-z0-9%_.~\-]+)=([^&\s?]+)")
+    _REDACTED = "[REDACTED]"
+    _AUTH_PARAM = "api_key"
+
+    def _redact_text(self, text: str) -> str:
+        """Replace every api_key param's value with the redaction marker."""
+
+        def _redact_param(match: re.Match[str]) -> str:
+            if unquote(match.group(1)) == self._AUTH_PARAM:
+                return f"{match.group(1)}={self._REDACTED}"
+            return match.group(0)
+
+        return self._PARAM_RE.sub(_redact_param, text)
+
+    def _has_live_api_key(self, text: str) -> bool:
+        """True when an api_key param carries something not yet redacted.
+
+        ``startswith`` (not equality): the collapsed form can abut log
+        punctuation — ``api_key=[REDACTED]"`` from a quoted template — and
+        that is not a live secret.
+        """
+
+        for match in self._PARAM_RE.finditer(text):
+            if (
+                unquote(match.group(1)) == self._AUTH_PARAM
+                and not match.group(2).startswith(self._REDACTED)
+            ):
+                return True
+        return False
+
+    def _mentions_api_key(self, text: str) -> bool:
+        """True when any api_key param appears, already redacted or not."""
+
+        return any(
+            unquote(match.group(1)) == self._AUTH_PARAM
+            for match in self._PARAM_RE.finditer(text)
+        )
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not self._QUERY_RE.search(record.getMessage()):
+        if not self._mentions_api_key(record.getMessage()):
             return True
         if isinstance(record.args, tuple | list) and record.args:
             # Main path: the secret sits inside one of the args — uvicorn
@@ -38,15 +81,15 @@ class _ApiKeyRedactionFilter(logging.Filter):
             # args=None raises TypeError in every handler and spams
             # "--- Logging error ---" tracebacks instead of the line.
             record.args = tuple(
-                self._QUERY_RE.sub(r"\1[REDACTED]", arg) if isinstance(arg, str) else arg
+                self._redact_text(arg) if isinstance(arg, str) else arg
                 for arg in record.args
             )
-            if not self._LEAK_RE.search(record.getMessage()):
+            if not self._has_live_api_key(record.getMessage()):
                 return True
         # No args to redact (argless record), or the leak lives in the msg
         # template itself rather than in any arg: collapse to a fully
         # rendered, redacted message.
-        record.msg = self._QUERY_RE.sub(r"\1[REDACTED]", record.getMessage())
+        record.msg = self._redact_text(record.getMessage())
         record.args = None
         return True
 
