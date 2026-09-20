@@ -22,6 +22,7 @@ from clearwing.llm.messages import (
     HumanMessage,
     ToolMessage,
     _coerce_chat_messages,
+    extract_text_content,
 )
 from clearwing.llm.native import NativeToolSpec, response_text
 from clearwing.observability.bookkeeping import book_llm_call, init_session_audit_logger
@@ -119,8 +120,21 @@ def _turn_requests_save_report(messages: list[Any]) -> bool:
     e2e scenario prompts state the delivery contract explicitly ("produce
     the report with save_report"), so the literal keyword is the activation
     signal for the one-shot delivery nudge (issue #82).
+
+    Both message shapes are first-class in graph state: dataclass
+    ``HumanMessage`` objects AND the raw dicts every production frontend
+    sends (``{"role": "user", "content": ...}`` — webui/TUI/CLI-interactive/
+    operator/CICD all astream dict messages; ``_merge_input`` extends state
+    verbatim without coercion). Matching only the dataclass shape would
+    silence the nudge on every real frontend while dataclass-only tests
+    stay green (r7 review P0).
     """
     for message in messages:
+        if isinstance(message, dict):
+            if str(message.get("role", "")).strip().lower() in ("human", "user"):
+                if _SAVE_REPORT_TOOL in extract_text_content(message.get("content")):
+                    return True
+            continue
         if getattr(message, "type", "") == "human":
             if _SAVE_REPORT_TOOL in getattr(message, "text", ""):
                 return True
@@ -553,6 +567,15 @@ class NativeAgentGraph:
                         self.event_bus.emit_message(nudge.content, "warning")
                     continue
                 break
+            if "turn_start" in counters and any(
+                str(getattr(call, "fn_name", "") or "") == _SAVE_REPORT_TOOL
+                for call in tool_calls
+            ):
+                # Counted at dispatch, not by re-scanning history: the
+                # context summarizer can compact mid-turn and shift indices,
+                # which would make an index-bounded scan miss a save_report
+                # request from earlier in the turn (r7 review).
+                counters["save_report_calls"] = 1
             if max_tool_calls is not None:
                 budget_left = max_tool_calls - counters["tool_calls_total"]
                 if budget_left <= 0:
@@ -608,14 +631,17 @@ class NativeAgentGraph:
         save_report delivery (recorded at turn start as the ``turn_start``
         counter key — absent means the turn never mentioned it, e.g. loops
         entered without new user input), the turn has made zero
-        save_report tool calls so far, the latch is unset, and both budgets
-        still have room — with max_steps spent the loop would break before
-        answering the nudge, and with the tool-call budget spent the nudged
-        save_report call would only be answered as skipped (mirroring the
-        max_tool_calls stop), so the nudge would burn a round for nothing.
+        save_report tool requests (``save_report_calls`` is set at tool-batch
+        dispatch, which is immune to the context summarizer compacting and
+        shifting history indices mid-turn), the latch is unset, and both
+        budgets still have room — with max_steps spent the loop would break
+        before answering the nudge, and with the tool-call budget spent the
+        nudged save_report call would only be answered as skipped (mirroring
+        the max_tool_calls stop), so the nudge would burn a round for nothing.
         """
-        turn_start = counters.get("turn_start")
-        if turn_start is None or counters.get("save_report_nudged"):
+        if counters.get("turn_start") is None or counters.get("save_report_nudged"):
+            return False
+        if counters.get("save_report_calls"):
             return False
         limits = self.agent_limits
         if limits is not None:
@@ -626,12 +652,6 @@ class NativeAgentGraph:
                 and counters["tool_calls_total"] >= limits.max_tool_calls
             ):
                 return False
-        messages = state.get("messages", [])
-        # Clamp against context compaction shortening the history mid-turn.
-        for message in messages[min(turn_start, len(messages)) :]:
-            for call in getattr(message, "tool_calls", None) or []:
-                if str(getattr(call, "fn_name", "") or "") == _SAVE_REPORT_TOOL:
-                    return False
         return True
 
     def _thread_for_state(self, state: dict[str, Any]) -> str:

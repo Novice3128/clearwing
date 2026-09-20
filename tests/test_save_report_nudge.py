@@ -134,6 +134,53 @@ class TestSaveReportNudge:
         assert isinstance(state["messages"][-1], _Msg), "turn ends on the second text reply"
 
     @pytest.mark.asyncio
+    async def test_dict_shaped_user_input_activates_nudge(self):
+        """r7 review P0: every production frontend (webui/TUI/CLI-interactive/
+        operator/CICD) astreams DICT user messages — ``{"role": "user",
+        "content": ...}`` — and ``_merge_input`` extends state verbatim
+        without coercion. A dataclass-only matcher made the nudge dead on
+        every real path while HumanMessage-only tests stayed green."""
+        graph = _graph()
+        config = _config("t-dict")
+        state = graph._get_or_create_state("t-dict")
+        idx = _scripted_step(graph, [[], []])
+
+        async for _ in graph.astream(
+            {"messages": [{"role": "user", "content": ASKS_SAVE_REPORT}]}, config
+        ):
+            pass
+
+        assert idx["n"] == 2, "nudge must fire for dict-shaped input"
+        assert len(_nudges(state)) == 1
+
+    @pytest.mark.asyncio
+    async def test_dict_shaped_multimodal_content_activates_nudge(self):
+        """The dict content may be a parts list (multimodal shape); the text
+        parts must still be scanned for the keyword."""
+        graph = _graph()
+        config = _config("t-parts")
+        state = graph._get_or_create_state("t-parts")
+        idx = _scripted_step(graph, [[], []])
+
+        async for _ in graph.astream(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Scan the fixture. {ASKS_SAVE_REPORT}"},
+                        ],
+                    }
+                ]
+            },
+            config,
+        ):
+            pass
+
+        assert idx["n"] == 2
+        assert len(_nudges(state)) == 1
+
+    @pytest.mark.asyncio
     async def test_save_report_call_suppresses_nudge(self):
         graph = _graph()
         config = _config("t2")
