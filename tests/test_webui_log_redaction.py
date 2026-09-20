@@ -136,6 +136,37 @@ class TestRedactionFilterShapes:
                 assert record.args[1] == f"/ws/agent?{wire}=[REDACTED]", wire
                 assert "SECRET" not in record.getMessage()
 
+    def test_value_with_literal_question_mark_redacts_whole(self):
+        """Red-team round: parse_qs does NOT split values at '?', so a key
+        with a literal '?' passes auth intact — truncating the value there
+        leaked ``api_key=?secret`` whole (the param never matched) and
+        ``api_key=abc?def`` as a plaintext tail. '?' now ends the value
+        only when followed by a param-shaped token."""
+        record = _record("uvicorn.error", WS_MSG, ("127.0.0.1:1", "/ws/agent?api_key=?s3cr3t"))
+        assert _ApiKeyRedactionFilter().filter(record) is True
+        assert record.args[1] == "/ws/agent?api_key=[REDACTED]"
+        assert "s3cr3t" not in record.getMessage()
+
+        record = _record("uvicorn.error", WS_MSG, ("127.0.0.1:1", "/ws/agent?api_key=abc?def"))
+        assert _ApiKeyRedactionFilter().filter(record) is True
+        assert record.args[1] == "/ws/agent?api_key=[REDACTED]"
+        assert "abc?def" not in record.getMessage()
+
+    def test_param_shaped_question_mark_still_separates(self):
+        """The '?' rule must not over-correct: a message-template
+        ``url=/x?api_key=…`` and concatenated ``ab?api_key=real`` keep the
+        api_key token separately matchable."""
+        record = _record("uvicorn.error", "connect: url=/x?api_key=k1&z=2", None)
+        assert _ApiKeyRedactionFilter().filter(record) is True
+        assert "api_key=[REDACTED]" in str(record.msg)
+        assert "k1" not in str(record.msg)
+        assert "z=2" in str(record.msg)
+
+        record = _record("uvicorn.access", ACCESS_MSG,
+                         ("127.0.0.1:1", "GET", "/x?url=/y?api_key=k1&z=2", "1.1", 200))
+        assert _ApiKeyRedactionFilter().filter(record) is True
+        assert record.args[2] == "/x?url=/y?api_key=[REDACTED]&z=2"
+
 
 class TestInstallFunction:
     # Dependency note (issue #84): handle() installs these filters BEFORE

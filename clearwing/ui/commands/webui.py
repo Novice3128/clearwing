@@ -16,20 +16,26 @@ class _ApiKeyRedactionFilter(logging.Filter):
     # A query parameter is `name=value`. The name charset (unreserved chars
     # + percent escapes) anchors the match INSIDE the parameter — a greedy
     # "anything but =" would swallow the path prefix ("/api/x?api_key") as
-    # part of the name. The value stops at '&' and whitespace (query
-    # grammar) and at '?' — a rendered request target carries '?' only as
-    # the path/query separator, so a value crossing it is really two params
-    # abutting ("url=/x?api_key=…" in a message template must not hide the
-    # api_key token). Matching is DECODE-AWARE, not spelling-enumeration:
-    # starlette's parse_qs percent-decodes param NAMES, so ANY encoded
-    # spelling that decodes to ``api_key`` passes auth (``api%5Fkey=``,
-    # ``%61pi_key=``, ``api_%6Bey=``, …) — enumerating spellings in the
-    # regex can never be complete. Instead every param-shaped token is
-    # decoded and compared to the exact name the auth reads
-    # (case-sensitive, matching parse_qs semantics); the WIRE spelling of
-    # the name is preserved in the redacted output. The value pattern
-    # requires at least one character: an empty value carries no secret.
-    _PARAM_RE = re.compile(r"([A-Za-z0-9%_.~\-]+)=([^&\s?]+)")
+    # part of the name. The value stops at '&', whitespace, and at a '?'
+    # ONLY when what follows is param-shaped (`name=`): a rendered request
+    # target normally carries '?' as the path/query separator (so
+    # "url=/x?api_key=…" in a message template must not hide the api_key
+    # token), but a VALUE containing a literal '?' is legal on the wire —
+    # parse_qs does not split values at '?' — and truncating there leaked
+    # `api_key=?secret` whole and `api_key=abc?def` as a tail (red-team
+    # round). Residual, disclosed: a key containing a literal "?name="
+    # shape is indistinguishable from abutting params and splits at it —
+    # the conservative (over-redaction) direction. Matching is
+    # DECODE-AWARE, not spelling-enumeration: starlette's parse_qs
+    # percent-decodes param NAMES, so ANY encoded spelling that decodes to
+    # ``api_key`` passes auth (``api%5Fkey=``, ``%61pi_key=``,
+    # ``api_%6Bey=``, …) — enumerating spellings in the regex can never be
+    # complete. Instead every param-shaped token is decoded and compared to
+    # the exact name the auth reads (case-sensitive, matching parse_qs
+    # semantics); the WIRE spelling of the name is preserved in the
+    # redacted output. The value pattern requires at least one character:
+    # an empty value carries no secret.
+    _PARAM_RE = re.compile(r"([A-Za-z0-9%_.~\-]+)=((?:[^?&\s]|\?(?![A-Za-z0-9%_.~\-]+=))+)")
     _REDACTED = "[REDACTED]"
     _AUTH_PARAM = "api_key"
 
