@@ -105,6 +105,15 @@ class TestRedactionFilterShapes:
         assert record.args[0] == "127.0.0.1:1"
         assert record.args[4] == 200
 
+    def test_percent_encoded_param_name_redacts(self):
+        """``?api%5Fkey=`` passes auth (starlette percent-decodes param names)
+        and must be redacted in its wire form — a literal ``api_key=`` regex
+        would leave this spelling in the clear."""
+        record = _record("uvicorn.error", WS_MSG, ("127.0.0.1:1", "/ws/agent?api%5Fkey=SECRET"))
+        assert _ApiKeyRedactionFilter().filter(record) is True
+        assert record.args[1] == "/ws/agent?api%5Fkey=[REDACTED]"
+        assert "SECRET" not in record.getMessage()
+
 
 class TestInstallFunction:
     # Dependency note (issue #84): handle() installs these filters BEFORE
@@ -132,6 +141,48 @@ class TestInstallFunction:
         _install_api_key_redaction()
         assert any(isinstance(f, _ApiKeyRedactionFilter) for f in access.filters)
         assert any(isinstance(f, _ApiKeyRedactionFilter) for f in error.filters)
+
+    def test_install_is_idempotent(self, uvicorn_loggers):
+        """A second handle() in the same process must not stack filter
+        instances (each install would re-scan every record)."""
+        access, error = uvicorn_loggers
+        _install_api_key_redaction()
+        _install_api_key_redaction()
+        assert sum(isinstance(f, _ApiKeyRedactionFilter) for f in access.filters) == 1
+        assert sum(isinstance(f, _ApiKeyRedactionFilter) for f in error.filters) == 1
+
+    def test_filters_survive_uvicorn_dictconfig(self, uvicorn_loggers):
+        """Pin the upgrade coupling asserted above: uvicorn.run applies its
+        LOGGING_CONFIG via dictConfig AFTER handle() installed the filters —
+        if a future uvicorn starts clearing pre-existing filters, this is the
+        test that says so instead of a silent log leak."""
+        import logging.config
+
+        import uvicorn.config
+
+        access, error = uvicorn_loggers
+        _install_api_key_redaction()
+        names = ("uvicorn", "uvicorn.access", "uvicorn.error")
+        snapshot = {
+            name: (
+                list(logging.getLogger(name).filters),
+                list(logging.getLogger(name).handlers),
+                logging.getLogger(name).level,
+                logging.getLogger(name).propagate,
+            )
+            for name in names
+        }
+        try:
+            logging.config.dictConfig(uvicorn.config.LOGGING_CONFIG)
+            assert any(isinstance(f, _ApiKeyRedactionFilter) for f in access.filters)
+            assert any(isinstance(f, _ApiKeyRedactionFilter) for f in error.filters)
+        finally:
+            for name, (filters, handlers, level, propagate) in snapshot.items():
+                logger = logging.getLogger(name)
+                logger.filters[:] = filters
+                logger.handlers[:] = handlers
+                logger.setLevel(level)
+                logger.propagate = propagate
 
     def test_installed_pipeline_redacts_websocket_line(self, uvicorn_loggers):
         """End-to-end through the uvicorn.error logger (filter installed the
