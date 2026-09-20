@@ -128,6 +128,7 @@ asyncio_mode = "strict"
 markers = [
     "integration: tests that require a Docker daemon; skipped in CI without Docker",
     "timeout(seconds): per-test time limit (enforced when pytest-timeout is installed)",
+    "requires_llm: test needs ambient real LLM credentials; exempt from the offline-env tripwire in tests/conftest.py",
 ]
 
 [tool.black]
