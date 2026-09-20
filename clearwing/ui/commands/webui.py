@@ -5,7 +5,7 @@ import re
 
 
 class _ApiKeyRedactionFilter(logging.Filter):
-    """Scrub ``api_key=<secret>`` from uvicorn access-log records.
+    """Scrub ``api_key=<secret>`` from uvicorn request-log records.
 
     The browser-compatible auth path is ``?api_key=`` (query param), and
     uvicorn logs the full path+query verbatim — without this filter every
@@ -13,20 +13,59 @@ class _ApiKeyRedactionFilter(logging.Filter):
     """
 
     _QUERY_RE = re.compile(r"(api_key=)[^&\s]+")
+    # ``api_key=`` followed by anything OTHER than the redaction marker —
+    # detects a live secret. A plain substring test cannot do this: the
+    # redacted form ``api_key=[REDACTED]`` still contains ``api_key=``, so a
+    # literal "still contains api_key=" check would collapse EVERY matching
+    # record (the original bug: it re-rendered the already-clean message and
+    # set args=None unconditionally).
+    _LEAK_RE = re.compile(r"api_key=(?!\[REDACTED\])[^&\s]")
 
     def filter(self, record: logging.LogRecord) -> bool:
         if "api_key=" not in record.getMessage():
             return True
-        if record.args:
+        if isinstance(record.args, tuple | list) and record.args:
+            # Main path: the secret sits inside one of the args — uvicorn
+            # access records use a 5-tuple (client, method, full_path,
+            # http_version, status) and the WebSocket accept/reject lines on
+            # uvicorn.error use a 2-tuple whose second element is the full
+            # path+query. Redact the string args IN PLACE and keep
+            # record.args in tuple shape: uvicorn's AccessFormatter unpacks
+            # record.args, so flattening to a pre-rendered msg with
+            # args=None raises TypeError in every handler and spams
+            # "--- Logging error ---" tracebacks instead of the line.
             record.args = tuple(
                 self._QUERY_RE.sub(r"\1[REDACTED]", arg) if isinstance(arg, str) else arg
                 for arg in record.args
             )
-        # Re-render in case the secret sits in msg itself rather than args.
-        if "api_key=" in record.getMessage():
-            record.msg = self._QUERY_RE.sub(r"\1[REDACTED]", record.getMessage())
-            record.args = None
+            if not self._LEAK_RE.search(record.getMessage()):
+                return True
+        # No args to redact (argless record), or the leak lives in the msg
+        # template itself rather than in any arg: collapse to a fully
+        # rendered, redacted message.
+        record.msg = self._QUERY_RE.sub(r"\1[REDACTED]", record.getMessage())
+        record.args = None
         return True
+
+
+def _install_api_key_redaction() -> None:
+    """Attach the redaction filter to both loggers uvicorn uses for URLs.
+
+    ``uvicorn.access`` carries the HTTP request lines, but the WebSocket
+    accept/reject lines (``... "WebSocket /ws/agent?api_key=..." [accepted]``)
+    are emitted on ``uvicorn.error`` (all three WS protocol impls route
+    through it) — installing on one logger only leaves the key in the clear
+    on the other.
+
+    NB: this must run BEFORE ``uvicorn.run``, and the filters survive
+    uvicorn's dictConfig by design — its LOGGING_CONFIG keeps
+    ``disable_existing_loggers=False`` and configures no ``filters`` key for
+    these loggers, so the dictConfig reset rebinds handlers but leaves
+    pre-existing logger-level filters attached.
+    """
+    redaction = _ApiKeyRedactionFilter()
+    logging.getLogger("uvicorn.access").addFilter(redaction)
+    logging.getLogger("uvicorn.error").addFilter(redaction)
 
 
 def add_parser(subparsers):
@@ -50,7 +89,7 @@ def handle(cli, args):
 
     from ..web import create_app
 
-    logging.getLogger("uvicorn.access").addFilter(_ApiKeyRedactionFilter())
+    _install_api_key_redaction()
 
     app = create_app()
 
