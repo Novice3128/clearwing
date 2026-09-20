@@ -108,6 +108,25 @@ def _streak_key(tool_name: str, tool_args: dict[str, Any]) -> str:
     return f"{tool_name}:{args_json}"
 
 
+# Exact registration name of the reporting tool (reporting_tools.py) — the
+# save_report nudge matches tool calls by this literal name.
+_SAVE_REPORT_TOOL = "save_report"
+
+
+def _turn_requests_save_report(messages: list[Any]) -> bool:
+    """True when the turn's incoming user messages mention ``save_report``.
+
+    e2e scenario prompts state the delivery contract explicitly ("produce
+    the report with save_report"), so the literal keyword is the activation
+    signal for the one-shot delivery nudge (issue #82).
+    """
+    for message in messages:
+        if getattr(message, "type", "") == "human":
+            if _SAVE_REPORT_TOOL in getattr(message, "text", ""):
+                return True
+    return False
+
+
 FLAG_PATTERNS = [
     re.compile(r"flag\{[^}]+\}", re.IGNORECASE),
     re.compile(r"FLAG\{[^}]+\}"),
@@ -371,7 +390,21 @@ class NativeAgentGraph:
             # (issue #23). Operator stop/cancel also deliberately preserve
             # spent budget: only new input resets.
             self._loop_counters.pop(thread_id, None)
+            turn_start = len(state.setdefault("messages", []))
             self._merge_input(state, input_data)
+            # Fresh logical turn, fresh counters. The save_report nudge keys
+            # (issue #82) ride in the SAME per-thread counter dict — same
+            # lifecycle as the budget: reset here, survive approval resumes,
+            # never graph state (issue #23 clobber rule). They are only
+            # created when this turn's user input actually asks for a
+            # save_report delivery, keeping the counter shape unchanged for
+            # every other turn. turn_start is recorded BEFORE the merge so it
+            # bounds exactly the messages this turn contributed.
+            fresh_counters: dict[str, int] = {"steps": 0, "tool_calls_total": 0}
+            if _turn_requests_save_report(state["messages"][turn_start:]):
+                fresh_counters["turn_start"] = turn_start
+                fresh_counters["save_report_nudged"] = 0
+            self._loop_counters[thread_id] = fresh_counters
             async for event in self._arun_loop(thread_id):
                 yield event
         except asyncio.CancelledError:
@@ -495,6 +528,30 @@ class NativeAgentGraph:
             last = state["messages"][-1]
             tool_calls = getattr(last, "tool_calls", []) or []
             if not tool_calls:
+                # One-shot save_report delivery nudge (issue #82): e2e
+                # scenario prompts require the report as a FILE via the
+                # save_report tool, but the model often ends the turn with a
+                # prose summary and zero calls — the runtime generates no
+                # report on its own and the model never sees the webui's
+                # report_path, so without a nudge the delivery is simply
+                # skipped. The last message is a text-only assistant step
+                # here, so appending a HumanMessage cannot orphan a
+                # tool_use.
+                if self._should_nudge_save_report(state, counters):
+                    counters["save_report_nudged"] = 1
+                    nudge = HumanMessage(
+                        content=(
+                            "Delivery reminder: this task explicitly asked for the "
+                            "report to be written with the save_report tool, but it has "
+                            "not been called in this turn. Call save_report now to "
+                            "write the report file, then wrap up. This reminder will "
+                            "not repeat."
+                        )
+                    )
+                    state.setdefault("messages", []).append(nudge)
+                    if self.event_bus:
+                        self.event_bus.emit_message(nudge.content, "warning")
+                    continue
                 break
             if max_tool_calls is not None:
                 budget_left = max_tool_calls - counters["tool_calls_total"]
@@ -541,6 +598,41 @@ class NativeAgentGraph:
                 yield event
             if paused or halted:
                 break
+
+    def _should_nudge_save_report(
+        self, state: dict[str, Any], counters: dict[str, int]
+    ) -> bool:
+        """Gate for the one-shot save_report nudge (issue #82).
+
+        Fires only when ALL hold: this turn's user input asked for a
+        save_report delivery (recorded at turn start as the ``turn_start``
+        counter key — absent means the turn never mentioned it, e.g. loops
+        entered without new user input), the turn has made zero
+        save_report tool calls so far, the latch is unset, and both budgets
+        still have room — with max_steps spent the loop would break before
+        answering the nudge, and with the tool-call budget spent the nudged
+        save_report call would only be answered as skipped (mirroring the
+        max_tool_calls stop), so the nudge would burn a round for nothing.
+        """
+        turn_start = counters.get("turn_start")
+        if turn_start is None or counters.get("save_report_nudged"):
+            return False
+        limits = self.agent_limits
+        if limits is not None:
+            if limits.max_steps is not None and counters["steps"] >= limits.max_steps:
+                return False
+            if (
+                limits.max_tool_calls is not None
+                and counters["tool_calls_total"] >= limits.max_tool_calls
+            ):
+                return False
+        messages = state.get("messages", [])
+        # Clamp against context compaction shortening the history mid-turn.
+        for message in messages[min(turn_start, len(messages)) :]:
+            for call in getattr(message, "tool_calls", None) or []:
+                if str(getattr(call, "fn_name", "") or "") == _SAVE_REPORT_TOOL:
+                    return False
+        return True
 
     def _thread_for_state(self, state: dict[str, Any]) -> str:
         """The thread_id owning *state* (issues #37/#52).
