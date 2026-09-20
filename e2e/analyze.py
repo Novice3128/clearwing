@@ -254,13 +254,19 @@ def evaluate(summary: dict, fm: dict, tier_name: str, audit: dict | None,
                 + (f" — MISSING {missing} llm_call(s) from audit" if missing > 0 else ""))
 
     if flag_max is not None and tier_name == "full":
-        faces = summary.get("flag_faces")
+        # Issue #83: gate on the UNIQUE count — LLM responses that quote a
+        # flag batch back are re-detected byte-identically (16 = 14 distinct
+        # + 2 echoes on 2026-09-20), so the raw count double-bills echoes.
+        # Older summaries without the unique field fall back to the raw.
+        raw = summary.get("flag_faces")
+        faces = summary.get("flag_faces_unique", raw)
         if faces is not None:
             # baseline 9 measured same-build spread 8↔14 (2026-09-18) — a
             # hard <=9 gate flagged pure #35-family volatility; the range
             # keeps the drift ceiling without the noise
             add("flag-faces-max", faces <= flag_max,
-                f"faces={faces} max={flag_max} (observed same-build spread 8-14)")
+                f"unique={faces} raw={raw} max={flag_max} "
+                f"(observed same-build spread 8-14)")
     if hud and hud.get("type") == "hud":
         add("hud-render-match", hud.get("pass", False), str(hud))
 
@@ -426,6 +432,7 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
             if s.get("tokens_in") else None,
             "dup": fm.get("dup_pairs"), "late": fm.get("late_frames"),
             "memory": s.get("memory"), "flag_faces": s.get("flag_faces"),
+            "flag_faces_unique": s.get("flag_faces_unique"),
             "audit": audit, "gates": [g for g in gates if not g["pass"]
                                       and g["severity"] != "skip"],
         })
@@ -509,14 +516,15 @@ def render(run_dir: Path, tier_name: str, ver: dict, cleanup: list) -> dict:
         f"- verdict: **{overall}** — {verdict_line}",
         lines_hint,
         "",
-        "| scenario | sid | s | statuses | err | $ | cache% | dup | late | flags | mem | failed gates |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| scenario | sid | s | statuses | err | $ | cache% | dup | late | flags | uniq | mem | failed gates |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
             f"| {r['name']} | {r['sid'] or '-'} | {r['seconds'] or '-'} | {r['statuses']} | "
             f"{r['errors']} | {r['cost'] if r['cost'] is not None else '-'} | {r['cache_pct'] if r['cache_pct'] is not None else '-'} | "
             f"{r['dup']} | {r['late']} | {r['flag_faces'] if r['flag_faces'] is not None else '-'} | "
+            f"{r['flag_faces_unique'] if r['flag_faces_unique'] is not None else '-'} | "
             f"{r['memory'] or '-'} | "
             f"{'; '.join(g['gate'] + ':' + str(g['detail'])[:60] for g in r['gates']) or '—'} |")
     lines += ["", f"- frame-type census: `{json.dumps(census, ensure_ascii=False)}` "

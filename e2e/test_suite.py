@@ -690,6 +690,27 @@ def test_flag_max_range_gate():
     assert next(g for g in gates if g["gate"] == "flag-faces-max")["pass"] is False
 
 
+def test_flag_max_gate_compares_unique_faces():
+    """#83: 2026-09-20 t2 saw 16 raw = 14 distinct batch faces + 2 byte-identical
+    LLM echoes re-detected. The gate compares the per-scenario UNIQUE set;
+    the raw count stays reported for continuity. Old summaries without the
+    unique field fall back to the raw count."""
+    summary = {"status": None, "invariants": {"terminal_closure": True,
+                                              "approval_closure": True,
+                                              "no_complete_while_approval_open": True},
+               "approvals": 0, "error_count": 0, "cost_updates": 0,
+               "complete_statuses": ["ok"],
+               "flag_faces": 16, "flag_faces_unique": 14}
+    fm = {"statuses": ["ok"], "dup_pairs": 0, "late_frames": 0}
+    gates = analyze.evaluate(summary, fm, "full", audit=None, hud=None, flag_max=15)
+    gate = next(g for g in gates if g["gate"] == "flag-faces-max")
+    assert gate["pass"] is True and "unique=14" in gate["detail"]
+    # unique is authoritative both ways: fewer raw than unique still fails
+    gates = analyze.evaluate(dict(summary, flag_faces=14, flag_faces_unique=16),
+                             fm, "full", audit=None, hud=None, flag_max=15)
+    assert next(g for g in gates if g["gate"] == "flag-faces-max")["pass"] is False
+
+
 def test_partial_run_trend_suppressed(monkeypatch, tmp_path):
     """G7: --only subset vs whole-tier baseline is apples-to-oranges — the
     2026-09-18 n=2 run took 2 spurious trend FAILs from it."""
