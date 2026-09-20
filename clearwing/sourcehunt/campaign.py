@@ -373,6 +373,9 @@ class CampaignRunner:
                     max_parallel=max_par,
                     campaign_hint=target.campaign_hint or self.config.campaign_hint,
                     parent_session_id=ps.session_id,
+                    # Issue #78: the campaign minted ps.session_id itself and
+                    # nothing else reclaims that bucket — the runner owns it.
+                    owns_parent_session=True,
                     prompt_mode=self.config.prompt_mode,
                     output_dir=str(self._checkpoint_dir),
                     enable_findings_pool=True,

@@ -905,6 +905,7 @@ class TestSpecialistAudit:
         tmp_path,
         *,
         parent_session_id: str | None = None,
+        owns_parent_session: bool = False,
         usage: Usage | None = None,
     ) -> tuple[SourceHuntRunner, Path]:
         audit_home = tmp_path / "audit-home"
@@ -930,6 +931,7 @@ class TestSpecialistAudit:
             depth="quick",
             output_dir=str(tmp_path / "out"),
             parent_session_id=parent_session_id,
+            owns_parent_session=owns_parent_session,
             enable_knowledge_graph=False,
             enable_mechanism_memory=False,
         )
@@ -1340,6 +1342,72 @@ class TestSpecialistAudit:
         with pytest.raises(RuntimeError, match="proof flow exploded"):
             asyncio.run(runner3.arun())
         assert runner3._session_id in forgotten
+
+    def _spy_on_forget(self, monkeypatch) -> list[str]:
+        forgotten: list[str] = []
+        original_forget = CostTracker.forget_session
+
+        def _forget_spy(tracker_self, session_id):
+            forgotten.append(session_id)
+            original_forget(tracker_self, session_id)
+
+        monkeypatch.setattr(CostTracker, "forget_session", _forget_spy)
+        return forgotten
+
+    def test_owned_parent_session_reclaims_parent_bucket(self, monkeypatch, tmp_path):
+        """Issue #78: campaign/eval runners OWN the execution id they pass
+        as ``parent_session_id`` (they minted it themselves and nothing
+        else reclaims it). With ``owns_parent_session=True`` the run-end
+        finally forgets that bucket too — before #78 every campaign child
+        leaked one ``_session_totals`` entry in the process-global tracker
+        for the CLI process's lifetime."""
+        parent = "campaign-x"
+        forgotten = self._spy_on_forget(monkeypatch)
+        runner, audit_home = self._make_booked_runner(
+            monkeypatch, tmp_path, parent_session_id=parent, owns_parent_session=True
+        )
+        assert runner._session_id == parent
+        assert runner._session_id_minted is True
+
+        # Book one real specialist call under the parent id (the booked
+        # view's fallback) so the bucket holds a non-zero total first.
+        view = runner._get_native_client("hunter", self._real_client(), budget_stage="hunt")
+        asyncio.run(view.aask_text(system="s", user="u"))
+        assert CostTracker().session_total(parent) > 0.0
+        assert len(_llm_cost_rows(_audit_rows(audit_home, parent))) == 1
+
+        def _explode():
+            raise RuntimeError("pipeline exploded")
+
+        monkeypatch.setattr(runner, "_preprocess", _explode)
+        with pytest.raises(RuntimeError, match="pipeline exploded"):
+            asyncio.run(runner.arun())
+
+        # The OWNED parent bucket was reclaimed on the failure path.
+        assert parent in forgotten
+        assert CostTracker().session_total(parent) == 0.0
+        # The disk audit trail survives the forget (audit file is the
+        # source of truth post-hoc).
+        assert len(_llm_cost_rows(_audit_rows(audit_home, parent))) == 1
+
+    def test_external_parent_bucket_keeps_default_lifecycle(self, monkeypatch, tmp_path):
+        """Issue #78: the default (``owns_parent_session=False``) keeps the
+        pre-#78 semantics — a parent id passed by an EXTERNAL owner (webui
+        socket teardown, operator job) is never forgotten by the child."""
+        parent = f"webui-{uuid.uuid4().hex[:8]}"
+        forgotten = self._spy_on_forget(monkeypatch)
+        runner, _ = self._make_booked_runner(monkeypatch, tmp_path, parent_session_id=parent)
+        assert runner._session_id_minted is False
+
+        def _explode():
+            raise RuntimeError("pipeline exploded")
+
+        monkeypatch.setattr(runner, "_preprocess", _explode)
+        with pytest.raises(RuntimeError, match="pipeline exploded"):
+            asyncio.run(runner.arun())
+
+        assert parent not in forgotten
+        assert runner._session_id == parent
 
     def test_run_belt_and_braces_reclaim(self, monkeypatch, tmp_path):
         """run() adds an idempotent reclaim after arun — even a stubbed

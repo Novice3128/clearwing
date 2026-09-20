@@ -9,6 +9,65 @@ from dataclasses import asdict
 from typing import Any
 from urllib.parse import urlsplit
 
+logger = logging.getLogger(__name__)
+
+
+def _mint_cli_book_id(kind: str) -> str:
+    """Mint a CLI pipeline bookkeeping id: ``sh-<kind>-<uuid8>`` (issue #76).
+
+    Same mint convention as the runner's ``sh-<uuid8>`` execution ids, with
+    the pipeline kind spelled out so the audit directory is self-describing
+    (``audit/sh-retro-ab12cd34/``).
+    """
+    import uuid
+
+    return f"sh-{kind}-{uuid.uuid4().hex[:8]}"
+
+
+def _booked_cli_client(llm: Any, *, agent: str, session_id: str) -> Any:
+    """Attach single-entry LLM metering to a runner-external CLI pipeline (issue #76).
+
+    Retro-hunt, n-day, reveng, and both elaborate modes used to grab
+    ``provider_manager.get_native_client("default")`` raw — every call ran
+    unmetered (no CostTracker bucket, no audit row). This mirrors the
+    runner's ``_get_native_client`` booking: a ``with_bookkeeping`` copy
+    view that books BOTH halves (tracker + audit row, same id) per
+    successful ``achat`` under *session_id* with the *agent* role tag.
+    The isinstance gate keeps test doubles untouched — AsyncMock/MagicMock
+    synthesize a ``with_bookkeeping`` attribute, so a hasattr gate would
+    wrap them (the same seam the runner keeps before booking).
+    """
+    from clearwing.llm.native import AsyncLLMClient
+    from clearwing.observability.bookkeeping import init_session_audit_logger
+    from clearwing.observability.telemetry import CostTracker
+
+    if not isinstance(llm, AsyncLLMClient):
+        return llm
+    return llm.with_bookkeeping(
+        agent=agent,
+        session_id=session_id,
+        tracker=CostTracker(),
+        audit_logger=init_session_audit_logger(session_id),
+    )
+
+
+def _reclaim_cli_cost_bucket(session_id: str) -> None:
+    """Forget a CLI-minted CostTracker bucket; never raises (issue #76).
+
+    Hunter-arun doctrine: the reclaim is best-effort cleanup — the CLI
+    process exits right after anyway, but long-lived hosts (tests) must
+    not leak ``_session_totals`` entries. The disk audit trail and any
+    already-emitted COST_UPDATE frames survive the forget.
+    """
+    from clearwing.observability.telemetry import CostTracker
+
+    try:
+        CostTracker().forget_session(session_id)
+    except Exception:
+        logger.warning(
+            "Failed to reclaim CLI pipeline cost bucket %s", session_id, exc_info=True
+        )
+
 
 def _format_budget(budget: float) -> str:
     if budget <= 0:
@@ -848,13 +907,21 @@ def handle(cli, args):
             sys.exit(1)
 
         cli.console.print(f"[bold blue]Retro-hunting {args.retro_hunt} in {args.repo}[/bold blue]")
-        hunter = RetroHunter(llm=llm)
-        result = hunter.hunt(
-            cve_id=args.retro_hunt,
-            patch_source=args.patch_source,
-            target_repo_path=args.local_path or args.repo,
-            repo_path_for_git_source=args.patch_repo or args.local_path or args.repo,
+        # Issue #76: book the rule-gen LLM spend under a CLI-minted id and
+        # reclaim the bucket when the hunt ends.
+        book_id = _mint_cli_book_id("retro")
+        hunter = RetroHunter(
+            llm=_booked_cli_client(llm, agent="retro_hunt", session_id=book_id)
         )
+        try:
+            result = hunter.hunt(
+                cve_id=args.retro_hunt,
+                patch_source=args.patch_source,
+                target_repo_path=args.local_path or args.repo,
+                repo_path_for_git_source=args.patch_repo or args.local_path or args.repo,
+            )
+        finally:
+            _reclaim_cli_cost_bucket(book_id)
         cli.console.print("\n[bold]Retro-hunt complete[/bold]")
         cli.console.print(f"  CVE: {result.cve_id}")
         cli.console.print(f"  Rule: {result.rule_description}")
@@ -911,14 +978,20 @@ def handle(cli, args):
             f"(budget={args.nday_budget})[/bold blue]"
         )
 
+        # Issue #76: book the filter/exploit LLM spend under a CLI-minted id
+        # and reclaim the bucket when the pipeline ends.
+        book_id = _mint_cli_book_id("nday")
         pipeline = NdayPipeline(
-            llm=llm,
+            llm=_booked_cli_client(llm, agent="nday", session_id=book_id),
             repo_path=args.local_path or args.repo,
             budget_band=args.nday_budget,
             project=args.repo,
             output_dir=args.output_dir,
         )
-        result = asyncio.run(pipeline.arun(candidates))
+        try:
+            result = asyncio.run(pipeline.arun(candidates))
+        finally:
+            _reclaim_cli_cost_bucket(book_id)
 
         cli.console.print("\n[bold]N-day pipeline complete[/bold]")
         cli.console.print(f"  Total CVEs: {result.total_cves}")
@@ -965,15 +1038,21 @@ def handle(cli, args):
             f"(arch={args.arch}, budget={args.reveng_budget})[/bold blue]"
         )
 
+        # Issue #76: book the decompiler/exploit LLM spend under a CLI-minted
+        # id and reclaim the bucket when the pipeline ends.
+        book_id = _mint_cli_book_id("reveng")
         pipeline = RevengPipeline(
-            llm=llm,
+            llm=_booked_cli_client(llm, agent="reveng", session_id=book_id),
             binary_path=os.path.abspath(binary_path),
             arch=args.arch,
             budget_band=args.reveng_budget,
             output_dir=args.output_dir,
             project_name=os.path.basename(binary_path),
         )
-        result = asyncio.run(pipeline.arun())
+        try:
+            result = asyncio.run(pipeline.arun())
+        finally:
+            _reclaim_cli_cost_bucket(book_id)
 
         cli.console.print("\n[bold]Reveng pipeline complete[/bold]")
         cli.console.print(f"  Binary: {result.binary_path}")
@@ -1679,6 +1758,11 @@ def _run_elaborate_interactive(cli, args, finding, session_id, endpoint, provide
         cli.console.print(f"[red]Could not build LLM: {e}[/red]")
         sys.exit(1)
 
+    # Issue #76: book the HITL elaboration turns under the same
+    # HunterContext-shaped id the elaboration tools already use.
+    book_id = f"elaborate-hitl-{session_id}"
+    llm = _booked_cli_client(llm, agent="elaboration", session_id=book_id)
+
     system_prompt = _build_elaboration_prompt(finding)
     from clearwing.llm import ChatMessage
     from clearwing.llm.native import response_text
@@ -1747,22 +1831,27 @@ def _run_elaborate_interactive(cli, args, finding, session_id, endpoint, provide
 
         return assistant_text
 
-    while True:
-        try:
-            user_input = Prompt.ask("[bold green]You[/bold green]")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if user_input.strip().lower() in ("quit", "exit", "done"):
-            break
-        if not user_input.strip():
-            continue
+    # Issue #76: reclaim the minted bucket when the interactive session
+    # ends, whichever way it exits (quit, EOF, or an exception mid-turn).
+    try:
+        while True:
+            try:
+                user_input = Prompt.ask("[bold green]You[/bold green]")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if user_input.strip().lower() in ("quit", "exit", "done"):
+                break
+            if not user_input.strip():
+                continue
 
-        result_text = asyncio.run(_chat_turn(user_input))
-        if result_text:
-            cli.console.print(f"\n[bold blue]Assistant[/bold blue]: {result_text}\n")
+            result_text = asyncio.run(_chat_turn(user_input))
+            if result_text:
+                cli.console.print(f"\n[bold blue]Assistant[/bold blue]: {result_text}\n")
 
-        if ctx.elaboration_result is not None:
-            break
+            if ctx.elaboration_result is not None:
+                break
+    finally:
+        _reclaim_cli_cost_bucket(book_id)
 
     if ctx.elaboration_result is not None:
         ctx.elaboration_result.human_guided = True
@@ -1804,8 +1893,14 @@ def _run_elaborate_auto(cli, args, targets, session_id, endpoint, provider_manag
         cli.console.print(f"[red]Could not build LLM: {e}[/red]")
         sys.exit(1)
 
+    # Issue #76: book the autonomous elaboration runs under an
+    # elaborate-auto-<session> id — session-level bucket by design (the
+    # internal per-finding HunterContext ids `elaborate-<fid>` are distinct),
+    # unlike HITL which reuses its HunterContext id verbatim — and reclaim
+    # the bucket when the batch ends.
+    book_id = f"elaborate-auto-{session_id}"
     agent = ElaborationAgent(
-        llm=llm,
+        llm=_booked_cli_client(llm, agent="elaboration", session_id=book_id),
         output_dir=args.output_dir,
         project_name=args.repo.split("/")[-1] if args.repo else "target",
     )
@@ -1829,7 +1924,10 @@ def _run_elaborate_auto(cli, args, targets, session_id, endpoint, provider_manag
                 cli.console.print(f"  Blocking: {', '.join(result.blocking_mitigations)}")
         return results
 
-    results = asyncio.run(_run_all())
+    try:
+        results = asyncio.run(_run_all())
+    finally:
+        _reclaim_cli_cost_bucket(book_id)
 
     out_dir = os.path.join(args.output_dir, session_id, "elaborations")
     os.makedirs(out_dir, exist_ok=True)

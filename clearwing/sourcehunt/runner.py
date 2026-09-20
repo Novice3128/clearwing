@@ -317,6 +317,9 @@ class SourceHuntRunner:
         exploiter_llm: Any = None,
         sandbox_factory: Any = None,  # callable[[], SandboxContainer]
         parent_session_id: str | None = None,
+        # Issue #78: True when the CALLER minted parent_session_id itself
+        # and no one else will reclaim that bucket (campaign/eval runners).
+        owns_parent_session: bool = False,
         resume_session_id: str | None = None,
         checkpoint: dict[str, Any] | str | None = None,
         checkpoint_path: str | Path | None = None,
@@ -650,12 +653,17 @@ class SourceHuntRunner:
                 raise ValueError(f"Sourcehunt session {resume_session_id!r} does not exist")
         self._resuming = resume_session_id is not None
         self._session_id = resume_session_id or parent_session_id or f"sh-{uuid.uuid4().hex[:8]}"
-        # Specialist metering (issue #64): only a sh-* id WE minted may be
-        # forgotten from the process-global CostTracker when the run ends —
-        # a resume/parent id's bucket belongs to its owner (webui socket
-        # teardown, operator job, the resumed session). Hunter arun doctrine.
+        # Specialist metering (issues #64/#78): only an id WE minted — or a
+        # parent id we OWN (campaign/eval runners mint their child execution
+        # ids themselves and pass owns_parent_session=True, because nobody
+        # else reclaims that bucket) — may be forgotten from the
+        # process-global CostTracker when the run ends. A resume id or an
+        # externally-owned parent id (webui socket teardown, operator job,
+        # the resumed session) keeps its bucket; its lifecycle belongs to
+        # its owner. Hunter arun doctrine.
         self._session_id_minted = (
-            resume_session_id is None and parent_session_id is None
+            resume_session_id is None
+            and (parent_session_id is None or owns_parent_session)
         )
         self._checkpoint_path = (
             Path(checkpoint_path)
@@ -4065,15 +4073,17 @@ class SourceHuntRunner:
         return self._session_audit_logger
 
     def _reclaim_minted_cost_bucket(self) -> None:
-        """Forget the runner's minted sh-* CostTracker bucket (issue #64).
+        """Forget the runner's minted CostTracker bucket (issues #64/#78).
 
         Without this, every standalone run leaks one ``_session_totals``/
         ``_session_tokens`` entry in the process-global tracker forever
-        (campaign mode runs many). Only the id WE minted is dropped — a
-        resume/parent id's bucket lifecycle belongs to its owner, exactly
-        like the hunter's arun reclaim. Cleanup never raises (a failed
-        reclaim is logged, not propagated) and the disk audit trail plus
-        already-emitted COST_UPDATE frames survive the forget.
+        (campaign mode runs many). Only the id WE minted — or a parent id
+        we own via ``owns_parent_session`` (issue #78: campaign/eval mint
+        their child execution ids and never reclaim them) — is dropped; a
+        resume/external-parent id's bucket lifecycle belongs to its owner,
+        exactly like the hunter's arun reclaim. Cleanup never raises (a
+        failed reclaim is logged, not propagated) and the disk audit trail
+        plus already-emitted COST_UPDATE frames survive the forget.
         """
         if not self._session_id_minted:
             return
