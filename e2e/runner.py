@@ -249,6 +249,10 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
     containers: set[str] = set()
     flag_frames = 0
     flag_faces = 0
+    # Issue #83: LLM responses that quote a flag batch back get re-detected
+    # byte-identically — the raw count double-bills those echoes. The gate
+    # compares the UNIQUE set; the raw count stays for continuity.
+    flags_seen: set[str] = set()
     completes_without_status = 0
     complete_while_approval_open = 0
     busy_rejects = 0
@@ -386,7 +390,19 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
             elif t == "flag_found":
                 flag_frames += 1
                 flags = d.get("flags")
-                flag_faces += len(flags) if isinstance(flags, list) else 1
+                if isinstance(flags, list):
+                    flag_faces += len(flags)
+                    # Tool-result frames carry {"flags": [{"flag","pattern"}...]}.
+                    for item in flags:
+                        key = item.get("flag") if isinstance(item, dict) else item
+                        flags_seen.add(str(key))
+                else:
+                    flag_faces += 1
+                    # LLM-response frames carry the SINGULAR "flag" key with
+                    # no "flags" list — keying by flag text either way makes
+                    # an echo of a batch face dedup against its original
+                    # (same text, different frame shape).
+                    flags_seen.add(str(d.get("flag", flags)))
             elif t == "stopped":
                 stopped_payload = d
             elif t == "complete":
@@ -427,6 +443,7 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
         "reply_chars": len(text), "reply_tail": text[-500:],
         "approval_open_at_end": approval_open, "flag_frames": flag_frames,
         "flag_faces": flag_faces,
+        "flag_faces_unique": len(flags_seen),
         "pending_approvals_at_end": len(pending_decisions),
         "busy_rejects": busy_rejects,
         "completes_without_status": completes_without_status,
