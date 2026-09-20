@@ -392,10 +392,17 @@ async def ws_run(ws_url: str, keyfile: Path, target: str, prompt: str, out_prefi
                 flags = d.get("flags")
                 if isinstance(flags, list):
                     flag_faces += len(flags)
-                    flags_seen.update(str(f) for f in flags)
+                    # Tool-result frames carry {"flags": [{"flag","pattern"}...]}.
+                    for item in flags:
+                        key = item.get("flag") if isinstance(item, dict) else item
+                        flags_seen.add(str(key))
                 else:
                     flag_faces += 1
-                    flags_seen.add(repr(flags))
+                    # LLM-response frames carry the SINGULAR "flag" key with
+                    # no "flags" list — keying by flag text either way makes
+                    # an echo of a batch face dedup against its original
+                    # (same text, different frame shape).
+                    flags_seen.add(str(d.get("flag", flags)))
             elif t == "stopped":
                 stopped_payload = d
             elif t == "complete":

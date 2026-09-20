@@ -110,6 +110,10 @@ tiers:
       - {name: probe-partial-fill, type: probe_partial_fill}
       - {name: report-cli, type: report_cli}
     analysis:
+      # caliber note (#83): the spread 8-14 above was observed on the RAW
+      # count; the gate compares flag_faces_unique (raw fallback) — echoes
+      # no longer count, so the effective ceiling on distinct faces keeps
+      # this max pending the product-side FP recalibration on #83.
       flag_max: 15                 # same-build spread 8-14 observed 2026-09-18; baseline 9 kept as history
       fact_check_samples: 3       # MANUAL R3 report fact-check (not automated)
 
