@@ -1,7 +1,7 @@
 # Web API — `/ws/agent` event schema
 
 The Clearwing web UI backend (`clearwing.ui.web.app`, started by
-`clearwing serve`) exposes a FastAPI server with a single real-time
+`clearwing webui`) exposes a FastAPI server with a single real-time
 WebSocket endpoint. Commit `dd5f093` wired the in-process
 [`EventBus`](architecture.md) into that WebSocket so external
 consumers (dashboards, CI tailers, custom TUIs) can follow campaign /
@@ -17,7 +17,7 @@ unless the underlying payload type is genuinely `T | None`.
 
 | | |
 |---|---|
-| URL | `ws://<host>:<port>/ws/agent` (default host/port: whatever `clearwing serve` binds to) |
+| URL | `ws://<host>:<port>/ws/agent` (default host/port: whatever `clearwing webui` binds to (default port 8899)) |
 | Subprotocol | none — plain JSON-text frames |
 | Auth | none when `CLEARWING_WEB_API_KEY` is unset. When set, the socket must present the key either as an `X-API-Key` header or as an `?api_key=` query parameter (browsers cannot set WebSocket headers, so the served frontend uses the query parameter, forwarding it from the page URL). Unauthorized sockets are closed with code `1008` before being accepted. |
 | CORS | `allow_origins=["*"]` — the frontend is served from the same FastAPI app |
