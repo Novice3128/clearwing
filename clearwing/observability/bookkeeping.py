@@ -32,8 +32,11 @@ from clearwing.observability.telemetry import CostTracker
 if TYPE_CHECKING:  # pragma: no cover
     # Duck-typed at runtime: anything exposing log_llm_call(model=...,
     # input_tokens=..., output_tokens=..., cost_usd=..., cached_tokens=...,
-    # agent=...) works — keeps this module import-cycle-free from
-    # clearwing.safety.audit (which lazily imports clearwing.core.config).
+    # agent=..., component=...) works — keeps this module import-cycle-free
+    # from clearwing.safety.audit (which lazily imports clearwing.core.config).
+    # A duck-typed logger missing the component kwarg would TypeError inside
+    # the try/except and silently drop the audit half — keep this signature
+    # in sync with AuditLogger.log_llm_call.
     from clearwing.safety.audit import AuditLogger
 
 logger = logging.getLogger(__name__)
@@ -63,6 +66,38 @@ def _endpoint_pricing_row(pricing: Any) -> dict[str, float] | None:
     return {"input": row_input, "output": row_output, "cached_input": row_cached}
 
 
+# component = the subsystem an LLM call belongs to, for audit↔map queries.
+# Single source of truth; cross-referenced tables that must NOT drift:
+#   - clearwing/sourcehunt/runner.py::_SPECIALIST_BOOK_ROLES (stage→agent tag)
+#   - clearwing/providers/roles.py::TASK_ROLES (different key space: nday_filter/reveng_analysis)
+# The agent-role namespace is OPEN (_specialist_book_role passes unknown
+# stages through verbatim) — unknown roles map to "unmapped" so the
+# component key is ALWAYS present with a fixed shape.
+_AGENT_COMPONENTS = {
+    "main": "agent-runtime",
+    "summarizer": "agent-runtime",  # dual-homed: sourcehunt hunter path emits this too — disambiguate by session_id (sh-*/<sid>-<8hex> = sourcehunt)
+    "operator": "agent-runtime",
+    "hunter": "sourcehunt",
+    "patcher": "sourcehunt",
+    "exploiter": "sourcehunt",
+    "variant": "sourcehunt",
+    "harness": "sourcehunt",
+    "stability": "sourcehunt",
+    "mechanism": "sourcehunt",
+    "proof": "sourcehunt",
+    "verifier": "sourcehunt",
+    "bench": "bench",
+    "retro_hunt": "cli-pipelines",
+    "nday": "cli-pipelines",
+    "reveng": "cli-pipelines",
+    "elaboration": "cli-pipelines",
+    # Live verbatim-fallthrough stage (not a _SPECIALIST_BOOK_ROLES key):
+    # the ranker books under stage "rank" (runner.py _get_native_client
+    # budget_stage="rank" → _specialist_book_role passes it through).
+    "rank": "sourcehunt",
+}
+
+
 def book_llm_call(
     input_tokens: int,
     output_tokens: int,
@@ -75,6 +110,7 @@ def book_llm_call(
     provider: str | None = None,
     session_id: str | None = None,
     agent: str = "main",
+    component: str | None = None,
     pricing: Any = None,
 ) -> float:
     """Record one LLM call in the cost tracker AND the audit log.
@@ -98,6 +134,14 @@ def book_llm_call(
       have no PRICING entry the table would silently bill Sonnet rates
       and diverge from the spend ledger. ``None``/invalid falls back to
       the table (with the usual one-time warning).
+    - ``component`` overrides the ``details["component"]`` subsystem tag
+      on the audit row. When ``None`` (the normal case) it resolves via
+      ``_AGENT_COMPONENTS`` from *agent*, falling back to ``"unmapped"``
+      — the key is ALWAYS present, never None, never omitted. The audit
+      row's ``details`` dict is otherwise free-form; the reconciliation
+      contract only reads ``details["cost_usd"]``, and audit rows from
+      BEFORE this key existed are legacy rows (no key) that analysis
+      tooling treats as ``"unmapped"``.
     - Audit writes must never break cost tracking; failures are logged and
       swallowed (same doctrine as telemetry's EventBus emit).
     """
@@ -127,6 +171,7 @@ def book_llm_call(
                 cost_usd=cost,
                 cached_tokens=cached_tokens,
                 agent=agent,
+                component=component or _AGENT_COMPONENTS.get(agent, "unmapped"),
             )
         except Exception:
             logger.warning("audit llm_call write failed", exc_info=True)

@@ -101,6 +101,8 @@ class AuditLogger:
         cost_usd: float,
         agent: str = "main",
         cached_tokens: int = 0,
+        *,
+        component: str | None = None,
     ) -> AuditEntry:
         """Log an LLM API call.
 
@@ -108,6 +110,9 @@ class AuditLogger:
         tracker's process-wide running total, which double-counts when audit
         rows are summed per session (issue #10). ``cached_tokens`` is the
         subset of input tokens served from the provider's prompt cache.
+        ``component`` is the subsystem tag for audit↔map queries; it
+        degrades to ``"unmapped"`` so the key always exists with a fixed
+        shape (rows written before the key existed are legacy rows).
         """
         return self.log(
             "llm_call",
@@ -118,6 +123,7 @@ class AuditLogger:
                 "output_tokens": output_tokens,
                 "cached_tokens": cached_tokens,
                 "cost_usd": cost_usd,
+                "component": component or "unmapped",
             },
         )
 

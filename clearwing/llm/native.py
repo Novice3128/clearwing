@@ -1015,6 +1015,7 @@ class AsyncLLMClient:
         # None on the base client — only views carry them.
         self._book_agent: str | None = None
         self._book_session_id: str | None = None
+        self._book_component: str | None = None
         self._book_tracker: CostTracker | None = None
         # Review round (reconciliation contract): the audit row must land
         # under the SAME resolved id as the tracker bucket, so a view holds
@@ -1078,6 +1079,7 @@ class AsyncLLMClient:
         session_id: str | None,
         tracker: CostTracker | None,
         audit_logger: AuditLogger | None,
+        component: str | None = None,
     ) -> AsyncLLMClient:
         """Return a metered view that books every successful call (issue #64).
 
@@ -1109,6 +1111,11 @@ class AsyncLLMClient:
         bound = copy.copy(self)
         bound._book_agent = agent
         bound._book_session_id = session_id
+        # Component override for the audit row's subsystem tag; None means
+        # book_llm_call resolves it from *agent* via _AGENT_COMPONENTS.
+        # Deliberately does NOT touch _book_agent — the hunter's double-
+        # booking guard and runner analytics continuity key on that.
+        bound._book_component = component
         bound._book_tracker = tracker
         bound._book_audit_loggers = {}
         if session_id is not None:
@@ -1207,6 +1214,8 @@ class AsyncLLMClient:
                 provider=self.provider_name,
                 session_id=session_id,
                 agent=self._book_agent or "main",
+                # None → book_llm_call maps *agent* via _AGENT_COMPONENTS.
+                component=self._book_component,
                 # Codex PR-69 r1: price with the endpoint's authoritative
                 # rates (the same self.pricing the spend ledger uses) so
                 # tracker/audit totals cannot diverge from the ledger on
