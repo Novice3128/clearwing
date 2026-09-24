@@ -77,9 +77,12 @@ The two unauthenticated ones relevant to orchestration:
 
 `Auth: key` means the request must carry `CLEARWING_WEB_API_KEY` as an
 `X-API-Key` header or `?api_key=` query parameter (`401` on mismatch).
-When the key env var is unset, the `key`-gated routes are not mounted at
-all and a `503` stub answers instead; `/ws/agent` is likewise closed
-with code `1008`. The disclosure routes are currently unauthenticated.
+When the key env var is unset: `/api/operate*` answers a `503` stub,
+`/ws/agent` is closed with code `1008`, while `/api/reports/{id}` and the
+five `/api/disclosure/*` routes (defined after the no-key early return)
+are **entirely unmounted** — a `404`, not a 503 stub. The disclosure
+routes are currently unauthenticated (but still require the key env var
+to be set for the routes to exist at all).
 
 | Method | Path | Auth | Contract |
 |---|---|---|---|

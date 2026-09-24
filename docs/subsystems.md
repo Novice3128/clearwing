@@ -29,10 +29,10 @@ entry); new code should use the `clearwing` console script or
 
 | Path | Responsibility | Entry point | Key modules |
 |---|---|---|---|
-| `agent/` | ReAct agent runtime, tool registry, specialists | `graph.py::create_agent`, `runtime.py::NativeAgentGraph` | `runtime.py` (astream loop, parallel tool batches, approval interrupts, budget guards), `graph.py`, `prompts.py`, `tooling.py`, `tools/` (scan, exploit, recon, ops, data, meta, hunt), `specialists/` (recon/planner/exploit/blue/reporter agents), `operator.py` (autonomous OperatorAgent) |
+| `agent/` | ReAct agent runtime, tool registry, specialists | `graph.py::create_agent`, `runtime.py::NativeAgentGraph` | `runtime.py` (astream loop, parallel tool batches, approval interrupts, budget guards), `graph.py`, `prompts.py`, `tooling.py`, `tools/` (scan, exploit, recon, crypto, ops, data, meta, hunt), `specialists/` (recon/planner/exploit/blue/reporter agents), `operator.py` (autonomous OperatorAgent) |
 | `analysis/` | Static source analysis helpers | `source_analyzer.py` | `source_analyzer.py`, `taint_tracker.py` |
 | `bench/` | OSS-Fuzz crash benchmarking | `ossfuzz.py` | `ossfuzz.py`, `crash_classifier.py`, `results.py` |
-| `capabilities.py` (module) | Runtime capability detection gating optional features | `capabilities.py` | detects memory summarization, event bus, telemetry, audit, knowledge-graph availability |
+| `capabilities.py` (module) | Runtime capability detection gating optional features | `capabilities.py` | detects memory summarization, event bus, telemetry, audit, guardrails, knowledge-graph availability |
 | `core/` | Engine, config, event bus, shared models | `engine.py::CoreEngine`, `events.py::EventBus` | `engine.py`, `config.py`, `events.py` + `event_payloads.py`, `logger.py`, `models.py`, `module_loader.py`, `skills/` |
 | `crypto/` | Cryptographic attack/math helpers | `srp.py` | `srp.py`, `stats.py` |
 | `data/` | Persistence: DB, knowledge graph, memory | `memory/session_store.py` | `database/models.py`, `knowledge/graph.py`, `memory/` (`episodic_memory.py`, `semantic_memory.py`, `session_store.py`, `summarizer.py`) |
@@ -57,7 +57,7 @@ entry); new code should use the `clearwing` console script or
 `SourceHuntRunner` (`clearwing/sourcehunt/runner.py`) orchestrates:
 
 ```
-preprocess → sandbox build → rank → tiered hunt → verify → exploit → proof
+preprocess → sandbox build → rank → tiered hunt (incl. subsystem_hunt) → verify → exploit → proof → report
 ```
 
 - **rank** — `ranker.py` scores files by attack surface (surface/influence/reach weights).
@@ -91,7 +91,7 @@ client ── WS /ws/agent ─────────────────�
   message frame ─► NativeAgentGraph.astream (agent/runtime.py)           │
                     ├─ assistant step → LLM (llm/native.py)              │
                     ├─ tool batch: parallel dispatch + approval          │
-                    │  interrupts (guarded_tools_node)                   │
+                    │  interrupts (_arun_tool_calls)                   │
                     └─ every step echoed on EventBus (core/events.py)    │
                                │                                         │
   EventBus ──► per-socket handlers ──► single FIFO writer coroutine      │
@@ -137,9 +137,11 @@ ui/web/app.py). Reports land under results/sourcehunt/<sh-id>/.
 
 ### 1. WebUI REST + WebSocket (`clearwing/ui/web/app.py`)
 
-REST routes (mounted by `create_app`; the `/api/operate*`, `/api/reports`
-routes are only mounted when `CLEARWING_WEB_API_KEY` is set, otherwise a
-503 stub answers):
+REST routes (mounted by `create_app`; when `CLEARWING_WEB_API_KEY` is unset
+the `/api/operate*` routes answer a **503 stub** instead, while
+`/api/reports/{id}` and the five `/api/disclosure/*` routes are defined
+AFTER the early return and are therefore **entirely unmounted** (`404` —
+not a 503 stub); the WebSocket closes with `1008`):
 
 | Method | Path | Auth | Contract |
 |---|---|---|---|
@@ -264,7 +266,7 @@ Two distinct asset families:
   daemon is broken.
 - **`e2e/`** — the *verifier's* assets (kept separate from the product):
   `test_suite.py` (60 offline tests over protocol/frames/artifacts),
-  `suite.yaml` (declarative tiers `quick` / `full` / `deep-cold`, hard
+  `suite.yaml` (declarative tiers `quick` / `full` / `deep-cold` / `deep-fallback`, hard
   thresholds — duplicate pairs, late frames, cache-prefix medians — and the
   `hot_paths` drift contract), plus `runner.py`/`analyze.py`/`chaos.py`
   tooling. Release bar: **Full tier passing twice consecutively + at least
