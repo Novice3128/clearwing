@@ -41,7 +41,8 @@ bus.
 
 ## The network-pentest agent (`clearwing.agent.graph`)
 
-A native ReAct loop with 99 bind-tools, driven by `clearwing.agent.runtime`
+A native ReAct loop with 120 bind-tools (as of `fa04772`, measured via
+`len(get_all_tools())`), driven by `clearwing.agent.runtime`
 on top of `clearwing.llm.native.AsyncLLMClient` (the `genai-pyo3` bridge
 to rust-genai). The graph has two nodes:
 
@@ -212,7 +213,11 @@ clearwing/agent/tools/
 ```
 
 `clearwing.agent.tools.__init__.get_all_tools()` is a pure aggregator
-that composes the network-agent's 102-tool bind-list. The
+that composes the network-agent's bind-list (as of `fa04772`:
+120 tools, `len(get_all_tools())`). The
 sourcehunt pipeline uses its own tool factory in
 `clearwing.agent.tools.hunt.__init__.build_hunter_tools(ctx)` — a
 different lineage that never appears in `get_all_tools()`.
+
+For the fork-local subsystem map (per-package table, data-flow diagrams,
+API surfaces, deployment topology), see [subsystems.md](subsystems.md).

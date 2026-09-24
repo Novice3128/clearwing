@@ -1,7 +1,7 @@
 # Web API — `/ws/agent` event schema
 
 The Clearwing web UI backend (`clearwing.ui.web.app`, started by
-`clearwing serve`) exposes a FastAPI server with a single real-time
+`clearwing webui`) exposes a FastAPI server with a single real-time
 WebSocket endpoint. Commit `dd5f093` wired the in-process
 [`EventBus`](architecture.md) into that WebSocket so external
 consumers (dashboards, CI tailers, custom TUIs) can follow campaign /
@@ -17,7 +17,7 @@ unless the underlying payload type is genuinely `T | None`.
 
 | | |
 |---|---|
-| URL | `ws://<host>:<port>/ws/agent` (default host/port: whatever `clearwing serve` binds to) |
+| URL | `ws://<host>:<port>/ws/agent` (default host/port: whatever `clearwing webui` binds to (default port 8899)) |
 | Subprotocol | none — plain JSON-text frames |
 | Auth | none when `CLEARWING_WEB_API_KEY` is unset. When set, the socket must present the key either as an `X-API-Key` header or as an `?api_key=` query parameter (browsers cannot set WebSocket headers, so the served frontend uses the query parameter, forwarding it from the page URL). Unauthorized sockets are closed with code `1008` before being accepted. |
 | CORS | `allow_origins=["*"]` — the frontend is served from the same FastAPI app |
@@ -72,6 +72,35 @@ The two unauthenticated ones relevant to orchestration:
   store is not usable (e.g. the same unwritable state directory).
   Same rule as health: generic detail on the wire, full reason in the
   server log. `GET /api/sessions/{id}` answers the same 503.
+
+### Full REST route table
+
+`Auth: key` means the request must carry `CLEARWING_WEB_API_KEY` as an
+`X-API-Key` header or `?api_key=` query parameter (`401` on mismatch).
+When the key env var is unset: `/api/operate*` answers a `503` stub,
+`/ws/agent` is closed with code `1008`, while `/api/reports/{id}` and the
+five `/api/disclosure/*` routes (defined after the no-key early return)
+are **entirely unmounted** — a `404`, not a 503 stub. The disclosure
+routes are currently unauthenticated (but still require the key env var
+to be set for the routes to exist at all).
+
+| Method | Path | Auth | Contract |
+|---|---|---|---|
+| GET | `/` | none | Serves the single-page frontend |
+| GET | `/static/*` | none | Static assets mount |
+| GET | `/api/health` | none | `200` ok; `503` `degraded` when state dir or session store unwritable |
+| GET | `/api/sessions` | none | Session summaries; `503` store unavailable |
+| GET | `/api/sessions/{id}` | none | Session detail; `404` unknown id; `503` store unavailable |
+| GET | `/api/metrics` | none | Process-global cost/token summary JSON |
+| GET | `/api/metrics/prometheus` | none | Prometheus exposition format |
+| POST | `/api/operate` | key | Start OperatorAgent (`400` missing target/goals → `{session_id, status:"running"}`); `503` stub when key unset |
+| GET | `/api/operate/{id}` | key | Operator session status; `404` unknown; `503` stub when key unset |
+| GET | `/api/disclosure/queue` | none | Disclosure queue (`?state=`, `?repo=` filters) |
+| POST | `/api/disclosure/{id}/validate` | none | Mark disclosure validated |
+| POST | `/api/disclosure/{id}/reject` | none | Mark disclosure rejected |
+| POST | `/api/disclosure/{id}/send` | none | Render + send disclosure templates |
+| GET | `/api/disclosure/status` | none | Disclosure workflow dashboard |
+| GET | `/api/reports/{id}` | key | Deterministic session markdown report; `400` invalid id, `404` not found |
 
 ## Client → server messages
 
