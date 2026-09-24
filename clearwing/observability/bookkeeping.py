@@ -32,8 +32,11 @@ from clearwing.observability.telemetry import CostTracker
 if TYPE_CHECKING:  # pragma: no cover
     # Duck-typed at runtime: anything exposing log_llm_call(model=...,
     # input_tokens=..., output_tokens=..., cost_usd=..., cached_tokens=...,
-    # agent=...) works — keeps this module import-cycle-free from
-    # clearwing.safety.audit (which lazily imports clearwing.core.config).
+    # agent=..., component=...) works — keeps this module import-cycle-free
+    # from clearwing.safety.audit (which lazily imports clearwing.core.config).
+    # A duck-typed logger missing the component kwarg would TypeError inside
+    # the try/except and silently drop the audit half — keep this signature
+    # in sync with AuditLogger.log_llm_call.
     from clearwing.safety.audit import AuditLogger
 
 logger = logging.getLogger(__name__)
@@ -88,6 +91,10 @@ _AGENT_COMPONENTS = {
     "nday": "cli-pipelines",
     "reveng": "cli-pipelines",
     "elaboration": "cli-pipelines",
+    # Live verbatim-fallthrough stage (not a _SPECIALIST_BOOK_ROLES key):
+    # the ranker books under stage "rank" (runner.py _get_native_client
+    # budget_stage="rank" → _specialist_book_role passes it through).
+    "rank": "sourcehunt",
 }
 
 

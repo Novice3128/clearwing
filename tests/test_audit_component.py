@@ -37,13 +37,15 @@ from clearwing.sourcehunt.runner import _SPECIALIST_BOOK_ROLES
 # anywhere in clearwing/ (grep-verified 2026-09-24):
 #   runtime.py main+summarizer, operator.py, hunter.py hunter+summarizer,
 #   crash_classifier.py bench, ui/commands/sourcehunt.py
-#   retro_hunt/nday/reveng/elaboration, runner.py via _specialist_book_role.
+#   retro_hunt/nday/reveng/elaboration, runner.py via _specialist_book_role
+#   (incl. the live verbatim-fallthrough stage "rank" — the ranker).
 _REPO_AGENT_LITERALS = [
     "main",
     "summarizer",
     "operator",
     "hunter",
     "bench",
+    "rank",
     "retro_hunt",
     "nday",
     "reveng",
@@ -265,13 +267,37 @@ class TestAgentLiteralCoverage:
         assert unmapped == []
         assert missing == []
 
+    def test_table_values_pinned_verbatim(self):
+        """R-D review: value-level pin — a mistyped component value (e.g.
+        operator→sourcehunt) would slip past the coverage test above, which
+        only checks membership. The full dict is the contract."""
+        assert _AGENT_COMPONENTS == {
+            "main": "agent-runtime",
+            "summarizer": "agent-runtime",
+            "operator": "agent-runtime",
+            "hunter": "sourcehunt",
+            "patcher": "sourcehunt",
+            "exploiter": "sourcehunt",
+            "variant": "sourcehunt",
+            "harness": "sourcehunt",
+            "stability": "sourcehunt",
+            "mechanism": "sourcehunt",
+            "proof": "sourcehunt",
+            "verifier": "sourcehunt",
+            "bench": "bench",
+            "rank": "sourcehunt",
+            "retro_hunt": "cli-pipelines",
+            "nday": "cli-pipelines",
+            "reveng": "cli-pipelines",
+            "elaboration": "cli-pipelines",
+        }
+
     def test_verbatim_fallback_roles_keep_the_sentinel_shape(self):
         """The agent namespace is OPEN (_specialist_book_role passes unknown
         stages through verbatim): table-level lookups for such roles MISS
         (no accidental sentinel entry in the table), and the booking-path
         resolver still yields the sentinel so the key keeps its shape."""
         # Unknown stages are deliberately absent from the table...
-        assert "rank" not in _AGENT_COMPONENTS
         assert "some_new_stage" not in _AGENT_COMPONENTS
         # ...and the resolver maps them to the sentinel, never to None.
         assert _AGENT_COMPONENTS.get("some_new_stage", "unmapped") == "unmapped"
