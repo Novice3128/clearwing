@@ -44,10 +44,13 @@ nav:
   - Remediation lifecycle: remediation.md
   - VVAH pattern review: vvah-integration.md
   - Architecture: architecture.md
+  - Subsystems map: subsystems.md
   - Sandbox backends: sandbox-backends.md
   - CLI reference: cli.md
   - API reference: api.md
   - Web API (WebSocket): web-api.md
+  - Crypto tools: crypto-tools.md
+  - New features: new-features.md
 
 markdown_extensions:
   - admonition
