@@ -73,6 +73,32 @@ The two unauthenticated ones relevant to orchestration:
   Same rule as health: generic detail on the wire, full reason in the
   server log. `GET /api/sessions/{id}` answers the same 503.
 
+### Full REST route table
+
+`Auth: key` means the request must carry `CLEARWING_WEB_API_KEY` as an
+`X-API-Key` header or `?api_key=` query parameter (`401` on mismatch).
+When the key env var is unset, the `key`-gated routes are not mounted at
+all and a `503` stub answers instead; `/ws/agent` is likewise closed
+with code `1008`. The disclosure routes are currently unauthenticated.
+
+| Method | Path | Auth | Contract |
+|---|---|---|---|
+| GET | `/` | none | Serves the single-page frontend |
+| GET | `/static/*` | none | Static assets mount |
+| GET | `/api/health` | none | `200` ok; `503` `degraded` when state dir or session store unwritable |
+| GET | `/api/sessions` | none | Session summaries; `503` store unavailable |
+| GET | `/api/sessions/{id}` | none | Session detail; `404` unknown id; `503` store unavailable |
+| GET | `/api/metrics` | none | Process-global cost/token summary JSON |
+| GET | `/api/metrics/prometheus` | none | Prometheus exposition format |
+| POST | `/api/operate` | key | Start OperatorAgent (`400` missing target/goals → `{session_id, status:"running"}`); `503` stub when key unset |
+| GET | `/api/operate/{id}` | key | Operator session status; `404` unknown; `503` stub when key unset |
+| GET | `/api/disclosure/queue` | none | Disclosure queue (`?state=`, `?repo=` filters) |
+| POST | `/api/disclosure/{id}/validate` | none | Mark disclosure validated |
+| POST | `/api/disclosure/{id}/reject` | none | Mark disclosure rejected |
+| POST | `/api/disclosure/{id}/send` | none | Render + send disclosure templates |
+| GET | `/api/disclosure/status` | none | Disclosure workflow dashboard |
+| GET | `/api/reports/{id}` | key | Deterministic session markdown report; `400` invalid id, `404` not found |
+
 ## Client → server messages
 
 Every client frame is a JSON object with a `type` discriminator.
