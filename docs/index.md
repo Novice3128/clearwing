@@ -10,9 +10,9 @@ Clearwing is a dual-mode offensive-security tool:
 - **Network-pentest agent** — a ReAct-loop agent that scans live
   targets, enumerates services, detects vulnerabilities, attempts
   exploits, and writes reports. Runs on top of a Docker-sandboxed
-  Kali toolbox when one is configured. 99 tools, gated through a
-  guardrail/approval layer so destructive operations pause for a
-  human.
+  Kali toolbox when one is configured. As of `fa04772`: 120 tools
+  (`len(get_all_tools())`), gated through a guardrail/approval layer
+  so destructive operations pause for a human.
 - **Source-code hunter** — a file-parallel agent-driven
   discovery pipeline that ranks source files by attack surface, fans
   out per-file hunter agents, uses ASan/UBSan crashes as ground
@@ -30,11 +30,11 @@ Clearwing is a dual-mode offensive-security tool:
 | [**LLM providers**](providers.md) | OpenRouter / Ollama / LM Studio / vLLM / Together / Groq / DeepSeek / OpenAI — CLI + env + config.yaml recipes for each |
 | [**Sourcehunt evaluation and rollout**](eval_rollout.md) | Run the paired proof/legacy empirical campaign, evaluate cutover gates, and roll out proof flow safely |
 | [**Architecture**](architecture.md) | How the ReAct loops, sandboxes, capabilities layer, Finding dataclass, and knowledge graph fit together |
+| [**Subsystems map**](subsystems.md) | Fork-local snapshot: entry chain, per-package table, data-flow diagrams, API surfaces, deployment topology |
 | [**CLI reference**](cli.md) | Every `clearwing <subcommand>` flag, with examples |
 | [**API reference**](api.md) | `clearwing.findings.Finding`, the sourcehunt runner, auto-generated from docstrings |
 | [**Web API (WebSocket)**](web-api.md) | `/ws/agent` client/server message schema for the event-streaming web UI backend |
 | [**Crypto tools**](crypto-tools.md) | TLS, SRP, KDF, vault encryption, timing, WebCrypto, and credential attack tools — full reference |
-| [**1Password CTF**](1password_ctf.md) | CTF runbook: target analysis, toolchain mapping, step-by-step attack procedures, decision tree |
 
 ## Project status
 
